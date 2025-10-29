@@ -88,9 +88,10 @@ def get_wrapped_partitioner(
 ):
 
     def partition_recompute_ds_params(joint_module: GraphModule, _joint_inputs, *,
-                                      num_fwd_outputs) -> Tuple[GraphModule, GraphModule]:
+                                      num_fwd_outputs, **partition_kwargs) -> Tuple[GraphModule, GraphModule]:
         if z3_partition:
             _recompute_param_aliases(joint_module.graph, param_indices)
-        return partition_fn(joint_module, _joint_inputs, num_fwd_outputs=num_fwd_outputs)
+        return partition_fn(joint_module, _joint_inputs, num_fwd_outputs=num_fwd_outputs,
+                            **partition_kwargs)
 
     return partition_recompute_ds_params
