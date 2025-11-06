@@ -50,6 +50,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         dist.enable_symm_mem_for_group(group_name)
 
     for p in engine.module.parameters():
+        if not p.requires_grad:
+            continue
         grad_buffer = torch.Tensor()
         if use_opt:
             grad_buffer = optimizer._DeepSpeedZeroOptimizer_Stage3__param_id_to_grad_partition[p.ds_id]
