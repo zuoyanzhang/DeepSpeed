@@ -348,6 +348,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                                      get_activation_node_names(gm.graph, param_nodes_bw, non_param_input_names))
 
             frames_needing_bwd.remove(frame_id)
+            # frames_needing_bwd.discard(frame_id)
             if len(frames_needing_bwd) == 0:
                 unpatch_compiled_func()
 

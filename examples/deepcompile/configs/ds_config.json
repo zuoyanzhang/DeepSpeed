@@ -1,0 +1,28 @@
+{
+    
+    "bf16": {
+        "enabled": true
+    },
+    
+    "zero_optimization": {
+        "stage": 3,
+        "sub_group_size": 100000000
+    },
+    "compile": {
+        "deepcompile": true,
+        "offload_activation": false,
+        "offload_opt_states": false,
+        "double_buffer": true,
+        "symmetric_memory": false,
+        "free_activation": false,
+        "debug_log": false,
+        "sync_before_reduce": false,
+        "sync_after_reduce": false
+    },
+    "gradient_accumulation_steps": 1,
+    "gradient_clipping": "auto",
+    "steps_per_print": 2000,
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "wall_clock_breakdown": false
+}
