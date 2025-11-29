@@ -13,6 +13,7 @@ EXTRA_OPTS=""
 
 EAGER=0
 DEEPCOMPILE=0
+# 梯度累积步数
 GRADIENT_ACCUMULATION_STEPS=1
 ACTIVATION_CHECKPOINTING=1
 BATCH_SIZE=1
@@ -221,7 +222,7 @@ mkdir -p ${LOG_DIR}
 LOG_FILE=${LOG_DIR}/debug_n${MACHINE_RANK}_${MODEL##*/}_${BACKEND}_np${NUM_PROCESSES}z${ZERO_STAGE}c${COMPILE}dc${DEEPCOMPILE}E${EAGER}b${BATCH_SIZE}seq${SEQ_LENGTH}g${GRADIENT_ACCUMULATION_STEPS}a${ACTIVATION_CHECKPOINTING}p${PASSES}.log
 echo "Logging to ${LOG_FILE}"
 
-${HOME}/.conda/envs/dist/bin/accelerate launch --main_process_ip ${HOST_IP} --main_process_port 12345 \
+${HOME}/.conda/envs/deepcompile/bin/accelerate launch --main_process_ip ${HOST_IP} --main_process_port 12345 \
 --num_machines ${NUM_NODES} --num_processes ${NUM_PROCESSES} --machine_rank ${MACHINE_RANK} \
 --config_file configs/config.yaml \
 run_bench_lm.py \

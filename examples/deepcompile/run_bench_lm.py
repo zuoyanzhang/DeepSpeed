@@ -144,7 +144,7 @@ def main():
         disable_progress_bar()
         
     # dataset = load_dataset('ag_news', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
-    dataset = load_dataset('/data/home/scvi736/run/DeepSpeedExamples/benchmarks/deepcompile/datasets', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
+    dataset = load_dataset('/data/home/scvj326/run/DeepSpeed/examples/deepcompile/datasets', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
 
     # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # tokenizer.pad_token = tokenizer.convert_ids_to_tokens(2)

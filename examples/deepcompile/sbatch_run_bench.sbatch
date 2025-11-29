@@ -3,7 +3,7 @@
 #SBATCH --job-name=deepcompile_bench
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8               # 根据实际需要调整 GPU 数量
+#SBATCH --gres=gpu:4               # 调整 GPU 数量
 #SBATCH --output=logs/slurm-%j.out.log
 
 # 优先使用 SLURM 分配的 GPU 数目
