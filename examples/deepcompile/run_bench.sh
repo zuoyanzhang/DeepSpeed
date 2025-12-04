@@ -14,12 +14,13 @@ BATCH_SIZE_OPTS=(2)
 SEQ_LENGTH_OPTS=(1024)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
-        ARGS="--model ${MODEL} --model_path ${MODEL_PATH} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} ${ACC_OPTS} ${AC_OPTS}"
+        ARGS="--model ${MODEL} --model_path ${MODEL_PATH} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} ${ACC_OPTS} ${AC_OPTS} --deterministic"
         # bash ./run_multinode.sh --backend deepspeed ${ARGS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${COMPILE_OPTS}
         # bash ./run_multinode.sh --backend fsdp ${ARGS}
         # bash ./run_multinode.sh --backend fsdp ${ARGS} ${COMPILE_OPTS}
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch,selective_gather
+        # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch,selective_gather
+        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes chunk_gemm
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes selective_gather
 

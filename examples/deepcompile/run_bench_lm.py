@@ -48,7 +48,7 @@ def get_args():
 
 
 def make_schedule(passes: List[str], warmup):
-    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states
+    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, chunk_gemm
 
     schedule = []
 
@@ -60,8 +60,13 @@ def make_schedule(passes: List[str], warmup):
         assert len(passes) == 1, "offload_adam_states_sync should be the only pass"
         schedule.append((0, [zero3_compile.add_z3_gather_release, offload_adam_states.move_opt_states_sync]))
     else:
-        schedule.append((0, [zero3_compile.add_z3_gather_release]))
-        second_opt = [zero3_compile.add_z3_gather_release]
+        # schedule.append((0, [zero3_compile.add_z3_gather_release]))
+        # second_opt = [zero3_compile.add_z3_gather_release]
+        first_opt = [zero3_compile.add_z3_gather_release]
+        if "chunk_gemm" in passes:
+            first_opt.append(chunk_gemm.chunk_gemm)
+        schedule.append((0, first_opt))
+        second_opt = list(first_opt)
         if "prefetch" in passes:
             second_opt.append(prefetch.schedule_prefetch)
         if "selective_gather" in passes:

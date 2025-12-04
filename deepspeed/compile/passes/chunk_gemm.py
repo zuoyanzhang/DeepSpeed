@@ -9,26 +9,57 @@ from torch.fx import GraphModule, Node
 
 from ..util import is_cast_op
 from ..graph_param import DSGraphParamManager
+import deepspeed.comm as dist
 
 NAME = "chunk_gemm"
 
-# NOTE: 将chunk的大小设置成1024，后面需要加上cost model来自动确定chunk size
-DEFAULT_CHUNK_SIZE = 1024
+# TODO: 先手动设置chunksize，后面需要加上cost model来自动确定chunk size
+DEFAULT_CHUNK_SIZE = 4096
 
 def _unwrap_weight_to_allgather(node: Node) -> Optional[Node]:
-    # 尝试从当前节点开始向上查找allgather节点
-    # 如果找到allgather节点，则返回该节点。否则返回None
-    # dc.allgather_param -> dc.wait_allgather -> cast(fp16) -> 作为某个算子的输入
+    # 尝试从当前节点开始向上查找 allgather 节点。
+    # 如果找到 allgather 节点，则返回该节点；否则返回 None。
+    #
+    # 允许穿透的算子（保持张量值不变或仅做 dtype/布局变换）包括：
+    #   - dc.wait_allgather
+    #   - dtype cast（prims.convert_element_type / aten._to_copy(dtype=...)）
+    #   - aten.permute
+    #   - aten.view / aten.reshape
+    #   - aten.contiguous
+    #
+    # 典型链路：
+    #   dc.allgather_param -> dc.wait_allgather -> permute -> mm
+    #   dc.allgather_param -> dc.wait_allgather -> cast -> view -> mm
     cur = node
     for _ in range(3):
-        if cur.op == "call_function" and cur.target == torch.ops.dc.wait_allgather.default:
+        if cur.op != "call_function":
+            break
+
+        tgt = cur.target
+
+        # dc.wait_allgather
+        if tgt == torch.ops.dc.wait_allgather.default:
             cur = cur.args[0]
             continue
-        if cur.op == "call_function":
-            is_cast, _ = is_cast_op(cur)
-            if is_cast:
-                cur = cur.args[0]
-                continue
+
+        # dtype cast
+        is_cast, _ = is_cast_op(cur)
+        if is_cast:
+            cur = cur.args[0]
+            continue
+
+        # 纯布局/形状变换：permute/view/reshape/contiguous
+        if tgt in (
+            torch.ops.aten.permute.default,
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+            torch.ops.aten.contiguous.default,
+        ):
+            cur = cur.args[0]
+            continue
+
+        # 其他算子认为是边界
         break
 
     if cur.op == "call_function" and cur.target == torch.ops.dc.allgather_param.default:
@@ -37,7 +68,8 @@ def _unwrap_weight_to_allgather(node: Node) -> Optional[Node]:
 
 def _extract_linear_pattern(node: Node):
     """
-    Try to unify different linear-ish patterns to (x, w, bias, beta, alpha).
+    Try to unify different linear-ish patterns to (x, w, bias, beta, alpha, mm_like_node).
+    mm_like_node 是真正的 gemm 节点（用于在外层 add 场景下删除冗余 gemm）。
     """
     bias = None
     beta = 1.0
@@ -49,7 +81,8 @@ def _extract_linear_pattern(node: Node):
         mm_like = None
         bias_candidate = None
         for first, second in ((a, b), (b, a)):
-            if first.op == "call_function" and first.target in {
+            # first/second可能是常量float/int，需要先判断是否是Node
+            if isinstance(first, Node) and first.op == "call_function" and first.target in {
                     torch.ops.aten.mm.default, torch.ops.aten.addmm.default, torch.ops.aten.bmm.default,
                     torch.ops.aten.matmul.default
             }:
@@ -61,13 +94,14 @@ def _extract_linear_pattern(node: Node):
         inner = _extract_linear_pattern(mm_like)
         if inner is None:
             return None
-        x, w, inner_bias, beta, alpha = inner
+        x, w, inner_bias, beta, alpha, _ = inner
         bias = inner_bias if inner_bias is not None else bias_candidate
-        return x, w, bias, beta, alpha
+        # mm_like 是外层 add 里的真正 gemm 节点
+        return x, w, bias, beta, alpha, mm_like
 
     if node.target == torch.ops.aten.mm.default and len(node.args) == 2:
         x, w = node.args
-        return x, w, bias, beta, alpha
+        return x, w, bias, beta, alpha, node
 
     if node.target == torch.ops.aten.addmm.default and len(node.args) >= 3:
         bias, x, w = node.args[:3]
@@ -75,11 +109,11 @@ def _extract_linear_pattern(node: Node):
             beta = float(node.args[3])
         if len(node.args) >= 5:
             alpha = float(node.args[4])
-        return x, w, bias, beta, alpha
+        return x, w, bias, beta, alpha, node
 
     if node.target == torch.ops.aten.bmm.default and len(node.args) == 2:
         x, w = node.args
-        return x, w, bias, beta, alpha
+        return x, w, bias, beta, alpha, node
 
     if node.target == torch.ops.aten.matmul.default and len(node.args) == 2:
         x, w = node.args
@@ -88,7 +122,7 @@ def _extract_linear_pattern(node: Node):
         if x_meta is None or w_meta is None:
             return None
         if len(x_meta.shape) in (2, 3) and len(w_meta.shape) in (2, 3):
-            return x, w, bias, beta, alpha
+            return x, w, bias, beta, alpha, node
         return None
 
     return None
@@ -121,7 +155,8 @@ def _chunk_dim_k(graph, mm_node: Node, x: Node, w: Node, bias: Optional[Node], b
 
     x_dim = len(x_meta.shape) - 1
     w_dim = len(w_meta.shape) - 2
-    matmul_target = torch.ops.aten.mm.default if len(x_meta.shape) == 2 and len(w_meta.shape) == 2 else torch.ops.aten.bmm.default
+    matmul_target = torch.ops.aten.mm.default if len(x_meta.shape) == 2 \
+                    and len(w_meta.shape) == 2 else torch.ops.aten.bmm.default
 
     with mm_node.graph.inserting_before(mm_node):
         acc = None
@@ -138,12 +173,22 @@ def _chunk_dim_k(graph, mm_node: Node, x: Node, w: Node, bias: Optional[Node], b
                                                 args=(w, w_dim, start, start + length),
                                                 kwargs={})
 
-            y_i = mm_node.graph.create_node("call_function", matmul_target, args=(x_slice, w_slice), kwargs={})
+            y_i = mm_node.graph.create_node(
+                                            "call_function", 
+                                            matmul_target, 
+                                            args=(x_slice, w_slice), 
+                                            kwargs={}
+                                            )
 
             if acc is None:
                 acc = y_i
             else:
-                acc = mm_node.graph.create_node("call_function", torch.ops.aten.add.Tensor, args=(acc, y_i), kwargs={})
+                acc = mm_node.graph.create_node(
+                                                "call_function", 
+                                                torch.ops.aten.add.Tensor, 
+                                                args=(acc, y_i), 
+                                                kwargs={}
+                                                )
 
             start += length
 
@@ -167,17 +212,27 @@ def _chunk_dim_k(graph, mm_node: Node, x: Node, w: Node, bias: Optional[Node], b
                                                             kwargs={})
                 else:
                     bias_scaled = bias
-            acc = mm_node.graph.create_node("call_function", torch.ops.aten.add.Tensor, args=(bias_scaled, acc), kwargs={})
+            acc = mm_node.graph.create_node(
+                                            "call_function", 
+                                            torch.ops.aten.add.Tensor, 
+                                            args=(bias_scaled, acc), 
+                                            kwargs={}
+                                            )
 
     _replace_uses(mm_node, acc)
     mm_node.graph.erase_node(mm_node)
     return True
 
 def chunk_gemm(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
-               create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager, bwd: bool) -> GraphModule:
+               create_inputs_fn, mem_budget: float, 
+               param_manager: DSGraphParamManager, bwd: bool) -> GraphModule:
     # 先只对前向图做chunk
     if bwd:
         return gm
+    
+    # NOTE: 打印graph
+    if dist.get_rank() == 0:
+        print(f"[chunk_gemm] graph_id={graph_id} BEFORE:\n{gm.graph}")
 
     graph = gm.graph
     rewritten = False
@@ -189,17 +244,30 @@ def chunk_gemm(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool
         extracted = _extract_linear_pattern(node)
         if extracted is None:
             continue
-        x, w, bias, beta, alpha = extracted
+        x, w, bias, beta, alpha, mm_like = extracted
 
         ag = _unwrap_weight_to_allgather(w)
         if ag is None:
             continue
 
         did = _chunk_dim_k(graph, node, x, w, bias, beta, alpha, DEFAULT_CHUNK_SIZE)
+        # NOTE: debug 
+        # if did and dist.get_rank() == 0:
+        #     # 用于验证哪些算子被做了chunk
+        #     print(f"[chunk_gemm] graph_id={graph_id} chunked node={node.name} target={node.target}")
+        if did and mm_like is not node and len(mm_like.users) == 0:
+            # 对于 add(mm(x, w), bias) 这类模式，mm_like 的输出只用于这个 add，
+            # chunk 重写后不再需要原始 gemm，直接删掉避免多余计算。
+            graph.erase_node(mm_like)
+
         rewritten = rewritten or did
 
     if rewritten:
         graph.lint()
         gm.recompile()
+        
+        # NOTE: 打印chunk后graph
+        if dist.get_rank() == 0:
+            print(f"[chunk_gemm] graph_id={graph_id} AFTER:\n{gm.graph}")
 
     return gm
