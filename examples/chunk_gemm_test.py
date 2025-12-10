@@ -34,11 +34,43 @@ def ensure_dc_ops():
     # 最后兜底：注册 CPU stub，便于构图/打印
     lib = Library("dc", "DEF")
     lib.define("allgather_param(Tensor a, int graph_id, int ds_id, ScalarType? dtype=None) -> Tensor")
+    lib.define(
+        "allgather_param_chunk(Tensor a, int graph_id, int ds_id, int offset, int length, int stride=0, int chunk_count=1, ScalarType? dtype=None) -> Tensor"
+    )
     lib.define("wait_allgather(Tensor a, int graph_id, int ds_id) -> Tensor")
+    lib.define(
+        "wait_allgather_chunk(Tensor a, int graph_id, int ds_id, int offset, int length, int stride=0, int chunk_count=1) -> Tensor"
+    )
 
     lib_impl = Library("dc", "IMPL", "CPU")
     lib_impl.impl("allgather_param", lambda a, graph_id, ds_id, dtype=None: a)
+    def _fake_allgather_chunk(a, graph_id, ds_id, offset, length, stride=0, chunk_count=1, dtype=None):
+        if chunk_count <= 0:
+            raise ValueError("chunk_count must be positive")
+        if stride < 0:
+            raise ValueError("stride must be non-negative")
+        if chunk_count > 1 and stride <= 0:
+            raise ValueError("stride must be positive when chunk_count > 1")
+
+        flat = a.flatten()
+        if dtype is not None:
+            flat = flat.to(dtype)
+
+        stride_elems = stride if chunk_count > 1 else (stride if stride > 0 else length)
+        pieces = []
+        for idx in range(chunk_count):
+            start = offset + idx * stride_elems
+            if start >= flat.numel():
+                break
+            take = min(length, flat.numel() - start)
+            pieces.append(flat.narrow(0, start, take))
+        if not pieces:
+            return torch.empty((0,), device=flat.device, dtype=flat.dtype)
+        return torch.cat(pieces)
+
+    lib_impl.impl("allgather_param_chunk", _fake_allgather_chunk)
     lib_impl.impl("wait_allgather", lambda a, graph_id, ds_id: a)
+    lib_impl.impl("wait_allgather_chunk", lambda a, graph_id, ds_id, offset, length, stride=0, chunk_count=1: a)
 
 
 def build_dummy_graph():

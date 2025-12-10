@@ -25,6 +25,14 @@ at::Tensor allgather_param(at::Tensor param_tensor,
                            long graph_id,
                            long ds_id,
                            std::optional<at::ScalarType> dtype);
+at::Tensor allgather_param_chunk(at::Tensor param_tensor,
+                                 long graph_id,
+                                 long ds_id,
+                                 long offset,
+                                 long length,
+                                 long stride,
+                                 long chunk_count,
+                                 std::optional<at::ScalarType> dtype);
 void set_persistent(long ds_id);
 void prefetch_params_fused(long graph_id,
                            const std::vector<at::Tensor>& params,
@@ -41,10 +49,32 @@ at::Tensor allgather_param_meta(at::Tensor param_tensor,
                                 long graph_id,
                                 long ds_id,
                                 std::optional<at::ScalarType> dtype);
+at::Tensor allgather_param_chunk_meta(at::Tensor param_tensor,
+                                      long graph_id,
+                                      long ds_id,
+                                      long offset,
+                                      long length,
+                                      long stride,
+                                      long chunk_count,
+                                      std::optional<at::ScalarType> dtype);
 at::Tensor release_param(at::Tensor dummy, long graph_id, long ds_id, long n_users);
 at::Tensor release_param_meta(at::Tensor dummy, long graph_id, long ds_id, long n_users);
 at::Tensor wait_allgather(at::Tensor v, long graph_id, const long ds_id);
+at::Tensor wait_allgather_chunk(at::Tensor v,
+                                long graph_id,
+                                const long ds_id,
+                                long offset,
+                                long length,
+                                long stride,
+                                long chunk_count);
 at::Tensor wait_allgather_meta(at::Tensor v, long graph_id, long ds_id);
+at::Tensor wait_allgather_chunk_meta(at::Tensor v,
+                                     long graph_id,
+                                     long ds_id,
+                                     long offset,
+                                     long length,
+                                     long stride,
+                                     long chunk_count);
 at::Tensor offload_tensor(at::Tensor tensor, long graph_id, long id);
 at::Tensor reload_tensor(at::Tensor tensor, long graph_id, long id);
 at::Tensor wait_offload(at::Tensor tensor, long graph_id, long id);
