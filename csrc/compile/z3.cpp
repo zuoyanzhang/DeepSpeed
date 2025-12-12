@@ -13,8 +13,9 @@ namespace dc {
 
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
 
-using ChunkKey = std::tuple<long, long, long, long>;
+using ChunkKey = std::tuple<long, long, long, long>; // (offset, length, stride, count)
 
+// 用来标识一次chunk通信的配置，同一个ds_id下如果offset/length/stride/count不同，则视为不同的chunk通信
 struct ChunkKeyHash {
     size_t operator()(const ChunkKey& key) const
     {
@@ -178,6 +179,7 @@ public:
             .view(param.getShape());
     }
 
+    //
     at::Tensor allgatherParamChunk(long ds_id,
                                    long offset,
                                    long length,

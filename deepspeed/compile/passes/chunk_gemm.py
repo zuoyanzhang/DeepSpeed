@@ -224,7 +224,9 @@ def _apply_transforms_on_chunk(graph,
             dims = t["dims"]
             if len(dims) != current_rank:
                 return None
-            cur = graph.create_node("call_function", torch.ops.aten.permute.default, args=(cur, dims), kwargs={})
+            cur = graph.create_node("call_function", 
+                                    torch.ops.aten.permute.default, 
+                                    args=(cur, dims), kwargs={})
         elif t_type in ("view", "reshape", "_unsafe_view"):
             target = t.get("target", torch.ops.aten.view.default)
             target_shape = t.get("shape", None)
@@ -236,11 +238,17 @@ def _apply_transforms_on_chunk(graph,
             cur = graph.create_node("call_function", target, args=(cur, tuple(adjusted_shape)), kwargs={})
             current_rank = len(adjusted_shape)
         elif t_type == "contiguous":
-            cur = graph.create_node("call_function", torch.ops.aten.contiguous.default, args=(cur,), kwargs={})
+            cur = graph.create_node("call_function", 
+                                    torch.ops.aten.contiguous.default, 
+                                    args=(cur,), 
+                                    kwargs={})
         else:
             return None
     # 最终 reshape 成与原始权重相同的布局（chunk 维度替换为 chunk_len）
-    cur = graph.create_node("call_function", torch.ops.aten.view.default, args=(cur, tuple(target_shape)), kwargs={})
+    cur = graph.create_node("call_function", 
+                            torch.ops.aten.view.default, 
+                            args=(cur, tuple(target_shape)), 
+                            kwargs={})
     return cur
 
 
@@ -454,7 +462,8 @@ def _chunk_allgather_and_gemm(graph, mm_node: Node, x: Node, w: Node, bias: Opti
             if next_ag is None:
                 ag_chunk = graph.create_node("call_function",
                                              torch.ops.dc.allgather_param_chunk.default,
-                                             args=(ag_input, ag_graph_id, ds_id, offset_elems, length_elems, stride_elems, chunk_count),
+                                             args=(ag_input, ag_graph_id, ds_id, offset_elems, length_elems, 
+                                                   stride_elems, chunk_count),
                                              kwargs=make_kwargs())
                 created_nodes.append(ag_chunk)
             else:
@@ -466,7 +475,8 @@ def _chunk_allgather_and_gemm(graph, mm_node: Node, x: Node, w: Node, bias: Opti
                 next_offset = next_start * suffix
                 next_ag = graph.create_node("call_function",
                                             torch.ops.dc.allgather_param_chunk.default,
-                                            args=(ag_input, ag_graph_id, ds_id, next_offset, next_len, stride_elems, chunk_count),
+                                            args=(ag_input, ag_graph_id, ds_id, next_offset, next_len, 
+                                                  stride_elems, chunk_count),
                                             kwargs=make_kwargs())
                 created_nodes.append(next_ag)
             else:
@@ -474,7 +484,8 @@ def _chunk_allgather_and_gemm(graph, mm_node: Node, x: Node, w: Node, bias: Opti
 
             wait_chunk = graph.create_node("call_function",
                                            torch.ops.dc.wait_allgather_chunk.default,
-                                           args=(ag_chunk, ag_graph_id, ds_id, offset_elems, length_elems, stride_elems, chunk_count),
+                                           args=(ag_chunk, ag_graph_id, ds_id, offset_elems, length_elems, 
+                                                 stride_elems, chunk_count),
                                            kwargs={})
             created_nodes.append(wait_chunk)
 
@@ -500,7 +511,10 @@ def _chunk_allgather_and_gemm(graph, mm_node: Node, x: Node, w: Node, bias: Opti
             if acc is None:
                 acc = y_i
             else:
-                acc = graph.create_node("call_function", torch.ops.aten.add.Tensor, args=(acc, y_i), kwargs={})
+                acc = graph.create_node("call_function", 
+                                        torch.ops.aten.add.Tensor, 
+                                        args=(acc, y_i), 
+                                        kwargs={})
                 created_nodes.append(acc)
 
             start_k += chunk_k
@@ -525,7 +539,10 @@ def _chunk_allgather_and_gemm(graph, mm_node: Node, x: Node, w: Node, bias: Opti
                                                     kwargs={})
                 else:
                     bias_scaled = bias
-            acc = graph.create_node("call_function", torch.ops.aten.add.Tensor, args=(bias_scaled, acc), kwargs={})
+            acc = graph.create_node("call_function", 
+                                    torch.ops.aten.add.Tensor, 
+                                    args=(bias_scaled, acc), 
+                                    kwargs={})
 
     _replace_uses(mm_node, acc)
     graph.erase_node(mm_node)

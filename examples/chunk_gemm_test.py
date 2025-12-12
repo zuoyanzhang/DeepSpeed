@@ -113,6 +113,7 @@ def build_dummy_graph():
 
 def main():
     gm = build_dummy_graph()
+    chunk_gemm.DEFAULT_CHUNK_SIZE = 1024
     print("=== Original graph ===")
     print(gm.graph)
 
