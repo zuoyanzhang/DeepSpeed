@@ -28,7 +28,7 @@ def get_args():
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--dataset_name", type=str, default="timdettmers/openassistant-guanaco")
     parser.add_argument("--num_layers", type=int, default=0)
-    parser.add_argument("--attn_impl", type=str, default="spda")
+    parser.add_argument("--attn_impl", type=str, default="sdpa")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--passes", type=str, default=None)
     parser.add_argument("--backend", type=str, default="inductor")
@@ -60,15 +60,21 @@ def make_schedule(passes: List[str], warmup):
         assert len(passes) == 1, "offload_adam_states_sync should be the only pass"
         schedule.append((0, [zero3_compile.add_z3_gather_release, offload_adam_states.move_opt_states_sync]))
     else:
-        # schedule.append((0, [zero3_compile.add_z3_gather_release]))
-        # second_opt = [zero3_compile.add_z3_gather_release]
-        first_opt = [zero3_compile.add_z3_gather_release]
-        if "chunk_gemm" in passes:
-            first_opt.append(chunk_gemm.chunk_gemm)
-        schedule.append((0, first_opt))
-        second_opt = list(first_opt)
-        if "prefetch" in passes:
+        # 第一次只做 gather/release 等基础 pass；warmup 后再跑带 profiling 的 chunk/prefetch/selective_gather
+        base_opt = [zero3_compile.add_z3_gather_release]
+        schedule.append((0, list(base_opt)))
+
+        second_opt = list(base_opt)
+        combo_chunk_prefetch = "chunk_gemm" in passes and "prefetch" in passes
+        if combo_chunk_prefetch:
+            # 组合优化：chunk_gemm 先基于 profile 做决策，prefetch 负责层间调度
+            second_opt.append(chunk_gemm.chunk_gemm_combo)
             second_opt.append(prefetch.schedule_prefetch)
+        else:
+            if "chunk_gemm" in passes:
+                second_opt.append(chunk_gemm.chunk_gemm)
+            if "prefetch" in passes:
+                second_opt.append(prefetch.schedule_prefetch)
         if "selective_gather" in passes:
             second_opt.append(selective_gather.selective_gather)
         schedule.append((warmup, second_opt))
@@ -78,7 +84,6 @@ def make_schedule(passes: List[str], warmup):
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false" # to suppress tokenizer parallelism warning
     args = get_args()
-    args.load_weights = True # 必须设置为true，否则还是从huggingface中下载权重，不走本地路径
     print(args)
 
     if args.passes is not None and "offload_adam_states" in args.passes:
@@ -106,19 +111,18 @@ def main():
     if accelerator.is_main_process:
         print(f"model_weight_path: {model_weight_path}")
     if args.load_weights:
-        model = AutoModelForCausalLM.from_pretrained(model_weight_path, 
-                                                     trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_weight_path, trust_remote_code=True)
     else:
+        # 从头训练：只加载 config（不加载预训练权重）
+        # 优先从本地 model_weight_path 读 config/tokenizer；若不存在则退回 model_name
+        config_src = model_weight_path if os.path.exists(model_weight_path) else model_name
+        model_config = AutoConfig.from_pretrained(config_src,
+                                                  attn_implementation=args.attn_impl,
+                                                  trust_remote_code=True)
         if args.num_layers > 0:
-            model_config = AutoConfig.from_pretrained(model_name, 
-                                                      attn_implementation=args.attn_impl, 
-                                                      trust_remote_code=True)
             print(f"num_hidden_layers: {model_config.num_hidden_layers} -> {args.num_layers}")
             model_config.num_hidden_layers = args.num_layers
-            model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                         trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
             
     # 有些buffer类型是float32，使用fsdp+compile的时候需要强制将buffer提前转换成bfloat16，
     # 否则torch.compile的dynamo会触发类型转换错误
@@ -130,9 +134,9 @@ def main():
     if accelerator.is_main_process:
         print(f"model is {model}")
 
-    # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_weight_path, 
-                                              trust_remote_code=True)
+    # tokenizer 仍可用本地词表（即使不加载权重）；本地不存在则退回 model_name
+    tok_src = model_weight_path if os.path.exists(model_weight_path) else model_name
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
 
     if args.save_weights and accelerator.is_main_process:
         model.save_pretrained(model_weight_path)

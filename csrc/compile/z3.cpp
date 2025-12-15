@@ -12,8 +12,10 @@
 namespace dc {
 
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
+constexpr int64_t kChunkBufferStages = 3;
 
 using ChunkKey = std::tuple<long, long, long, long>; // (offset, length, stride, count)
+using ChunkBufferKey = std::tuple<long, long, long, at::ScalarType>; // (length, stride, count, dtype)
 
 // 用来标识一次chunk通信的配置，同一个ds_id下如果offset/length/stride/count不同，则视为不同的chunk通信
 struct ChunkKeyHash {
@@ -24,6 +26,18 @@ struct ChunkKeyHash {
         seed ^= (std::hash<long>{}(length) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
         seed ^= (std::hash<long>{}(stride) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
         seed ^= (std::hash<long>{}(count) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        return seed;
+    }
+};
+
+struct ChunkBufferKeyHash {
+    size_t operator()(const ChunkBufferKey& key) const
+    {
+        auto [length, stride, count, dtype] = key;
+        size_t seed = std::hash<long>{}(length);
+        seed ^= (std::hash<long>{}(stride) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        seed ^= (std::hash<long>{}(count) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        seed ^= (std::hash<int>{}(static_cast<int>(dtype)) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
         return seed;
     }
 };
@@ -217,7 +231,21 @@ public:
         auto options = ds_tensor.options().dtype(target_dtype);
 
         const int64_t chunk_size = length * segments;
-        at::Tensor send_buf = torch::zeros({chunk_size}, options);
+        const int64_t world_chunk_size = static_cast<int64_t>(world_size) * chunk_size;
+        const ChunkBufferKey buf_key = std::make_tuple(length, stride_elems, segments, target_dtype);
+        auto& chunk_pool = get_chunk_buffers(ds_id, buf_key, chunk_size, world_chunk_size, options);
+        const size_t slot = chunk_pool.cursor;
+        chunk_pool.cursor = (chunk_pool.cursor + 1) % chunk_pool.send.size();
+        at::Tensor send_buf = chunk_pool.send[slot];
+        at::Tensor recv_buf = chunk_pool.recv[slot];
+        at::Tensor chunk_buf = chunk_pool.chunk[slot];
+        const bool need_zero_send = (segments > 1) || ((offset + chunk_size) > true_numel);
+        const bool need_zero_chunk = (offset + chunk_size) > true_numel;
+        if (need_zero_send || need_zero_chunk) {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            if (need_zero_send) { send_buf.zero_(); }
+            if (need_zero_chunk) { chunk_buf.zero_(); }
+        }
 
         {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
@@ -238,8 +266,6 @@ public:
             }
         }
 
-        at::Tensor recv_buf = torch::zeros({world_size * chunk_size}, options);
-
         // Ensure the param shard is ready before launching comm
         assert(hasKey(ag_comp_done_events_, ds_id));
         ag_comp_done_events_[ds_id]->record();
@@ -257,7 +283,6 @@ public:
         }
 
         // Stitch the relevant pieces into a compact chunk buffer
-        at::Tensor chunk_buf = torch::zeros({chunk_size}, options);
         for (int r = 0; r < world_size; ++r) {
             const int64_t r_start = static_cast<int64_t>(r) * padded_per_rank;
             const int64_t r_end = r_start + padded_per_rank;
@@ -548,6 +573,33 @@ public:
 private:
     using ChunkEventMap =
         std::unordered_map<ChunkKey, std::shared_ptr<at::cuda::CUDAEvent>, ChunkKeyHash>;
+    struct ChunkBufferPool {
+        std::vector<at::Tensor> send;
+        std::vector<at::Tensor> recv;
+        std::vector<at::Tensor> chunk;
+        size_t cursor = 0;
+    };
+    ChunkBufferPool& get_chunk_buffers(long ds_id,
+                                       const ChunkBufferKey& key,
+                                       int64_t chunk_size,
+                                       int64_t world_chunk_size,
+                                       at::TensorOptions options)
+    {
+        auto& pools = chunk_buffer_pool_[ds_id];
+        auto& pool = pools[key];
+        if (pool.send.empty()) {
+            pool.cursor = 0;
+            pool.send.resize(kChunkBufferStages);
+            pool.recv.resize(kChunkBufferStages);
+            pool.chunk.resize(kChunkBufferStages);
+            for (size_t i = 0; i < kChunkBufferStages; ++i) {
+                pool.send[i] = torch::zeros({chunk_size}, options);
+                pool.recv[i] = torch::zeros({world_chunk_size}, options);
+                pool.chunk[i] = torch::zeros({chunk_size}, options);
+            }
+        }
+        return pool;
+    }
 
     at::cuda::CUDAStream ag_stream_;
     at::cuda::CUDAStream offload_stream_;
@@ -562,6 +614,9 @@ private:
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> reload_events_;
     std::unordered_map<long, at::Tensor> offload_buffers_;
     std::unordered_map<long, at::Tensor> reload_buffers_;
+    std::unordered_map<long,
+                       std::unordered_map<ChunkBufferKey, ChunkBufferPool, ChunkBufferKeyHash>>
+        chunk_buffer_pool_;
 
     std::unordered_map<long, long> param_use_count_;
 };

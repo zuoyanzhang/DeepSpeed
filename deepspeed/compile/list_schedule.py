@@ -333,8 +333,8 @@ def fast_free_schedule(graph: Graph, available_mem: int, output_size: int, debug
 
                 diff_required_nodes = get_node_requirements(last_use, scheduled + schedule_until_ag)
 
-                allgather_cost = sum(n.meta["device_time"] for n in schedule_until_ag)
-                free_cost = sum(n.meta["device_time"] for n in diff_required_nodes)
+                allgather_cost = sum(n.meta.get("device_time", 0.0) for n in schedule_until_ag)
+                free_cost = sum(n.meta.get("device_time", 0.0) for n in diff_required_nodes)
                 allgathered_mem = node.meta["tensor_size"]
                 allgather_acc_mem = sum(n.meta["tensor_size"] for n in schedule_until_ag
                                         if n.target == torch.ops.dc.allgather_param.default)
