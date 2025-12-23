@@ -11,8 +11,8 @@ MODEL_PATH=${MODEL_PATH:-"/data/home/scvj326/run/.cache/modelscope/hub/models/LL
 export NUM_NODES=${NUM_NODES:-4}
 
 MODEL=${MODEL_NAME:-"Llama-3.2-1B-Instruct"}
-BATCH_SIZE_OPTS=(2)
-SEQ_LENGTH_OPTS=(2048)
+BATCH_SIZE_OPTS=(1)
+SEQ_LENGTH_OPTS=(4096)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
         # 如果要预加载权重, 加上${LOAD_OPTS}

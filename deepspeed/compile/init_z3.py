@@ -60,6 +60,7 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         p.ds_persist = False
         dc.register_z3_param(p.ds_id, p.ds_shape, p.ds_tensor, grad_buffer, p.ds_persist)
 
+    # 是否应用了chunk_gemm需要确定一下
     if schedule is None:
         schedule = []
         if (compile_config.offload_parameters):

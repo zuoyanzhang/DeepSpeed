@@ -163,6 +163,7 @@ The following optimization passes are currently available in DeepCompile:
 
 - All-gather & reduce-scatter insertion (ZeRO3)
 - Proactive prefetching (ZeRO3)
+- Chunked all-gather + GEMM pipelining (`chunk_gemm`) — see [chunk_gemm.md](chunk_gemm.md)
 - Selective unsharding (ZeRO3)
 - Reduce-scatter insertion (ZeRO1)
 - Adaptive offloading
