@@ -204,6 +204,12 @@ def run_opt_passes(opt_passes: List[Callable],
 
             mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log)
             mem_prof.run(*create_inputs_fn())
+            # Backward graphs should be executed with grad disabled to avoid unnecessary memory tracking
+            if bwd:
+                with torch.no_grad():
+                    mem_prof.run(*create_inputs_fn())
+            else:
+                mem_prof.run(*create_inputs_fn())
             mem = [(name, current_alloc, delta, peak) for name, current_alloc, delta, peak in mem_prof.mem_record]
 
             set_time_and_tensor_size(graph_id, gm.graph, mem, bwd, profiling_results)

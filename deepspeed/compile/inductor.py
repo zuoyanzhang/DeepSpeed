@@ -175,7 +175,7 @@ def register_custom_ops():
                     self.codegen_comment(wrapper)
                     args = [*self.codegen_args(), *self.codegen_kwargs()]
 
-                    if required_torch_version(min_version=2.8):
+                    if required_torch_version(min_version=2.7):
                         V.graph.wrapper_code.generate_fallback_kernel(self)
                     else:
                         V.graph.wrapper_code.generate_fallback_kernel(self, args)

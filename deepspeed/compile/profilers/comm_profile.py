@@ -117,6 +117,8 @@ def run_all_gather(device, dtype, maxsize, warmup=5, trials=10, async_op=False):
         sync_all()
         results.append(timed_all_gather(device, input, output, start_event, end_event, warmup, trials, async_op))
 
+        del input, output
+        get_accelerator().empty_cache()
     return results
 
 

@@ -107,7 +107,8 @@ class ProfilingInterpreter(Interpreter):
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):
                     self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
-                    return_val = super().run(*args)
+                    with torch.no_grad():
+                        return_val = super().run(*args)
         except Exception as e:
             msg = e.msg if "msg" in dir(e) else str(e)
             print(f"Profiling error {msg}")
