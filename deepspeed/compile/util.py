@@ -81,7 +81,7 @@ def get_no_copy_ops():
     # Need to compile custom ops
     get_deepcompile_handle()
 
-    no_copy_ops = {torch.ops.dc.wait_allgather.default}
+    no_copy_ops = {torch.ops.dc.wait_allgather.default, torch.ops.dc.wait_allgather_chunk.default}
 
     # All operations whose return value aliases any of their inputs are included
     # in the returned list to ensure that the last user of a node is computed

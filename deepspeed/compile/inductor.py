@@ -175,6 +175,8 @@ def register_custom_ops():
                     self.codegen_comment(wrapper)
                     args = [*self.codegen_args(), *self.codegen_kwargs()]
 
+                    # this need to be seted 2.7, otherwise it has the error message:
+                    # TypeError: PythonWrapperCodegen.generate_fallback_kernel() takes 2 positional arguments but 3 were given
                     if required_torch_version(min_version=2.7):
                         V.graph.wrapper_code.generate_fallback_kernel(self)
                     else:
@@ -208,7 +210,13 @@ def register_custom_ops():
     # Inductor tries to reuse output buffer when possible. We need to disable this behavior for some custom ops.
     # -> It seems that memory region is still reused in some cases. So we clone the inputs for some ops.
     register_fallback_no_reuse(torch.ops.dc.allgather_param.default, never_reuse_input=False, never_reuse_output=True)
+    register_fallback_no_reuse(torch.ops.dc.allgather_param_chunk.default,
+                               never_reuse_input=False,
+                               never_reuse_output=True)
     register_fallback_no_reuse(torch.ops.dc.wait_allgather.default, never_reuse_input=True, never_reuse_output=True)
+    register_fallback_no_reuse(torch.ops.dc.wait_allgather_chunk.default,
+                               never_reuse_input=True,
+                               never_reuse_output=True)
     register_fallback_no_reuse(torch.ops.dc.release_param.default, never_reuse_input=True, never_reuse_output=False)
     register_fallback_no_reuse(torch.ops.dc.reduce_grad.default,
                                never_reuse_input=True,

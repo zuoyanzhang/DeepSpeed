@@ -48,7 +48,7 @@ def get_args():
 
 
 def make_schedule(passes: List[str], warmup):
-    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states
+    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, chunk_gemm
 
     schedule = []
 
@@ -66,6 +66,8 @@ def make_schedule(passes: List[str], warmup):
             second_opt.append(prefetch.schedule_prefetch)
         if "selective_gather" in passes:
             second_opt.append(selective_gather.selective_gather)
+        if "chunk_gemm" in passes:
+            second_opt.append(chunk_gemm.chunk_gemm)
         schedule.append((warmup, second_opt))
     return schedule
 

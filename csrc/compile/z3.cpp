@@ -3,12 +3,29 @@
 
 // DeepSpeed Team
 
+#include <algorithm>
+#include <functional>
+#include <tuple>
 #include "z3.h"
 #include "deepcompile.h"
 
 namespace dc {
 
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
+
+using ChunkKey = std::tuple<long, long, long, long>;
+
+struct ChunkKeyHash {
+    size_t operator()(const ChunkKey& key) const
+    {
+        auto [offset, length, stride, count] = key;
+        size_t seed = std::hash<long>{}(offset);
+        seed ^= (std::hash<long>{}(length) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        seed ^= (std::hash<long>{}(stride) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        seed ^= (std::hash<long>{}(count) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+        return seed;
+    }
+};
 
 class Z3CustomOpExecutor : public CustomOpExecutor {
 public:
@@ -161,6 +178,120 @@ public:
             .view(param.getShape());
     }
 
+    at::Tensor allgatherParamChunk(long ds_id,
+                                   long offset,
+                                   long length,
+                                   long stride,
+                                   long chunk_count,
+                                   std::optional<at::ScalarType> dtype,
+                                   c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
+    {
+        (void)symm_mem;
+        TORCH_CHECK(length > 0, "chunk length must be positive");
+        TORCH_CHECK(chunk_count > 0, "chunk_count must be positive");
+        TORCH_CHECK(stride >= 0, "stride must be non-negative");
+
+        const int64_t segments = static_cast<int64_t>(chunk_count);
+        const int64_t stride_elems = (segments == 1) ? (stride > 0 ? stride : length) : stride;
+        TORCH_CHECK(segments == 1 || stride_elems > 0, "stride must be positive when chunk_count > 1");
+
+        const ChunkKey chunk_key = std::make_tuple(offset, length, stride, chunk_count);
+
+        const DSParam& param = param_registry_->getParam(ds_id);
+        const at::Tensor& ds_tensor = param.getDSTensor();
+        const int world_size = process_group_->getSize();
+        const int64_t true_numel = static_cast<int64_t>(productDim(param.getShape()));
+        const int64_t padded_per_rank = (true_numel + world_size - 1) / world_size;
+        const int64_t padded_numel = static_cast<int64_t>(world_size) * padded_per_rank;
+
+        TORCH_CHECK(offset >= 0, "offset must be non-negative");
+        TORCH_CHECK(offset < padded_numel, "chunk offset is out of range");
+
+        const int rank = process_group_->getRank();
+        const int64_t local_start = static_cast<int64_t>(rank) * padded_per_rank;
+        const int64_t local_end = local_start + padded_per_rank;
+
+        at::ScalarType target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
+        auto options = ds_tensor.options().dtype(target_dtype);
+
+        const int64_t chunk_size = length * segments;
+        at::Tensor send_buf = torch::zeros({chunk_size}, options);
+
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            const auto flat_ds = ds_tensor.flatten();
+            for (int64_t idx = 0; idx < segments; ++idx) {
+                const int64_t seg_start = offset + idx * stride_elems;
+                const int64_t seg_end = seg_start + length;
+                const int64_t overlap_start = std::max<int64_t>(seg_start, local_start);
+                const int64_t overlap_end = std::min<int64_t>(seg_end, local_end);
+                const int64_t overlap_len = std::max<int64_t>(static_cast<int64_t>(0),
+                                                               overlap_end - overlap_start);
+                if (overlap_len <= 0) { continue; }
+
+                const int64_t src_offset = overlap_start - local_start;
+                const int64_t dst_offset = idx * length + (overlap_start - seg_start);
+                send_buf.narrow(0, dst_offset, overlap_len)
+                    .copy_(flat_ds.narrow(0, src_offset, overlap_len), true);
+            }
+        }
+
+        at::Tensor recv_buf = torch::zeros({world_size * chunk_size}, options);
+
+        // Ensure the param shard is ready before launching comm
+        assert(hasKey(ag_comp_done_events_, ds_id));
+        ag_comp_done_events_[ds_id]->record();
+        ag_comp_done_events_[ds_id]->block(ag_stream_);
+
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            ncclResult_t result = ncclAllGather(send_buf.contiguous().data_ptr(),
+                                                recv_buf.data_ptr(),
+                                                chunk_size,
+                                                get_nccl_data_type(send_buf.scalar_type()),
+                                                nccl_comm_,
+                                                ag_stream_);
+            if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather (chunk) failed"); }
+        }
+
+        // Stitch the relevant pieces into a compact chunk buffer
+        at::Tensor chunk_buf = torch::zeros({chunk_size}, options);
+        for (int r = 0; r < world_size; ++r) {
+            const int64_t r_start = static_cast<int64_t>(r) * padded_per_rank;
+            const int64_t r_end = r_start + padded_per_rank;
+            for (int64_t idx = 0; idx < segments; ++idx) {
+                const int64_t seg_start = offset + idx * stride_elems;
+                const int64_t seg_end = seg_start + length;
+
+                const int64_t r_overlap_start = std::max<int64_t>(seg_start, r_start);
+                const int64_t r_overlap_end = std::min<int64_t>(seg_end, r_end);
+                if (r_overlap_start >= r_overlap_end) { continue; }
+
+                const int64_t r_overlap_len = r_overlap_end - r_overlap_start;
+                const int64_t dst_offset = idx * length + (r_overlap_start - seg_start);
+                const int64_t src_offset = r * chunk_size + idx * length + (r_overlap_start - seg_start);
+
+                chunk_buf.narrow(0, dst_offset, r_overlap_len)
+                    .copy_(recv_buf.narrow(0, src_offset, r_overlap_len), true);
+            }
+        }
+
+        chunk_buf.record_stream(ag_stream_);
+        ag_chunk_comm_done_events_[ds_id][chunk_key] =
+            std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+        ag_chunk_comm_done_events_[ds_id][chunk_key]->record(ag_stream_);
+
+        int64_t valid_length = 0;
+        for (int64_t idx = 0; idx < segments; ++idx) {
+            const int64_t seg_start = offset + idx * stride_elems;
+            const int64_t seg_valid =
+                std::min<int64_t>(length, std::max<int64_t>(static_cast<int64_t>(0), true_numel - seg_start));
+            valid_length += seg_valid;
+        }
+        valid_length = std::min<int64_t>(valid_length, chunk_size);
+        return chunk_buf.narrow(0, 0, valid_length);
+    }
+
     void prefetchParamsFused(const std::vector<long>& ds_ids,
                              const std::optional<std::vector<at::ScalarType>> dtypes,
                              c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
@@ -219,15 +350,17 @@ public:
         param_use_count_[ds_id]--;
 
         if (param_use_count_[ds_id] == 0 && !param.isPersistent()) {
-            at::Tensor gathered_param = param_registry_->getGatheredParam(ds_id);
+            if (param_registry_->hasGatheredParam(ds_id)) {
+                at::Tensor gathered_param = param_registry_->getGatheredParam(ds_id);
 
-            if (gathered_param.defined()) {  // gathered param is undefined while profiling
-                const auto options = gathered_param.options();
-                at::Tensor empty_buffer = torch::empty({0}, options);
-                gathered_param.set_data(empty_buffer);
+                if (gathered_param.defined()) {  // gathered param is undefined while profiling
+                    const auto options = gathered_param.options();
+                    at::Tensor empty_buffer = torch::empty({0}, options);
+                    gathered_param.set_data(empty_buffer);
+                }
+
+                param_registry_->unregisterGatheredParam(ds_id);
             }
-
-            param_registry_->unregisterGatheredParam(ds_id);
         }
     }
 
@@ -235,6 +368,24 @@ public:
     {
         assert(hasKey(ag_comm_done_events_, ds_id));
         ag_comm_done_events_[ds_id]->block(at::cuda::getCurrentCUDAStream());
+        return v;
+    }
+
+    at::Tensor waitAllgatherChunk(at::Tensor v,
+                                  long ds_id,
+                                  long offset,
+                                  long length,
+                                  long stride,
+                                  long chunk_count)
+    {
+        TORCH_CHECK(chunk_count > 0, "chunk_count must be positive");
+        TORCH_CHECK(stride >= 0, "stride must be non-negative");
+        const ChunkKey chunk_key = std::make_tuple(offset, length, stride, chunk_count);
+        assert(hasKey(ag_chunk_comm_done_events_, ds_id));
+        const auto& chunk_events = ag_chunk_comm_done_events_.at(ds_id);
+        auto it = chunk_events.find(chunk_key);
+        assert(it != chunk_events.end());
+        it->second->block(at::cuda::getCurrentCUDAStream());
         return v;
     }
 
@@ -393,12 +544,16 @@ public:
     bool hasParam(long ds_id) const { return hasKey(has_acc_grad_, ds_id); }
 
 private:
+    using ChunkEventMap =
+        std::unordered_map<ChunkKey, std::shared_ptr<at::cuda::CUDAEvent>, ChunkKeyHash>;
+
     at::cuda::CUDAStream ag_stream_;
     at::cuda::CUDAStream offload_stream_;
     at::cuda::CUDAStream reload_stream_;
 
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comp_done_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comm_done_events_;
+    std::unordered_map<long, ChunkEventMap> ag_chunk_comm_done_events_;
 
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> offload_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> offload_comp_done_events_;
@@ -490,6 +645,22 @@ at::Tensor allgather_param(at::Tensor param_tensor,
     return ret;
 }
 
+at::Tensor allgather_param_chunk(at::Tensor param_tensor,
+                                 long graph_id,
+                                 long ds_id,
+                                 long offset,
+                                 long length,
+                                 long stride,
+                                 long chunk_count,
+                                 std::optional<at::ScalarType> dtype)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    if (sync_before_allgather) { c10::cuda::device_synchronize(); }
+    auto ret = executor->allgatherParamChunk(ds_id, offset, length, stride, chunk_count, dtype, symm_mem);
+    if (sync_after_allgather) { c10::cuda::device_synchronize(); }
+    return ret;
+}
+
 void set_persistent(long ds_id)
 {
     param_registry->setPersistent(ds_id, true);
@@ -554,6 +725,24 @@ at::Tensor allgather_param_meta(at::Tensor param_tensor,
     return output_buf;
 }
 
+at::Tensor allgather_param_chunk_meta(at::Tensor param_tensor,
+                                      long graph_id,
+                                      long ds_id,
+                                      long offset,
+                                      long length,
+                                      long stride,
+                                      long chunk_count,
+                                      std::optional<at::ScalarType> dtype)
+{
+    const DSParam& param = param_registry->getParam(ds_id);
+    auto options = param.getDSTensor().options().device(c10::kMeta);
+    TORCH_CHECK(chunk_count > 0, "chunk_count must be positive");
+    TORCH_CHECK(stride >= 0, "stride must be non-negative");
+    const int64_t segments = std::max<long>(1, chunk_count);
+    at::Tensor output_buf = torch::empty({length * segments}, options.dtype(dtype));
+    return output_buf;
+}
+
 at::Tensor release_param(at::Tensor dummy, long graph_id, long ds_id, long n_users)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
@@ -566,6 +755,19 @@ at::Tensor release_param_meta(at::Tensor dummy, long graph_id, long ds_id, long 
     return dummy;
 }
 
+at::Tensor wait_allgather_chunk(at::Tensor v,
+                                long graph_id,
+                                long ds_id,
+                                long offset,
+                                long length,
+                                long stride,
+                                long chunk_count)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    executor->waitAllgatherChunk(v, ds_id, offset, length, stride, chunk_count);
+    return v;
+}
+
 at::Tensor wait_allgather(at::Tensor v, long graph_id, long ds_id)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
@@ -574,6 +776,18 @@ at::Tensor wait_allgather(at::Tensor v, long graph_id, long ds_id)
 }
 
 at::Tensor wait_allgather_meta(at::Tensor v, long graph_id, long ds_id) { return v; }
+at::Tensor wait_allgather_chunk_meta(at::Tensor v,
+                                     long graph_id,
+                                     long ds_id,
+                                     long offset,
+                                     long length,
+                                     long stride,
+                                     long chunk_count)
+{
+    TORCH_CHECK(chunk_count > 0, "chunk_count must be positive");
+    TORCH_CHECK(stride >= 0, "stride must be non-negative");
+    return v;
+}
 
 at::Tensor offload_tensor(at::Tensor tensor, long graph_id, long id)
 {

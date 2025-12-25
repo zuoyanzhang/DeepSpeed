@@ -6,7 +6,6 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --output=logs/%x-%j.out.log
-#SBATCH --error=logs/%x-%j.err.log
 
 module load miniforge3/24.1 compilers/gcc/11.3.0  compilers/cuda/12.4  cudnn/8.9.5.29_cuda12.x nccl/2.26.5-1_cuda12.4
 source /home/bingxing2/apps/miniforge3/24.1.2/etc/profile.d/conda.sh

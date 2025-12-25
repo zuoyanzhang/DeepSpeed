@@ -11,10 +11,12 @@
 TORCH_LIBRARY(dc, m)
 {
     m.def("allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor");
+    m.def("allgather_param_chunk(Tensor a, int graph_id, int id, int offset, int length, int stride = 0, int chunk_count = 1, ScalarType? dtype = None) -> Tensor");
     m.def(
         "prefetch_params_fused(int graph_id, Tensor[] params, int[] ids,"
         "                      ScalarType[]? dtypes = None) -> ()");
     m.def("wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)");
+    m.def("wait_allgather_chunk(Tensor(a) a, int graph_id, int id, int offset, int length, int stride = 0, int chunk_count = 1) -> Tensor(a)");
     m.def("release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)");
     m.def("reduce_grad(Tensor a, int graph_id, int id) -> Tensor");
     m.def("free_tensors(Tensor[] a) -> ()");
@@ -32,8 +34,10 @@ TORCH_LIBRARY(dc, m)
 TORCH_LIBRARY_IMPL(dc, CPU, m)
 {
     m.impl("allgather_param", &dc::allgather_param);
+    m.impl("allgather_param_chunk", &dc::allgather_param_chunk);
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused);
     m.impl("wait_allgather", &dc::wait_allgather);
+    m.impl("wait_allgather_chunk", &dc::wait_allgather_chunk);
     m.impl("release_param", &dc::release_param);
     m.impl("reduce_grad", &dc::reduce_grad);
     m.impl("free_tensors", &dc::free_tensors);
@@ -50,8 +54,10 @@ TORCH_LIBRARY_IMPL(dc, CPU, m)
 TORCH_LIBRARY_IMPL(dc, CUDA, m)
 {
     m.impl("allgather_param", &dc::allgather_param);
+    m.impl("allgather_param_chunk", &dc::allgather_param_chunk);
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused);
     m.impl("wait_allgather", &dc::wait_allgather);
+    m.impl("wait_allgather_chunk", &dc::wait_allgather_chunk);
     m.impl("release_param", &dc::release_param);
     m.impl("reduce_grad", &dc::reduce_grad);
     m.impl("free_tensors", &dc::free_tensors);
@@ -68,9 +74,11 @@ TORCH_LIBRARY_IMPL(dc, CUDA, m)
 TORCH_LIBRARY_IMPL(dc, Meta, m)
 {
     m.impl("allgather_param", &dc::allgather_param_meta);
+    m.impl("allgather_param_chunk", &dc::allgather_param_chunk_meta);
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused_meta);
     m.impl("release_param", &dc::release_param_meta);
     m.impl("wait_allgather", &dc::wait_allgather_meta);
+    m.impl("wait_allgather_chunk", &dc::wait_allgather_chunk_meta);
     m.impl("reduce_grad", &dc::reduce_grad_meta);
     m.impl("free_tensors", &dc::free_tensors_meta);
     m.impl("reload_parameter", &dc::reload_parameter_meta);
