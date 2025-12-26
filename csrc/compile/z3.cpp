@@ -215,10 +215,21 @@ public:
         auto options = ds_tensor.options().dtype(target_dtype);
 
         const int64_t chunk_size = length * segments;
-        at::Tensor send_buf = torch::zeros({chunk_size}, options);
+        // Ensure the param shard is ready before reading it on ag_stream_.
+        // This matches the synchronization scheme used by allgatherParam().
+        assert(hasKey(ag_comp_done_events_, ds_id));
+        ag_comp_done_events_[ds_id]->record();
+        ag_comp_done_events_[ds_id]->block(ag_stream_);
 
+        // IMPORTANT: Run the entire chunk gather + stitching on ag_stream_.
+        // The previous implementation launched NCCL on ag_stream_ but then stitched
+        // the result on the current stream without synchronizing, which could read
+        // incomplete data and corrupt the output (e.g., bad loss without --deterministic).
+        at::Tensor chunk_buf;
         {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
+
+            at::Tensor send_buf = torch::zeros({chunk_size}, options);
             const auto flat_ds = ds_tensor.flatten();
             for (int64_t idx = 0; idx < segments; ++idx) {
                 const int64_t seg_start = offset + idx * stride_elems;
@@ -234,17 +245,9 @@ public:
                 send_buf.narrow(0, dst_offset, overlap_len)
                     .copy_(flat_ds.narrow(0, src_offset, overlap_len), true);
             }
-        }
 
-        at::Tensor recv_buf = torch::zeros({world_size * chunk_size}, options);
+            at::Tensor recv_buf = torch::zeros({world_size * chunk_size}, options);
 
-        // Ensure the param shard is ready before launching comm
-        assert(hasKey(ag_comp_done_events_, ds_id));
-        ag_comp_done_events_[ds_id]->record();
-        ag_comp_done_events_[ds_id]->block(ag_stream_);
-
-        {
-            at::cuda::CUDAStreamGuard guard(ag_stream_);
             ncclResult_t result = ncclAllGather(send_buf.contiguous().data_ptr(),
                                                 recv_buf.data_ptr(),
                                                 chunk_size,
@@ -252,34 +255,34 @@ public:
                                                 nccl_comm_,
                                                 ag_stream_);
             if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather (chunk) failed"); }
-        }
 
-        // Stitch the relevant pieces into a compact chunk buffer
-        at::Tensor chunk_buf = torch::zeros({chunk_size}, options);
-        for (int r = 0; r < world_size; ++r) {
-            const int64_t r_start = static_cast<int64_t>(r) * padded_per_rank;
-            const int64_t r_end = r_start + padded_per_rank;
-            for (int64_t idx = 0; idx < segments; ++idx) {
-                const int64_t seg_start = offset + idx * stride_elems;
-                const int64_t seg_end = seg_start + length;
+            // Stitch the relevant pieces into a compact chunk buffer
+            chunk_buf = torch::zeros({chunk_size}, options);
+            for (int r = 0; r < world_size; ++r) {
+                const int64_t r_start = static_cast<int64_t>(r) * padded_per_rank;
+                const int64_t r_end = r_start + padded_per_rank;
+                for (int64_t idx = 0; idx < segments; ++idx) {
+                    const int64_t seg_start = offset + idx * stride_elems;
+                    const int64_t seg_end = seg_start + length;
 
-                const int64_t r_overlap_start = std::max<int64_t>(seg_start, r_start);
-                const int64_t r_overlap_end = std::min<int64_t>(seg_end, r_end);
-                if (r_overlap_start >= r_overlap_end) { continue; }
+                    const int64_t r_overlap_start = std::max<int64_t>(seg_start, r_start);
+                    const int64_t r_overlap_end = std::min<int64_t>(seg_end, r_end);
+                    if (r_overlap_start >= r_overlap_end) { continue; }
 
-                const int64_t r_overlap_len = r_overlap_end - r_overlap_start;
-                const int64_t dst_offset = idx * length + (r_overlap_start - seg_start);
-                const int64_t src_offset = r * chunk_size + idx * length + (r_overlap_start - seg_start);
+                    const int64_t r_overlap_len = r_overlap_end - r_overlap_start;
+                    const int64_t dst_offset = idx * length + (r_overlap_start - seg_start);
+                    const int64_t src_offset = r * chunk_size + idx * length + (r_overlap_start - seg_start);
 
-                chunk_buf.narrow(0, dst_offset, r_overlap_len)
-                    .copy_(recv_buf.narrow(0, src_offset, r_overlap_len), true);
+                    chunk_buf.narrow(0, dst_offset, r_overlap_len)
+                        .copy_(recv_buf.narrow(0, src_offset, r_overlap_len), true);
+                }
             }
-        }
 
-        chunk_buf.record_stream(ag_stream_);
-        ag_chunk_comm_done_events_[ds_id][chunk_key] =
-            std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
-        ag_chunk_comm_done_events_[ds_id][chunk_key]->record(ag_stream_);
+            chunk_buf.record_stream(ag_stream_);
+            ag_chunk_comm_done_events_[ds_id][chunk_key] =
+                std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+            ag_chunk_comm_done_events_[ds_id][chunk_key]->record(ag_stream_);
+        }
 
         int64_t valid_length = 0;
         for (int64_t idx = 0; idx < segments; ++idx) {

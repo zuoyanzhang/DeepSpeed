@@ -1,6 +1,3 @@
-"""
-Chunk linear pass: 对 allgather + gemm 进行按 K 维度分块并流水化。
-"""
 from typing import List, Tuple, Optional
 
 import torch
@@ -12,7 +9,7 @@ import deepspeed.comm as dist
 
 NAME = "chunk_gemm"
 
-# TODO: 先手动设置chunksize，后面需要加上cost model来自动确定chunk size
+# TODO: 先手动设置chunksize
 DEFAULT_CHUNK_SIZE = 4096
 
 def _unwrap_weight_to_allgather(node: Node):
