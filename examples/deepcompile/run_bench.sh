@@ -15,11 +15,7 @@ BATCH_SIZE_OPTS=(2)
 SEQ_LENGTH_OPTS=(4096)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
-<<<<<<< Updated upstream
-        # 如果要预加载权重, 加上${LOAD_OPTS}，固定种子加上--deterministic
-=======
         # 如果要预加载权重, 加上${LOAD_OPTS}， 固定种子--deterministic
->>>>>>> Stashed changes
         ARGS="--model ${MODEL} ${LOAD_OPTS} --model_path ${MODEL_PATH} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} ${ACC_OPTS} ${AC_OPTS}"
         # bash ./run_multinode.sh --backend deepspeed ${ARGS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${COMPILE_OPTS}
@@ -27,12 +23,7 @@ for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
         # bash ./run_multinode.sh --backend fsdp ${ARGS}
         # bash ./run_multinode.sh --backend fsdp ${ARGS} ${COMPILE_OPTS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch,selective_gather
-<<<<<<< Updated upstream
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes chunk_gemm
-        # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes chunk_gemm,prefetch
-=======
         bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes global_layer_scheduler
->>>>>>> Stashed changes
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes selective_gather
 

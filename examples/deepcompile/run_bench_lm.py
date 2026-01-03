@@ -48,11 +48,7 @@ def get_args():
 
 
 def make_schedule(passes: List[str], warmup):
-<<<<<<< Updated upstream
-    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, chunk_gemm
-=======
     from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, global_layer_scheduler
->>>>>>> Stashed changes
 
     schedule = []
 
@@ -64,17 +60,6 @@ def make_schedule(passes: List[str], warmup):
         assert len(passes) == 1, "offload_adam_states_sync should be the only pass"
         schedule.append((0, [zero3_compile.add_z3_gather_release, offload_adam_states.move_opt_states_sync]))
     else:
-<<<<<<< Updated upstream
-        schedule.append((0, [zero3_compile.add_z3_gather_release]))
-        second_opt = [zero3_compile.add_z3_gather_release]
-        if "prefetch" in passes:
-            second_opt.append(prefetch.schedule_prefetch)
-        if "selective_gather" in passes:
-            second_opt.append(selective_gather.selective_gather)
-        if "chunk_gemm" in passes:
-            second_opt.append(chunk_gemm.chunk_gemm)
-        schedule.append((warmup, second_opt))
-=======
         if "global_layer_scheduler" in passes:
             assert "prefetch" not in passes and "selective_gather" not in passes, \
                 "global_layer_scheduler should not be combined with prefetch/selective_gather in the same schedule"
@@ -89,7 +74,6 @@ def make_schedule(passes: List[str], warmup):
             if "selective_gather" in passes:
                 second_opt.append(selective_gather.selective_gather)
             schedule.append((warmup, second_opt))
->>>>>>> Stashed changes
     return schedule
 
 
