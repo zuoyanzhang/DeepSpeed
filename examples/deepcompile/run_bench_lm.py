@@ -28,7 +28,7 @@ def get_args():
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--dataset_name", type=str, default="timdettmers/openassistant-guanaco")
     parser.add_argument("--num_layers", type=int, default=0)
-    parser.add_argument("--attn_impl", type=str, default="spda")
+    parser.add_argument("--attn_impl", type=str, default="sdpa")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--passes", type=str, default=None)
     parser.add_argument("--backend", type=str, default="inductor")
@@ -48,7 +48,11 @@ def get_args():
 
 
 def make_schedule(passes: List[str], warmup):
+<<<<<<< Updated upstream
     from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, chunk_gemm
+=======
+    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, global_layer_scheduler
+>>>>>>> Stashed changes
 
     schedule = []
 
@@ -60,6 +64,7 @@ def make_schedule(passes: List[str], warmup):
         assert len(passes) == 1, "offload_adam_states_sync should be the only pass"
         schedule.append((0, [zero3_compile.add_z3_gather_release, offload_adam_states.move_opt_states_sync]))
     else:
+<<<<<<< Updated upstream
         schedule.append((0, [zero3_compile.add_z3_gather_release]))
         second_opt = [zero3_compile.add_z3_gather_release]
         if "prefetch" in passes:
@@ -69,6 +74,22 @@ def make_schedule(passes: List[str], warmup):
         if "chunk_gemm" in passes:
             second_opt.append(chunk_gemm.chunk_gemm)
         schedule.append((warmup, second_opt))
+=======
+        if "global_layer_scheduler" in passes:
+            assert "prefetch" not in passes and "selective_gather" not in passes, \
+                "global_layer_scheduler should not be combined with prefetch/selective_gather in the same schedule"
+            schedule.append((0, [zero3_compile.add_z3_gather_release]))
+            schedule.append((warmup, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
+            schedule.append((warmup + 1, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
+        else:
+            schedule.append((0, [zero3_compile.add_z3_gather_release]))
+            second_opt = [zero3_compile.add_z3_gather_release]
+            if "prefetch" in passes:
+                second_opt.append(prefetch.schedule_prefetch)
+            if "selective_gather" in passes:
+                second_opt.append(selective_gather.selective_gather)
+            schedule.append((warmup, second_opt))
+>>>>>>> Stashed changes
     return schedule
 
 
@@ -220,12 +241,15 @@ def main():
 
     stop = False
     with prof_context as prof:
+        step_compute_time = 0.0
         for epoch in range(args.num_epochs):
-            start_iter = time.time()
-
             for step, batch in enumerate(data_loader):
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
+
+                # Time only the training compute segment (exclude dataloader/epoch-boundary overhead).
+                # Start timing after the batch is already moved to device.
+                micro_start = time.time()
 
                 with acc_context(model):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
@@ -239,13 +263,17 @@ def main():
                     global_step += 1
 
                     if update_step:
+                        step_compute_time += time.time() - micro_start
+                        step_time = step_compute_time
                         alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
                         peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
                         if accelerator.is_main_process and global_step % (args.print_interval * args.gradient_accumulation_steps) == 0:
-                            print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item()} sync: {accelerator.sync_gradients} time: {time.time() - start_iter} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB")
+                            print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item()} sync: {accelerator.sync_gradients} time: {step_time} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB")
 
-                        iter_times.append(time.time() - start_iter)
-                        start_iter = time.time()
+                        iter_times.append(step_time)
+                        step_compute_time = 0.0
+                    else:
+                        step_compute_time += time.time() - micro_start
 
                 if do_profile:
                     prof.step()

@@ -10,7 +10,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToModuleSubClasses
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
-from .passes import zero3_compile, prefetch, selective_gather, offload_parameters
+from .passes import zero3_compile, prefetch, selective_gather, offload_parameters, global_layer_scheduler
 from .backend import make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook
@@ -67,9 +67,15 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append(
-                (WARMUP,
-                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
+            if getattr(compile_config, "global_layer_scheduler", False):
+                schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
+                schedule.append((WARMUP + 1, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
+            else:
+                schedule.append((WARMUP, [
+                    zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather
+                ]))
+
+    global_layer_scheduler.maybe_init_layer_mapping(engine.module, compile_config, schedule)
 
     init_schedule(schedule)
 

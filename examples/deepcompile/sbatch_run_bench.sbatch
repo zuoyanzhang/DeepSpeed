@@ -1,5 +1,4 @@
 #!/bin/bash
-#
 #SBATCH --job-name=deepcompile_bench
 #SBATCH --nodes=1
 #SBATCH --qos=gpugpu
@@ -29,7 +28,13 @@ else
     export NGPUS_PER_NODE=1
 fi
 export NUM_NODES=${SLURM_NNODES:-1}
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+if [ -z "${MASTER_ADDR:-}" ]; then
+    if [ -n "${SLURM_NODELIST:-}" ]; then
+        export MASTER_ADDR=$(scontrol show hostnames "${SLURM_NODELIST}" | head -n1)
+    else
+        export MASTER_ADDR="127.0.0.1"
+    fi
+fi
 export MASTER_PORT=${MASTER_PORT:-$((15000 + RANDOM % 10000))}
 
 # 运行基准脚本（多节点启动由 run_multinode.sh 内部的 srun 负责）

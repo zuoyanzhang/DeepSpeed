@@ -32,6 +32,10 @@ while [[ $# -gt 0 ]]; do
             HOST_IP="$2"
             shift 2
             ;;
+        --host-port)
+            HOST_PORT="$2"
+            shift 2
+            ;;
         --backend)
             BACKEND="$2"
             shift 2
@@ -130,6 +134,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+HOST_IP="${HOST_IP:-${MASTER_ADDR:-$(hostname)}}"
+HOST_PORT="${HOST_PORT:-${MASTER_PORT:-12345}}"
+
+if [ -n "${SLURM_NODEID:-}" ]; then
+    MACHINE_RANK="${SLURM_NODEID}"
+elif [ -n "${SLURM_PROCID:-}" ]; then
+    MACHINE_RANK="${SLURM_PROCID}"
+else
+    MACHINE_RANK=0
+fi
+
 
 
 export NCCL_DEBUG=WARN
@@ -168,8 +183,6 @@ echo "ZERO_STAGE: ${ZERO_STAGE}"
 echo "MODEL: ${MODEL}"
 echo "GRADIENT_ACCUMULATION_STEPS: ${GRADIENT_ACCUMULATION_STEPS}"
 echo "EXTRA_OPTS: ${EXTRA_OPTS}"
-
-MACHINE_RANK=$(hostname | sed 's/[^0-9]*//g')
 
 python generate_conf.py \
     --machine_rank ${MACHINE_RANK} \
@@ -232,7 +245,7 @@ mkdir -p ${LOG_DIR}
 LOG_FILE=${LOG_DIR}/debug_n${MACHINE_RANK}_${MODEL##*/}_${BACKEND}_np${NUM_PROCESSES}z${ZERO_STAGE}c${COMPILE}dc${DEEPCOMPILE}E${EAGER}b${BATCH_SIZE}seq${SEQ_LENGTH}g${GRADIENT_ACCUMULATION_STEPS}a${ACTIVATION_CHECKPOINTING}p${PASSES}.log
 echo "Logging to ${LOG_FILE}"
 
-${HOME}/.conda/envs/py310/bin/accelerate launch --main_process_ip ${HOST_IP} --main_process_port 12345 \
+${HOME}/.conda/envs/py310/bin/accelerate launch --main_process_ip ${HOST_IP} --main_process_port ${HOST_PORT} \
 --num_machines ${NUM_NODES} --num_processes ${NUM_PROCESSES} --machine_rank ${MACHINE_RANK} \
 --config_file configs/config.yaml \
 run_bench_lm.py \

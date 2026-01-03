@@ -3,7 +3,6 @@
 echo $*
 
 SCRIPT_DIR=$(dirname $(realpath $0))
-HOST_IP=$(hostname -i)
 NUM_NODES=${NUM_NODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 
@@ -13,30 +12,32 @@ if ! [[ "$NUM_NODES" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-# check if NUM_NODES ==1 or hostfile_n${NUM_NODES} exists
-if [ ! -f hostfile_n${NUM_NODES} ] && [ "${NUM_NODES}" != "1" ]; then
+# check if NUM_NODES ==1 or hostfile_n${NUM_NODES} exists (only for non-Slurm runs)
+if [ -z "${SLURM_JOB_ID:-}" ] && [ ! -f hostfile_n${NUM_NODES} ] && [ "${NUM_NODES}" != "1" ]; then
     echo "Error: hostfile_n${NUM_NODES} does not exist"
     exit 1
 fi
 
 if [ "${NUM_NODES}" == "1" ]; then
     # avoid dependency on pdsh when possible
-    cd ${SCRIPT_DIR}; bash ./run.sh --host-ip ${HOST_IP} $*
+    export MASTER_ADDR="${MASTER_ADDR:-$(hostname)}"
+    export MASTER_PORT="${MASTER_PORT:-12345}"
+    cd ${SCRIPT_DIR}; bash ./run.sh --host-ip "${MASTER_ADDR}" --host-port "${MASTER_PORT}" $*
 else
     if [ -n "${SLURM_JOB_ID}" ]; then
-        if [ -n "${SLURM_NODELIST}" ]; then
+        MAIN_HOST=""
+        if [ -n "${SLURM_NODELIST:-}" ]; then
             MAIN_HOST=$(scontrol show hostnames "${SLURM_NODELIST}" | head -n1)
-            HOST_IP=$(getent hosts "${MAIN_HOST}" | awk '{print $1}')
         fi
-        if [ -z "${HOST_IP}" ]; then
-            HOST_IP=$(hostname -i)
-        fi
+        export MASTER_ADDR="${MASTER_ADDR:-${MAIN_HOST}}"
+        export MASTER_ADDR="${MASTER_ADDR:-$(hostname)}"
+        export MASTER_PORT="${MASTER_PORT:-$((15000 + RANDOM % 10000))}"
         LOG_DIR="${SCRIPT_DIR}/logs"
         mkdir -p "${LOG_DIR}"
         srun --nodes="${NUM_NODES}" --ntasks-per-node=1 --gpus-per-node="${NGPUS_PER_NODE}" \
             --output="${LOG_DIR}/srun-%t.out.log" \
-            --export=ALL,NUM_NODES="${NUM_NODES}",NGPUS_PER_NODE="${NGPUS_PER_NODE}" \
-            bash "${SCRIPT_DIR}/run.sh" --host-ip "${HOST_IP}" $*
+            --export=ALL,NUM_NODES="${NUM_NODES}",NGPUS_PER_NODE="${NGPUS_PER_NODE}",MASTER_ADDR="${MASTER_ADDR}",MASTER_PORT="${MASTER_PORT}" \
+            bash "${SCRIPT_DIR}/run.sh" --host-ip "${MASTER_ADDR}" --host-port "${MASTER_PORT}" $*
     else
         echo "Error: multi-node run requires Slurm; SLURM_JOB_ID is not set."
         exit 1
