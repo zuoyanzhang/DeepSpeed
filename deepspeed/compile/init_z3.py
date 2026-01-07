@@ -66,11 +66,11 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         if (compile_config.offload_parameters):
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
         else:
-            schedule.append((0, [zero3_compile.add_z3_gather_release]))
             if getattr(compile_config, "global_layer_scheduler", False):
-                schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
-                schedule.append((WARMUP + 1, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
+                schedule.append((0, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
+                schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
             else:
+                schedule.append((0, [zero3_compile.add_z3_gather_release]))
                 schedule.append((WARMUP, [
                     zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather
                 ]))

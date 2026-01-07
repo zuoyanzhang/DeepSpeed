@@ -63,9 +63,8 @@ def make_schedule(passes: List[str], warmup):
         if "global_layer_scheduler" in passes:
             assert "prefetch" not in passes and "selective_gather" not in passes, \
                 "global_layer_scheduler should not be combined with prefetch/selective_gather in the same schedule"
-            schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append((warmup, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
-            schedule.append((warmup + 1, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
+            schedule.append((0, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
+            schedule.append((warmup, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
             second_opt = [zero3_compile.add_z3_gather_release]
