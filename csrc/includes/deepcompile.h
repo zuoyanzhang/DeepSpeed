@@ -98,6 +98,8 @@ at::Tensor test_call(at::Tensor param);
 extern c10::intrusive_ptr<c10d::ProcessGroup> process_group;
 extern c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem;
 extern ncclComm_t nccl_comm;
+// Optional: separate communicator for allgather operations (to avoid serialization with reduce/allreduce on nccl_comm).
+extern ncclComm_t nccl_ag_comm;
 extern bool use_symm_mem;
 extern bool profile;
 extern bool pre_div_reduce;

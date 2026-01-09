@@ -16,6 +16,7 @@ std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets = nullptr;
 c10::intrusive_ptr<c10d::ProcessGroup> process_group = nullptr;
 c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem = nullptr;
 ncclComm_t nccl_comm;
+ncclComm_t nccl_ag_comm;
 bool use_symm_mem;
 bool profile = false;
 bool pre_div_reduce = true;
@@ -85,6 +86,8 @@ void cleanup()
 {
     reset();
 
+    // If allgather uses a dedicated communicator, destroy it as well.
+    if (nccl_ag_comm != nccl_comm) { ncclCommDestroy(nccl_ag_comm); }
     ncclCommDestroy(nccl_comm);
     process_group = nullptr;
     symm_mem = nullptr;
@@ -133,23 +136,37 @@ void init(c10::intrusive_ptr<c10d::ProcessGroup> pg,
 {
     process_group = pg;
 
+    // ProcessGroup doesn't have an API to get the CUDA stream for comm calls.
+    // So we create NCCL communicator(s) and call NCCL APIs directly.
+    auto device = torch::Device(torch::kCUDA);
+
+    // Primary communicator (used for reduce/allreduce/reduce-scatter).
     ncclUniqueId ncclID;
     ncclGetUniqueId(&ncclID);
-
-    // ProcessGroup doesn't have an API to get the CUDA stream for comm calls.
-    // So we create a NCCL communicator and call NCCL APIs directly.
     auto vec = std::vector<uint8_t>(reinterpret_cast<uint8_t*>(&ncclID),
                                     reinterpret_cast<uint8_t*>(&ncclID) + NCCL_UNIQUE_ID_BYTES);
-    auto device = torch::Device(torch::kCUDA);
-    at::Tensor tensor = torch::from_blob(vec.data(), {static_cast<long>(vec.size())}, torch::kUInt8)
-                            .to(torch::Device(torch::kCUDA));
+    at::Tensor tensor = torch::from_blob(vec.data(), {static_cast<long>(vec.size())}, torch::kUInt8).to(device);
     std::vector<at::Tensor> bcast_input = {tensor};
-
     process_group->broadcast(bcast_input, c10d::BroadcastOptions())->wait();
-
-    // create a new nccl communicator
     std::memcpy(&ncclID, tensor.to(torch::Device(torch::kCPU)).data_ptr(), NCCL_UNIQUE_ID_BYTES);
     ncclCommInitRank(&nccl_comm, process_group->getSize(), ncclID, process_group->getRank());
+
+    // Optional: separate communicator for allgather to improve overlap with reduce on different streams.
+    bool separate_ag_comm = get_config<bool>(config, "separate_allgather_communicator");
+    if (separate_ag_comm) {
+        ncclUniqueId agID;
+        ncclGetUniqueId(&agID);
+        auto vec_ag = std::vector<uint8_t>(reinterpret_cast<uint8_t*>(&agID),
+                                           reinterpret_cast<uint8_t*>(&agID) + NCCL_UNIQUE_ID_BYTES);
+        at::Tensor tensor_ag =
+            torch::from_blob(vec_ag.data(), {static_cast<long>(vec_ag.size())}, torch::kUInt8).to(device);
+        std::vector<at::Tensor> bcast_input_ag = {tensor_ag};
+        process_group->broadcast(bcast_input_ag, c10d::BroadcastOptions())->wait();
+        std::memcpy(&agID, tensor_ag.to(torch::Device(torch::kCPU)).data_ptr(), NCCL_UNIQUE_ID_BYTES);
+        ncclCommInitRank(&nccl_ag_comm, process_group->getSize(), agID, process_group->getRank());
+    } else {
+        nccl_ag_comm = nccl_comm;
+    }
 
     param_registry = std::make_shared<DSParamRegistry>();
     reduce_buckets = std::make_shared<DoubleBufferedReduceBucket>(

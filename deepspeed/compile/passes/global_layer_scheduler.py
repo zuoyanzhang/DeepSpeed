@@ -10,7 +10,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -29,6 +29,7 @@ NAME = "global_layer_scheduler"
 class _SchedulerConfig:
     layer_regexes: Tuple[str, ...]
     lookahead_blocks: int
+    autotune_lookahead_blocks: bool
     fuse_max_bytes: int
     fuse_deadline_window_blocks: int
     fuse_factor: float
@@ -45,6 +46,11 @@ class _SchedulerConfig:
     set_persistent: bool
     dump_schedule: bool
     dump_dir: Optional[str]
+    milp_time_limit_s: float
+    milp_node_limit: int
+    milp_rel_gap: float
+    milp_presolve: bool
+    separate_allgather_communicator: bool
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,7 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
     cfg = _SchedulerConfig(
         layer_regexes=tuple(getattr(compile_config, "global_layer_scheduler_layer_regexes", default_regexes)),
         lookahead_blocks=int(getattr(compile_config, "global_layer_scheduler_lookahead_blocks", 4)),
+        autotune_lookahead_blocks=bool(getattr(compile_config, "global_layer_scheduler_autotune_lookahead_blocks", True)),
         fuse_max_bytes=int(getattr(compile_config, "global_layer_scheduler_fuse_max_bytes", 256 * 1024 * 1024)),
         fuse_deadline_window_blocks=int(
             getattr(compile_config, "global_layer_scheduler_fuse_deadline_window_blocks", 1)),
@@ -141,6 +148,11 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
         set_persistent=bool(getattr(compile_config, "global_layer_scheduler_set_persistent", False)),
         dump_schedule=bool(getattr(compile_config, "global_layer_scheduler_dump_schedule", False)),
         dump_dir=(str(getattr(compile_config, "global_layer_scheduler_dump_dir", "")).strip() or None),
+        milp_time_limit_s=float(getattr(compile_config, "global_layer_scheduler_milp_time_limit_s", 2.0)),
+        milp_node_limit=int(getattr(compile_config, "global_layer_scheduler_milp_node_limit", 0)),
+        milp_rel_gap=float(getattr(compile_config, "global_layer_scheduler_milp_rel_gap", 0.01)),
+        milp_presolve=bool(getattr(compile_config, "global_layer_scheduler_milp_presolve", True)),
+        separate_allgather_communicator=bool(getattr(compile_config, "separate_allgather_communicator", True)),
     )
     _CFG = cfg
 
@@ -244,20 +256,6 @@ def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: 
     return ds_id_to_size
 
 
-def _build_ds_id_to_bwd_wait_ms(graph_id: int, profiling_results) -> Dict[int, float]:
-    prof = profiling_results[graph_id]
-    g = getattr(prof, "bwd_graph", None)
-    if g is None:
-        return {}
-    out: Dict[int, float] = {}
-    for n in g.nodes:
-        # Use allgather_param device_time as a proxy for backward comm cost (more stable than wait timing).
-        if n.target == torch.ops.dc.allgather_param.default and "device_time" in n.meta:
-            ds_id = int(n.args[2])
-            out[ds_id] = out.get(ds_id, 0.0) + float(n.meta["device_time"])
-    return out
-
-
 def _build_ds_id_to_allgather_ms(profiling_results) -> Dict[int, float]:
     out: Dict[int, float] = {}
     for prof in profiling_results.values():
@@ -271,46 +269,22 @@ def _build_ds_id_to_allgather_ms(profiling_results) -> Dict[int, float]:
     return out
 
 
-def _choose_keep_layers(L: int, layer_to_ds_ids: Sequence[Sequence[int]], ds_id_to_size: Dict[int, int],
-                        ds_id_to_bwd_wait_ms: Dict[int, float], mem_budget_bytes: int) -> List[int]:
-    if L <= 0 or mem_budget_bytes <= 0:
-        return []
+def _build_ds_id_to_wait_pos(graph: Optional[Graph]) -> Dict[int, int]:
+    # Approximate first-use order for each ds_id using wait_allgather positions (fallback to allgather positions).
+    out: Dict[int, int] = {}
+    if graph is None:
+        return out
 
-    K = 2 * L
-    reserved = [0] * K
-
-    candidates = []
-    for i in range(L):
-        ds_ids = [ds_id for ds_id in layer_to_ds_ids[i] if ds_id in ds_id_to_size]
-        if not ds_ids:
-            continue
-        size_bytes = sum(ds_id_to_size[ds_id] for ds_id in ds_ids)
-        if size_bytes <= 0:
-            continue
-        benefit_ms = sum(ds_id_to_bwd_wait_ms.get(ds_id, 0.0) for ds_id in ds_ids)
-        span = (2 * L - 1) - 2 * i
-        score = benefit_ms / max(size_bytes * span, 1)
-        candidates.append((score, benefit_ms, size_bytes, i))
-
-    candidates.sort(reverse=True)
-
-    keep_layers: List[int] = []
-    for _, _, size_bytes, i in candidates:
-        f_k = i
-        b_k = 2 * L - 1 - i
-        feasible = True
-        for k in range(f_k, b_k + 1):
-            if reserved[k] + size_bytes > mem_budget_bytes:
-                feasible = False
-                break
-        if not feasible:
-            continue
-        for k in range(f_k, b_k + 1):
-            reserved[k] += size_bytes
-        keep_layers.append(i)
-
-    keep_layers.sort()
-    return keep_layers
+    for idx, n in enumerate(graph.nodes):
+        if n.target == torch.ops.dc.wait_allgather.default:
+            ds_id = _get_ds_id_from_wait(n)
+            prev = out.get(ds_id)
+            out[ds_id] = int(idx) if prev is None else min(int(prev), int(idx))
+        elif n.target == torch.ops.dc.allgather_param.default:
+            # Fallback for graphs that have no explicit wait node for a ds_id (rare).
+            ds_id = int(n.args[2])
+            out.setdefault(int(ds_id), int(idx))
+    return out
 
 
 @dataclass
@@ -332,6 +306,8 @@ class _BlockProfile:
     layer_idx: int
     compute_ms: float
     cap_bytes: int
+    fixed_comm_start_offset_ms: float
+    fixed_comm_ms: float
 
 
 @dataclass(frozen=True)
@@ -363,6 +339,15 @@ def _is_param_comm_node(n: Node) -> bool:
         torch.ops.dc.release_param.default,
         torch.ops.dc.prefetch_params_fused.default,
     }
+
+
+def _is_comm_node(n: Node) -> bool:
+    return bool(getattr(n, "meta", {}).get("comm", False))
+
+
+def _is_fixed_comm_marker_node(n: Node) -> bool:
+    # Comm nodes that are not part of param-prefetch scheduling (e.g., grad reduction).
+    return _is_comm_node(n) and not _is_param_comm_node(n)
 
 
 def _build_mem_peak_by_node_name(mem_list, graph: Graph) -> Dict[str, int]:
@@ -450,10 +435,15 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
             end = len(nodes)
 
         compute_ms = 0.0
+        fixed_comm_start_offset_ms = 0.0
+        saw_fixed_comm_marker = False
         base_mem_excl_params = 0
         for n in nodes[start:end]:
-            if not _is_param_comm_node(n):
+            if not _is_param_comm_node(n) and not _is_fixed_comm_marker_node(n) and n.target != torch.ops.dc.end_backward.default:
                 compute_ms += float(n.meta.get("device_time", 0.0))
+            if not saw_fixed_comm_marker and _is_fixed_comm_marker_node(n):
+                fixed_comm_start_offset_ms = float(compute_ms)
+                saw_fixed_comm_marker = True
             peak = int(peak_by_name.get(n.name, 0))
             live = int(live_by_node.get(n, 0))
             base_mem_excl_params = max(base_mem_excl_params, max(0, peak - live))
@@ -467,6 +457,8 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
                 layer_idx=int(layer),
                 compute_ms=float(compute_ms),
                 cap_bytes=int(cap_bytes),
+                fixed_comm_start_offset_ms=float(fixed_comm_start_offset_ms),
+                fixed_comm_ms=0.0,
             ))
 
     blocks.sort(key=lambda b: b.k)
@@ -509,159 +501,6 @@ def _fit_comm_model(graph_id: int, profiling_results, ds_id_to_size: Dict[int, i
     return _CommModel(alpha_ms=max(0.0, alpha), beta_ms_per_byte=max(0.0, beta))
 
 
-def _compute_prefix_ms(blocks: Sequence[_BlockProfile]) -> List[float]:
-    prefix = [0.0]
-    for b in blocks:
-        prefix.append(prefix[-1] + float(b.compute_ms))
-    return prefix
-
-
-def _sum_compute_ms(prefix: Sequence[float], start_k: int, end_k_exclusive: int) -> float:
-    start_k = max(0, int(start_k))
-    end_k_exclusive = max(start_k, int(end_k_exclusive))
-    if start_k >= len(prefix) - 1:
-        return 0.0
-    end_k_exclusive = min(end_k_exclusive, len(prefix) - 1)
-    return float(prefix[end_k_exclusive] - prefix[start_k])
-
-
-def _build_tasks(L: int, layer_to_ds_ids: Sequence[Sequence[int]], ds_id_to_size: Dict[int, int],
-                 keep_layers: Set[int]) -> List[_Task]:
-    tasks: List[_Task] = []
-    for layer_idx in range(L):
-        ds_ids = tuple(int(ds_id) for ds_id in layer_to_ds_ids[layer_idx] if int(ds_id) in ds_id_to_size)
-        if not ds_ids:
-            continue
-        size_bytes = int(sum(ds_id_to_size[ds_id] for ds_id in ds_ids))
-        if size_bytes <= 0:
-            continue
-
-        f_deadline = layer_idx
-        b_deadline = 2 * L - 1 - layer_idx
-        keep = layer_idx in keep_layers
-
-        tasks.append(
-            _Task(
-                kind="FWD",
-                layer_idx=layer_idx,
-                ds_ids=ds_ids,
-                size_bytes=size_bytes,
-                min_start_k=0,
-                deadline_k=f_deadline,
-                release_end_k=(b_deadline if keep else f_deadline),
-            ))
-        if not keep:
-            tasks.append(
-                _Task(
-                    kind="BWD",
-                    layer_idx=layer_idx,
-                    ds_ids=ds_ids,
-                    size_bytes=size_bytes,
-                    min_start_k=f_deadline + 1,
-                    deadline_k=b_deadline,
-                    release_end_k=b_deadline,
-                ))
-    return tasks
-
-
-def _reserve_range_feasible(reserved: List[int], blocks: Sequence[_BlockProfile], start_k: int, end_k: int,
-                            delta_bytes: int) -> bool:
-    start_k = int(start_k)
-    end_k = int(end_k)
-    if delta_bytes <= 0:
-        return True
-    for k in range(start_k, end_k + 1):
-        if k < 0 or k >= len(blocks):
-            return False
-        if reserved[k] + delta_bytes > int(blocks[k].cap_bytes):
-            return False
-    return True
-
-
-def _reserve_range_apply(reserved: List[int], start_k: int, end_k: int, delta_bytes: int) -> None:
-    start_k = int(start_k)
-    end_k = int(end_k)
-    if delta_bytes <= 0:
-        return
-    for k in range(start_k, end_k + 1):
-        reserved[k] += int(delta_bytes)
-
-
-def _assign_task_starts(tasks: List[_Task], blocks: Sequence[_BlockProfile], comm_model: _CommModel,
-                        cfg: _SchedulerConfig) -> Tuple[List[int], Dict[Tuple[int, str], int]]:
-    # Greedy EDF assignment with memory constraints. Every task is started at some block <= deadline.
-    tasks.sort(key=lambda t: (t.deadline_k, 0 if t.kind == "FWD" else 1, -t.size_bytes, t.layer_idx))
-
-    reserved = [0 for _ in blocks]
-    compute_prefix_ms = _compute_prefix_ms(blocks)
-    starts_count: Dict[int, int] = {}
-    per_task_start: Dict[Tuple[int, str], int] = {}
-
-    for t in tasks:
-        n_ops = len(t.ds_ids)
-        # prefetch_params_fused issues *per-ds_id* allgathers; model per-op overhead via alpha*n_ops.
-        # Apply fusion discount to the fixed launch overhead only (alpha), not the bandwidth term (beta*bytes).
-        fuse_alpha_factor = 1.0
-        if n_ops > 1:
-            fuse_alpha_factor = max(0.0, min(1.0, float(cfg.fuse_factor)))
-        comm_ms = (float(comm_model.alpha_ms) * float(fuse_alpha_factor) * float(n_ops) +
-                   float(comm_model.beta_ms_per_byte) * float(t.size_bytes))
-
-        hard_earliest = int(t.min_start_k)
-        soft_earliest = max(int(t.min_start_k), int(t.deadline_k) - int(cfg.lookahead_blocks))
-
-        desired = hard_earliest
-        found = False
-        for s in range(int(t.deadline_k), int(soft_earliest) - 1, -1):
-            if _sum_compute_ms(compute_prefix_ms, s, int(t.deadline_k)) >= comm_ms:
-                desired = int(s)
-                found = True
-                break
-        if not found and int(soft_earliest) > int(hard_earliest):
-            for s in range(int(soft_earliest) - 1, int(hard_earliest) - 1, -1):
-                if _sum_compute_ms(compute_prefix_ms, s, int(t.deadline_k)) >= comm_ms:
-                    desired = int(s)
-                    break
-
-        chosen: Optional[int] = None
-        for s in range(desired, t.deadline_k + 1):
-            if starts_count.get(s, 0) >= cfg.max_tasks_per_block:
-                continue
-            if _reserve_range_feasible(reserved, blocks, s, t.release_end_k, t.size_bytes):
-                chosen = s
-                break
-
-        if chosen is None:
-            # Fallback: delay to the latest feasible start (often deadline) to satisfy memory.
-            for s in range(t.deadline_k, hard_earliest - 1, -1):
-                if starts_count.get(s, 0) >= cfg.max_tasks_per_block:
-                    continue
-                if _reserve_range_feasible(reserved, blocks, s, t.release_end_k, t.size_bytes):
-                    chosen = s
-                    break
-
-        if chosen is None:
-            # As a last resort, force at deadline without reserving extra (should be rare if baseline fits).
-            chosen = int(t.deadline_k)
-            if not _reserve_range_feasible(reserved, blocks, chosen, t.release_end_k, t.size_bytes):
-                log_rank0(
-                    f"[{NAME}] WARNING: cannot reserve memory for task layer={t.layer_idx} kind={t.kind} size={t.size_bytes}B start={chosen}..{t.release_end_k}",
-                    enable=True,
-                )
-                # Still record start; leave reserved unchanged.
-                t.start_k = chosen
-                per_task_start[(t.layer_idx, t.kind)] = chosen
-                starts_count[chosen] = starts_count.get(chosen, 0) + 1
-                continue
-
-        _reserve_range_apply(reserved, chosen, t.release_end_k, t.size_bytes)
-        t.start_k = int(chosen)
-        per_task_start[(t.layer_idx, t.kind)] = int(chosen)
-        starts_count[int(chosen)] = starts_count.get(int(chosen), 0) + 1
-
-    return reserved, per_task_start
-
-
 def _build_comm_groups(tasks: Sequence[_Task],
                        comm_model: _CommModel,
                        ds_id_to_size: Dict[int, int],
@@ -678,7 +517,11 @@ def _build_comm_groups(tasks: Sequence[_Task],
     launches: Dict[int, List[List[int]]] = {}
     groups_by_start: Dict[int, List[_CommGroup]] = {}
 
+    # dc.prefetch_params_fused can respect per-ds_id readiness (each ds_id becomes ready after its own
+    # allgather completes, in ds_id list order). This enables deadline-aware fusion within a boundary
+    # as long as we order ds_ids by increasing deadline / use position.
     fuse_window = int(cfg.fuse_deadline_window_blocks if fuse_deadline_window_blocks is None else fuse_deadline_window_blocks)
+    fuse_window = max(0, int(fuse_window))
 
     for start_k, ts in tasks_by_start.items():
         ts = sorted(ts, key=lambda t: (t.deadline_k, 0 if t.kind == "FWD" else 1, t.layer_idx))
@@ -778,6 +621,8 @@ def _simulate_schedule_in_graph_order(
         blocks: Sequence[_BlockProfile],
         groups_by_start: Dict[int, List[_CommGroup]],
         keep_layers: Set[int],
+        *,
+        separate_allgather_communicator: bool = False,
 ) -> Tuple[float, List[float], Dict[int, float], Dict[Tuple[int, str], float]]:
     K = len(blocks)
     ready_time: Dict[Tuple[int, str], float] = {}
@@ -786,14 +631,16 @@ def _simulate_schedule_in_graph_order(
 
     # Model the *actual* execution order: comm groups are launched in (start_k, list-order).
     now = 0.0  # compute timeline
-    comm_free = 0.0  # comm stream availability time
+    ag_free = 0.0  # allgather/prefetch communicator stream availability time
+    rs_free = 0.0  # reduce communicator stream availability time (grad reductions)
+    separate = bool(separate_allgather_communicator)
 
     for k in range(K):
         # Launch groups scheduled at this block boundary.
         for g in groups_by_start.get(k, []):
-            start_t = max(float(comm_free), float(now))
+            start_t = max(float(ag_free), float(now))
             comm_end = start_t + float(g.comm_ms)
-            comm_free = comm_end
+            ag_free = comm_end
             for key, offset in g.task_ready_offsets_ms:
                 # Earliest completion wins (should be unique per task in practice).
                 end_t = start_t + float(offset)
@@ -811,7 +658,26 @@ def _simulate_schedule_in_graph_order(
             layer = int(blocks[k].layer_idx)
             stall_bwd_per_layer[layer] = stall_bwd_per_layer.get(layer, 0.0) + stall
 
-        now += float(blocks[k].compute_ms)
+        # Execute compute for this block, then schedule any fixed comm that starts within the block.
+        compute_ms = float(blocks[k].compute_ms)
+        offset_ms = float(blocks[k].fixed_comm_start_offset_ms)
+        fixed_comm_ms = float(blocks[k].fixed_comm_ms)
+
+        pre_ms = min(compute_ms, max(0.0, offset_ms))
+        now += pre_ms
+
+        if fixed_comm_ms > 0.0:
+            if separate:
+                fixed_start = max(float(rs_free), float(now))
+                rs_free = fixed_start + fixed_comm_ms
+            else:
+                fixed_start = max(float(ag_free), float(now))
+                ag_free = fixed_start + fixed_comm_ms
+
+        now += max(0.0, compute_ms - pre_ms)
+
+    # end_backward synchronizes comm before the step finishes.
+    now = max(float(now), float(rs_free if separate else ag_free))
 
     return float(now), stall_ms_per_block, stall_bwd_per_layer, ready_time
 
@@ -830,152 +696,637 @@ def _reserved_mem_by_block(tasks: Sequence[_Task], K: int) -> List[int]:
     return reserved
 
 
-def _starts_count_by_block(tasks: Sequence[_Task]) -> Dict[int, int]:
-    counts: Dict[int, int] = {}
-    for t in tasks:
-        if t.start_k is None:
-            continue
-        k = int(t.start_k)
-        counts[k] = counts.get(k, 0) + 1
-    return counts
-
-
-def _try_refine_task_starts(
-    tasks: List[_Task],
+def _solve_milp_schedule(
+    *,
+    L: int,
     blocks: Sequence[_BlockProfile],
-    comm_model: _CommModel,
+    layer_to_ds_ids: Sequence[Sequence[int]],
     ds_id_to_size: Dict[int, int],
     cfg: _SchedulerConfig,
-    keep_layers: Set[int],
-) -> Tuple[List[_Task], List[int], Dict[Tuple[int, str], int], Dict[int, List[List[int]]], float, List[float], Dict[int, float], int]:
-    # Local search: iteratively move the most-stalling task earlier (within lookahead + memory cap).
-    tasks = list(tasks)
+    comm_model: _CommModel,
+    forced_keep_layers: Optional[Set[int]] = None,
+) -> Tuple[Set[int], Dict[Tuple[int, str], int], dict]:
+    # MILP model (HiGHS via SciPy) chooses:
+    # - keep_layers (step-level keep-unshard)
+    # - per-layer task start blocks for FWD and (if not kept) BWD prefetch
+    #
+    # Fused group decisions are derived later from the chosen starts.
+    try:
+        import numpy as np
+        from scipy.optimize import Bounds, LinearConstraint, milp
+        from scipy.sparse import coo_matrix
+    except Exception as e:
+        raise RuntimeError(
+            f"[{NAME}] MILP solver requires SciPy (see requirements/requirements-deepcompile.txt). Import error: {e}"
+        ) from e
 
-    # Index for quick lookup.
-    key_to_task: Dict[Tuple[int, str], _Task] = {(t.layer_idx, t.kind): t for t in tasks if t.start_k is not None}
+    K = len(blocks)
+    if K != 2 * L:
+        raise ValueError(f"[{NAME}] internal error: expected K=2L blocks, got K={K} L={L}")
 
-    best_reserved = _reserved_mem_by_block(tasks, len(blocks))
-    best_per_task_start = {(t.layer_idx, t.kind): int(t.start_k) for t in tasks if t.start_k is not None}
-    best_launches, best_groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg)
-    best_step, best_stall, best_stall_bwd, _ = _simulate_schedule_in_graph_order(blocks, best_groups_by_start, keep_layers)
+    # Per-layer param volume (bytes) and op count (ds_id count) used by the comm model.
+    layer_sizes: List[int] = []
+    layer_ops: List[int] = []
+    for li in range(L):
+        ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
+        ids = sorted(set(ids))
+        size_bytes = int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids))
+        layer_sizes.append(size_bytes)
+        layer_ops.append(int(len(ids)))
 
-    # Try both: configured fusion window and strict window=0 (often reduces readiness coupling).
-    def eval_with_fuse_window(window: int) -> Tuple[float, List[float], Dict[int, float], Dict[int, List[_CommGroup]], Dict[int, List[List[int]]]]:
-        launches, groups = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg, fuse_deadline_window_blocks=window)
-        step, stalls, stall_bwd, _ = _simulate_schedule_in_graph_order(blocks, groups, keep_layers)
-        return step, stalls, stall_bwd, groups, launches
+    active_layers = [li for li in range(L) if layer_ops[li] > 0 and layer_sizes[li] > 0]
 
-    fuse_candidates = sorted(set([0, int(cfg.fuse_deadline_window_blocks)]))
-    chosen_fuse = int(cfg.fuse_deadline_window_blocks)
-    for w in fuse_candidates:
-        step, stalls, stall_bwd, groups, launches = eval_with_fuse_window(int(w))
-        if step + 1e-9 < best_step:
-            best_step, best_stall, best_stall_bwd = step, stalls, stall_bwd
-            best_groups_by_start, best_launches = groups, launches
-            chosen_fuse = int(w)
+    fuse_alpha_factor = max(0.0, min(1.0, float(cfg.fuse_factor)))
+    # Fused prefetch only reduces launch/latency overhead when there are multiple ops in the call.
+    # For layers with a single ds_id, use the unfused alpha to avoid underestimating comm cost.
+    alpha_ms = float(comm_model.alpha_ms)
+    alpha_per_op_fused = float(alpha_ms) * float(fuse_alpha_factor)
+    beta = float(comm_model.beta_ms_per_byte)
+    beta_grad = beta
 
-    # Main refinement loop.
-    for _ in range(int(cfg.inner_refine_max_iters)):
-        # Re-evaluate current state with the chosen fusion rule.
-        cur_step, cur_stall, _, _, _ = eval_with_fuse_window(chosen_fuse)
+    # Upper bound for big-M on time variables (ms).
+    sum_compute_ms = float(sum(float(b.compute_ms) for b in blocks))
+    per_layer_comm_ms = []
+    for li in range(L):
+        alpha_eff = float(alpha_per_op_fused) if int(layer_ops[li]) > 1 else float(alpha_ms)
+        per_layer_comm_ms.append(float(alpha_eff) * float(layer_ops[li]) + float(beta) * float(layer_sizes[li]))
+    per_layer_grad_comm_ms = [float(beta_grad) * float(layer_sizes[li]) for li in range(L)]
+    # Worst-case: gather twice per layer (FWD + BWD), plus a margin.
+    # Also include the fixed grad-comm tail so time bounds remain safe.
+    M_time = max(1.0, sum_compute_ms + 2.0 * float(sum(per_layer_comm_ms)) + float(sum(per_layer_grad_comm_ms)) + 1000.0)
 
-        max_stall = max(cur_stall) if cur_stall else 0.0
-        if max_stall <= 1e-9:
-            # No predicted stalls left.
-            if cur_step + 1e-9 < best_step:
-                best_step, best_stall = cur_step, cur_stall
-                best_reserved = _reserved_mem_by_block(tasks, len(blocks))
-                best_per_task_start = {(t.layer_idx, t.kind): int(t.start_k) for t in tasks if t.start_k is not None}
-                best_launches, best_groups_by_start = _build_comm_groups(tasks,
-                                                                        comm_model,
-                                                                        ds_id_to_size,
-                                                                        cfg,
-                                                                        fuse_deadline_window_blocks=chosen_fuse)
-            break
+    # Variable indexing.
+    idx = 0
+    keep_idx = [idx + li for li in range(L)]
+    idx += L
 
-        # Try stall blocks in descending stall order; tie-break by earliest k.
-        stall_blocks = sorted([(float(s), int(k)) for k, s in enumerate(cur_stall) if s > 1e-9],
-                              key=lambda x: (-x[0], x[1]))
-        moved = False
+    xF_idx: List[Dict[int, int]] = [{} for _ in range(L)]
+    lookahead = max(0, int(cfg.lookahead_blocks))
+    for li in active_layers:
+        min_k = max(0, int(li) - int(lookahead))
+        for k in range(min_k, li + 1):
+            xF_idx[li][k] = idx
+            idx += 1
 
-        for _, k_pick in stall_blocks:
-            required = _required_task_key_for_block(blocks[k_pick], keep_layers)
-            t = key_to_task.get(required)
-            if t is None or t.start_k is None:
+    xB_idx: List[Dict[int, int]] = [{} for _ in range(L)]
+    for li in active_layers:
+        b_deadline = 2 * L - 1 - li
+        min_k = max(int(li) + 1, int(b_deadline) - int(lookahead))
+        for k in range(min_k, b_deadline + 1):
+            xB_idx[li][k] = idx
+            idx += 1
+
+    readyF_idx = [idx + li for li in range(L)]
+    idx += L
+    readyB_idx = [idx + li for li in range(L)]
+    idx += L
+
+    now_idx = [idx + k for k in range(K + 1)]
+    idx += K + 1
+    stall_idx = [idx + k for k in range(K)]
+    idx += K
+    comm_start_idx = [idx + k for k in range(K)]
+    idx += K
+    comm_launch_idx = [idx + k for k in range(K)]
+    idx += K
+    comm_after_idx = [idx + k for k in range(K)]
+    idx += K
+
+    n_vars = idx
+
+    # Bounds & integrality.
+    lb = np.zeros(n_vars, dtype=float)
+    ub = np.full(n_vars, float(M_time), dtype=float)
+    integrality = np.zeros(n_vars, dtype=int)
+
+    # keep variables.
+    for li in range(L):
+        integrality[keep_idx[li]] = 1
+        if li not in active_layers:
+            ub[keep_idx[li]] = 0.0
+            continue
+        if forced_keep_layers is not None and li in forced_keep_layers:
+            lb[keep_idx[li]] = 1.0
+            ub[keep_idx[li]] = 1.0
+        else:
+            ub[keep_idx[li]] = 1.0
+
+    # xF/xB binaries.
+    for li in active_layers:
+        for _, j in xF_idx[li].items():
+            integrality[j] = 1
+            ub[j] = 1.0
+        for _, j in xB_idx[li].items():
+            integrality[j] = 1
+            if forced_keep_layers is not None and li in forced_keep_layers:
+                ub[j] = 0.0
+            else:
+                ub[j] = 1.0
+
+    # readyF/readyB for inactive layers are pinned to 0.
+    for li in range(L):
+        if li not in active_layers:
+            ub[readyF_idx[li]] = 0.0
+            ub[readyB_idx[li]] = 0.0
+
+    # Objective: minimize end time now[K].
+    c = np.zeros(n_vars, dtype=float)
+    c[now_idx[K]] = 1.0
+
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
+    lb_rows: List[float] = []
+    ub_rows: List[float] = []
+    row = 0
+
+    def add_row(coeffs: Sequence[Tuple[int, float]], lb_v: float, ub_v: float) -> None:
+        nonlocal row
+        for j, v in coeffs:
+            if v == 0.0:
                 continue
+            rows.append(row)
+            cols.append(int(j))
+            data.append(float(v))
+        lb_rows.append(float(lb_v))
+        ub_rows.append(float(ub_v))
+        row += 1
 
-            old_start = int(t.start_k)
-            # Refinement is allowed to move earlier than the nominal lookahead window as long as memory caps hold.
-            earliest_allowed = int(t.min_start_k)
-            if earliest_allowed >= old_start:
+    INF = float(np.inf)
+
+    # now[0] == 0.
+    add_row([(now_idx[0], 1.0)], 0.0, 0.0)
+
+    # Assignment constraints per layer.
+    for li in active_layers:
+        add_row([(j, 1.0) for j in xF_idx[li].values()], 1.0, 1.0)
+
+        # keep + sum(xB) == 1  (if keep==1, skip BWD prefetch).
+        coeffs = [(keep_idx[li], 1.0)] + [(j, 1.0) for j in xB_idx[li].values()]
+        add_row(coeffs, 1.0, 1.0)
+
+    # now recurrence: now[k+1] - now[k] - stall[k] == compute_ms[k].
+    for k in range(K):
+        add_row([(now_idx[k + 1], 1.0), (now_idx[k], -1.0), (stall_idx[k], -1.0)], float(blocks[k].compute_ms),
+                float(blocks[k].compute_ms))
+
+    # Comm timeline constraints:
+    # - comm_start[k] is when the comm stream can start launches at boundary k.
+    # - comm_launch[k] is the comm stream time after finishing the (scheduled) param-prefetch launch at boundary k.
+    # - comm_after[k] is the comm stream time after also accounting for "fixed" comm that happens inside block k
+    #   (e.g., grad reduction), which delays launches at later boundaries.
+    comm_coeff: List[float] = []
+    for li in range(L):
+        alpha_eff = float(alpha_per_op_fused) if int(layer_ops[li]) > 1 else float(alpha_ms)
+        comm_coeff.append(float(alpha_eff) * float(layer_ops[li]) + float(beta) * float(layer_sizes[li]))
+
+    # Approximate grad-comm cost per layer (reduce-scatter / allreduce) as bandwidth-dominated.
+    grad_comm_ms_per_layer = [float(beta_grad) * float(layer_sizes[li]) for li in range(L)]
+
+    for k in range(K):
+        # comm_start[k] >= comm_after[k-1]
+        if k > 0:
+            add_row([(comm_start_idx[k], 1.0), (comm_after_idx[k - 1], -1.0)], 0.0, INF)
+
+        # comm_start[k] >= now[k]
+        add_row([(comm_start_idx[k], 1.0), (now_idx[k], -1.0)], 0.0, INF)
+
+        # comm_launch[k] == comm_start[k] + comm_ms_launch[k]
+        coeffs_launch = [(comm_launch_idx[k], 1.0), (comm_start_idx[k], -1.0)]
+        for li in active_layers:
+            if k in xF_idx[li]:
+                coeffs_launch.append((xF_idx[li][k], -comm_coeff[li]))
+            if k in xB_idx[li]:
+                coeffs_launch.append((xB_idx[li][k], -comm_coeff[li]))
+        add_row(coeffs_launch, 0.0, 0.0)
+
+        # With a dedicated allgather communicator, prefetch/allgather launches no longer serialize with
+        # backward grad reductions on the reduce communicator/stream.
+        fixed_ms = 0.0
+        fixed_off = 0.0
+        if (not bool(cfg.separate_allgather_communicator)) and blocks[k].phase == "BWD":
+            fixed_ms = float(grad_comm_ms_per_layer[int(blocks[k].layer_idx)])
+            fixed_off = float(blocks[k].fixed_comm_start_offset_ms) if fixed_ms > 0.0 else 0.0
+
+        # comm_after[k] >= comm_launch[k] + fixed_ms
+        add_row([(comm_after_idx[k], 1.0), (comm_launch_idx[k], -1.0)], float(fixed_ms), INF)
+        # comm_after[k] >= now[k] + fixed_off + fixed_ms
+        add_row([(comm_after_idx[k], 1.0), (now_idx[k], -1.0)], float(fixed_off + fixed_ms), INF)
+
+    # Link ready times to selected comm launch boundary with big-M.
+    # Within a single boundary k, comm tasks are executed in ascending deadline order, so the ready time
+    # for task (li,kind) launched at k is comm_start[k] + sum(comm_cost of tasks with <= its deadline launched at k).
+    M = float(M_time)
+    for li in active_layers:
+        for k, j in xF_idx[li].items():
+            coeffs = [(readyF_idx[li], 1.0), (comm_start_idx[int(k)], -1.0)]
+            for lj in active_layers:
+                if int(lj) > int(li):
+                    continue
+                jj = xF_idx[lj].get(int(k))
+                if jj is not None:
+                    coeffs.append((jj, -comm_coeff[int(lj)]))
+
+            # readyF - (comm_start + prefix) <= M*(1-xF)
+            add_row(coeffs + [(j, float(M))], -INF, float(M))
+            # readyF - (comm_start + prefix) >= -M*(1-xF)
+            add_row(coeffs + [(j, -float(M))], -float(M), INF)
+
+        for k, j in xB_idx[li].items():
+            kk = int(k)
+            coeffs = [(readyB_idx[li], 1.0), (comm_start_idx[kk], -1.0)]
+            # Forward tasks are always ordered before backward tasks at the same boundary.
+            for lj in active_layers:
+                jj = xF_idx[lj].get(kk)
+                if jj is not None:
+                    coeffs.append((jj, -comm_coeff[int(lj)]))
+            # Backward tasks are ordered by increasing b_deadline, i.e., decreasing layer index.
+            for lj in active_layers:
+                if int(lj) < int(li):
+                    continue
+                jj = xB_idx[lj].get(kk)
+                if jj is not None:
+                    coeffs.append((jj, -comm_coeff[int(lj)]))
+
+            add_row(coeffs + [(j, float(M))], -INF, float(M))
+            add_row(coeffs + [(j, -float(M))], -float(M), INF)
+
+    # Model end-of-backward synchronization: the step can't finish before comm completes.
+    add_row([(now_idx[K], 1.0), (comm_after_idx[K - 1], -1.0)], 0.0, INF)
+
+    # Stall constraints (compute waits for the required task).
+    for k in range(K):
+        block = blocks[k]
+        layer = int(block.layer_idx)
+        if block.phase == "FWD":
+            add_row([(stall_idx[k], 1.0), (now_idx[k], 1.0), (readyF_idx[layer], -1.0)], 0.0, INF)
+        else:
+            # If keep[layer]==1, required is FWD; else required is BWD.
+            # stall >= readyF - now - M*(1-keep)
+            add_row([(stall_idx[k], 1.0), (now_idx[k], 1.0), (readyF_idx[layer], -1.0), (keep_idx[layer], -float(M))],
+                    -float(M), INF)
+            # stall >= readyB - now - M*keep
+            add_row([(stall_idx[k], 1.0), (now_idx[k], 1.0), (readyB_idx[layer], -1.0), (keep_idx[layer], float(M))],
+                    0.0, INF)
+
+    # Per-block launch and fuse constraints.
+    for k in range(K):
+        # max_tasks_per_block: count of layer-tasks launched at this boundary.
+        coeffs_cnt: List[Tuple[int, float]] = []
+        for li in active_layers:
+            if k in xF_idx[li]:
+                coeffs_cnt.append((xF_idx[li][k], 1.0))
+            if k in xB_idx[li]:
+                coeffs_cnt.append((xB_idx[li][k], 1.0))
+
+        if coeffs_cnt:
+            add_row(coeffs_cnt, -INF, float(cfg.max_tasks_per_block))
+        # NOTE: We intentionally do not constrain total bytes launched at boundary k.
+        # _build_comm_groups can split launches into multiple fused prefetch calls per boundary,
+        # each capped by fuse_max_bytes. A hard "sum(bytes)<=fuse_max_bytes" constraint would be
+        # overly strict and can make the MILP infeasible for large single-layer parameters
+        # (e.g., embeddings) even though the runtime can still allgather them.
+
+    # Per-block memory cap constraints.
+    for k in range(K):
+        rhs = float(blocks[k].cap_bytes)
+        coeffs: List[Tuple[int, float]] = []
+        for li in active_layers:
+            size = float(layer_sizes[li])
+            if size <= 0.0:
                 continue
+            f_deadline = li
+            b_deadline = 2 * L - 1 - li
 
-            # Precompute constraints once.
-            counts = _starts_count_by_block(tasks)
-            reserved = _reserved_mem_by_block(tasks, len(blocks))
-            size = int(t.size_bytes)
+            delta_f = 1.0 if k > f_deadline else 0.0
+            delta_b = 1.0 if k > b_deadline else 0.0
 
-            best_candidate = None  # (new_step, new_start, new_stalls, new_stall_bwd, new_groups, new_launches)
+            # Forward task live: sum_{s <= min(k, f_deadline)} xF[li,s] - delta_f*(1-keep[li])
+            # We move the constant term (-delta_f) to RHS.
+            if delta_f > 0.0:
+                rhs += size * delta_f
+                coeffs.append((keep_idx[li], size * delta_f))
 
-            for candidate_start in range(old_start - 1, earliest_allowed - 1, -1):
-                if counts.get(candidate_start, 0) + 1 > int(cfg.max_tasks_per_block):
+            max_s_f = min(k, f_deadline)
+            for s in range(0, max_s_f + 1):
+                j = xF_idx[li].get(s)
+                if j is not None:
+                    coeffs.append((j, size))
+
+            # Backward task live: sum_{s <= min(k, b_deadline)} xB[li,s] - delta_b*(1-keep[li])
+            # with s in [f_deadline+1, b_deadline]
+            if delta_b > 0.0:
+                rhs += size * delta_b
+                coeffs.append((keep_idx[li], size * delta_b))
+
+            if k <= b_deadline:
+                max_s_b = min(k, b_deadline)
+                for s in range(f_deadline + 1, max_s_b + 1):
+                    j = xB_idx[li].get(s)
+                    if j is not None:
+                        coeffs.append((j, size))
+
+        if coeffs:
+            add_row(coeffs, -INF, rhs)
+
+    A = coo_matrix((np.array(data, dtype=float), (np.array(rows, dtype=int), np.array(cols, dtype=int))),
+                   shape=(row, n_vars)).tocsr()
+    constraint = LinearConstraint(A, np.array(lb_rows, dtype=float), np.array(ub_rows, dtype=float))
+
+    options = {
+        "disp": False,
+        "time_limit": float(cfg.milp_time_limit_s),
+        "presolve": bool(cfg.milp_presolve),
+        "mip_rel_gap": float(cfg.milp_rel_gap),
+    }
+    if int(cfg.milp_node_limit) > 0:
+        options["node_limit"] = int(cfg.milp_node_limit)
+
+    res = milp(c, integrality=integrality, bounds=Bounds(lb, ub), constraints=constraint, options=options)
+    if res.status not in (0, 1) or res.x is None:
+        raise RuntimeError(f"[{NAME}] MILP solver failed: status={res.status} message={res.message}")
+
+    x = res.x
+
+    keep_layers: Set[int] = {li for li in active_layers if float(x[keep_idx[li]]) >= 0.5}
+    per_task_start: Dict[Tuple[int, str], int] = {}
+
+    for li in active_layers:
+        # FWD start
+        best_k = None
+        best_v = -1.0
+        for k, j in xF_idx[li].items():
+            v = float(x[j])
+            if v > best_v:
+                best_v = v
+                best_k = k
+        if best_k is None:
+            raise RuntimeError(f"[{NAME}] MILP produced no FWD start for layer={li}")
+        per_task_start[(li, "FWD")] = int(best_k)
+
+        if li not in keep_layers:
+            best_k = None
+            best_v = -1.0
+            for k, j in xB_idx[li].items():
+                v = float(x[j])
+                if v > best_v:
+                    best_v = v
+                    best_k = k
+            if best_k is None:
+                raise RuntimeError(f"[{NAME}] MILP produced no BWD start for layer={li}")
+            per_task_start[(li, "BWD")] = int(best_k)
+
+    meta = {
+        "status": int(res.status),
+        "message": str(res.message),
+        "objective": float(res.fun) if res.fun is not None else None,
+        "mip_gap": float(getattr(res, "mip_gap", float("nan"))) if hasattr(res, "mip_gap") else float("nan"),
+    }
+
+    return keep_layers, per_task_start, meta
+
+
+def _build_tasks_from_plan(*,
+                           L: int,
+                           layer_to_ds_ids: Sequence[Sequence[int]],
+                           ds_id_to_size: Dict[int, int],
+                           keep_layers: Set[int],
+                           per_task_start: Dict[Tuple[int, str], int],
+                           persistent_set: Set[int],
+                           ds_id_to_wait_pos_fwd: Optional[Dict[int, int]] = None,
+                           ds_id_to_wait_pos_bwd: Optional[Dict[int, int]] = None) -> List[_Task]:
+    tasks: List[_Task] = []
+
+    def order_ds_ids(ds_ids: Sequence[int], *, kind: str) -> Tuple[int, ...]:
+        if kind == "FWD":
+            pos = ds_id_to_wait_pos_fwd
+        else:
+            pos = ds_id_to_wait_pos_bwd
+        if not pos:
+            return tuple(int(x) for x in ds_ids)
+        # Earlier wait position => earlier allgather launch to maximize intra-layer overlap.
+        # Tie-break on size to prioritize small early-use params (reduces first-wait stalls).
+        return tuple(
+            sorted(
+                (int(x) for x in ds_ids),
+                key=lambda d: (
+                    int(pos.get(int(d), 1 << 60)),
+                    int(ds_id_to_size.get(int(d), 0)),
+                    int(d),
+                ),
+            ))
+
+    for layer_idx in range(L):
+        raw_ds_ids = [int(ds_id) for ds_id in layer_to_ds_ids[layer_idx] if int(ds_id) in ds_id_to_size]
+        if not raw_ds_ids:
+            continue
+
+        # Dedup while preserving relative order before applying a use-position sort.
+        seen: Set[int] = set()
+        uniq_ds_ids: List[int] = []
+        for ds_id in raw_ds_ids:
+            if ds_id in seen:
+                continue
+            seen.add(ds_id)
+            uniq_ds_ids.append(int(ds_id))
+
+        size_bytes = int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in uniq_ds_ids))
+        if size_bytes <= 0:
+            continue
+
+        f_deadline = int(layer_idx)
+        b_deadline = int(2 * L - 1 - layer_idx)
+        keep = layer_idx in keep_layers
+
+        start_f = per_task_start.get((layer_idx, "FWD"))
+        if start_f is None:
+            raise RuntimeError(f"[{NAME}] schedule missing FWD start for layer={layer_idx}")
+
+        fwd_ds_ids = order_ds_ids(uniq_ds_ids, kind="FWD")
+        tasks.append(
+            _Task(
+                kind="FWD",
+                layer_idx=int(layer_idx),
+                ds_ids=tuple(int(x) for x in fwd_ds_ids),
+                size_bytes=int(size_bytes),
+                min_start_k=0,
+                deadline_k=f_deadline,
+                release_end_k=(b_deadline if keep else f_deadline),
+                start_k=int(start_f),
+            ))
+
+        if keep:
+            continue
+
+        bwd_ds_ids = [int(ds_id) for ds_id in uniq_ds_ids if int(ds_id) not in persistent_set]
+        bwd_ds_ids = list(order_ds_ids(bwd_ds_ids, kind="BWD"))
+        bwd_size_bytes = int(sum(int(ds_id_to_size.get(int(ds_id), 0)) for ds_id in bwd_ds_ids))
+        if not bwd_ds_ids or bwd_size_bytes <= 0:
+            continue
+
+        start_b = per_task_start.get((layer_idx, "BWD"))
+        if start_b is None:
+            raise RuntimeError(f"[{NAME}] schedule missing BWD start for layer={layer_idx}")
+
+        tasks.append(
+            _Task(
+                kind="BWD",
+                layer_idx=int(layer_idx),
+                ds_ids=tuple(int(x) for x in bwd_ds_ids),
+                size_bytes=int(bwd_size_bytes),
+                min_start_k=f_deadline + 1,
+                deadline_k=b_deadline,
+                release_end_k=b_deadline,
+                start_k=int(start_b),
+            ))
+
+    return tasks
+
+
+def _is_mem_feasible(tasks: Sequence[_Task], blocks: Sequence[_BlockProfile]) -> bool:
+    K = len(blocks)
+    reserved = _reserved_mem_by_block(tasks, K)
+    for k in range(K):
+        if int(reserved[k]) > int(blocks[k].cap_bytes):
+            return False
+    return True
+
+
+def _evaluate_plan_ms(*,
+                      blocks: Sequence[_BlockProfile],
+                      tasks: Sequence[_Task],
+                      keep_layers: Set[int],
+                      comm_model: _CommModel,
+                      ds_id_to_size: Dict[int, int],
+                      cfg: _SchedulerConfig) -> Tuple[float, Dict[int, List[List[int]]]]:
+    launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg)
+    step_ms, _, _, _ = _simulate_schedule_in_graph_order(blocks,
+                                                         groups_by_start,
+                                                         keep_layers,
+                                                         separate_allgather_communicator=bool(
+                                                             cfg.separate_allgather_communicator))
+    return float(step_ms), launches
+
+
+def _refine_plan_local_search(*,
+                              L: int,
+                              blocks: Sequence[_BlockProfile],
+                              layer_to_ds_ids: Sequence[Sequence[int]],
+                              ds_id_to_size: Dict[int, int],
+                              cfg: _SchedulerConfig,
+                              comm_model: _CommModel,
+                              keep_layers: Set[int],
+                              per_task_start: Dict[Tuple[int, str], int],
+                              persistent_set: Set[int],
+                              ds_id_to_wait_pos_fwd: Optional[Dict[int, int]] = None,
+                              ds_id_to_wait_pos_bwd: Optional[Dict[int, int]] = None) -> Tuple[Dict[Tuple[int, str], int], dict]:
+    max_iters = int(cfg.inner_refine_max_iters)
+    if max_iters <= 0:
+        return per_task_start, {"iters": 0}
+
+    lookahead = max(0, int(cfg.lookahead_blocks))
+    min_gain = float(cfg.inner_refine_min_gain_ms)
+
+    # Refine only tasks that exist (skip layers with no ds_ids, or BWD tasks fully persistent).
+    base_tasks = _build_tasks_from_plan(L=L,
+                                        layer_to_ds_ids=layer_to_ds_ids,
+                                        ds_id_to_size=ds_id_to_size,
+                                        keep_layers=keep_layers,
+                                        per_task_start=per_task_start,
+                                        persistent_set=persistent_set,
+                                        ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                        ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+    refined_keys = sorted({(int(t.layer_idx), str(t.kind)) for t in base_tasks})
+    if not refined_keys:
+        return per_task_start, {"iters": 0}
+
+    if not _is_mem_feasible(base_tasks, blocks):
+        # Shouldn't happen (MILP enforces), but keep the schedule unchanged if it does.
+        return per_task_start, {"iters": 0, "skipped": "infeasible_base_mem"}
+
+    best_ms, _ = _evaluate_plan_ms(blocks=blocks,
+                                   tasks=base_tasks,
+                                   keep_layers=keep_layers,
+                                   comm_model=comm_model,
+                                   ds_id_to_size=ds_id_to_size,
+                                   cfg=cfg)
+    start_ms = float(best_ms)
+
+    it = 0
+    while it < max_iters:
+        best_move = None  # (key, new_k, cand_ms)
+
+        for layer, kind in refined_keys:
+            key = (int(layer), str(kind))
+            cur_k = int(per_task_start.get(key, 0))
+
+            if kind == "FWD":
+                lo = max(0, int(layer) - int(lookahead))
+                hi = int(layer)
+            else:
+                if layer in keep_layers:
+                    continue
+                b_deadline = int(2 * L - 1 - int(layer))
+                lo = max(int(layer) + 1, int(b_deadline) - int(lookahead))
+                hi = int(b_deadline)
+
+            # Explore a small set of candidate start positions instead of only +/-1.
+            # This helps unlock beneficial fusion (co-locating tasks at the same boundary)
+            # and can escape local minima quickly.
+            candidate_ks: Set[int] = {int(lo), int(hi)}
+            candidate_ks.update(int(v) for v in per_task_start.values() if int(lo) <= int(v) <= int(hi))
+            for delta in (-2, -1, 1, 2):
+                candidate_ks.add(int(cur_k) + int(delta))
+
+            for cand_k in sorted(candidate_ks):
+                cand_k = int(cand_k)
+                if cand_k < lo or cand_k > hi or cand_k == cur_k:
                     continue
 
-                feasible = True
-                for kk in range(candidate_start, old_start):
-                    if kk < 0 or kk >= len(blocks):
-                        feasible = False
-                        break
-                    if reserved[kk] + size > int(blocks[kk].cap_bytes):
-                        feasible = False
-                        break
-                if not feasible:
+                per_task_start[key] = int(cand_k)
+                try:
+                    cand_tasks = _build_tasks_from_plan(L=L,
+                                                        layer_to_ds_ids=layer_to_ds_ids,
+                                                        ds_id_to_size=ds_id_to_size,
+                                                        keep_layers=keep_layers,
+                                                        per_task_start=per_task_start,
+                                                        persistent_set=persistent_set,
+                                                        ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                                        ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+                finally:
+                    per_task_start[key] = int(cur_k)
+
+                if not _is_mem_feasible(cand_tasks, blocks):
                     continue
 
-                t.start_k = int(candidate_start)
-                new_step, new_stalls, new_stall_bwd, new_groups_by_start, new_launches = eval_with_fuse_window(
-                    chosen_fuse)
-                t.start_k = int(old_start)
+                cand_ms, _ = _evaluate_plan_ms(blocks=blocks,
+                                               tasks=cand_tasks,
+                                               keep_layers=keep_layers,
+                                               comm_model=comm_model,
+                                               ds_id_to_size=ds_id_to_size,
+                                               cfg=cfg)
+                improved = float(cand_ms) < float(best_ms) - float(min_gain)
+                if improved:
+                    if best_move is None:
+                        best_move = (key, int(cand_k), float(cand_ms))
+                        continue
+                    _, _, cur_best_ms = best_move
+                    if float(cand_ms) < float(cur_best_ms) - 1e-6:
+                        best_move = (key, int(cand_k), float(cand_ms))
 
-                if best_candidate is None or new_step + 1e-9 < best_candidate[0]:
-                    best_candidate = (float(new_step), int(candidate_start), list(new_stalls), dict(new_stall_bwd),
-                                      new_groups_by_start, new_launches)
-
-            if best_candidate is None:
-                continue
-
-            cand_step, cand_start, cand_stalls, cand_stall_bwd, cand_groups_by_start, cand_launches = best_candidate
-            if cand_step + 1e-6 < best_step - float(cfg.inner_refine_min_gain_ms):
-                # Apply winning move.
-                t.start_k = int(cand_start)
-                best_step = float(cand_step)
-                best_stall = list(cand_stalls)
-                best_stall_bwd = dict(cand_stall_bwd)
-                best_groups_by_start = cand_groups_by_start
-                best_launches = cand_launches
-                best_reserved = _reserved_mem_by_block(tasks, len(blocks))
-                best_per_task_start = {(tt.layer_idx, tt.kind): int(tt.start_k) for tt in tasks if tt.start_k is not None}
-                moved = True
-                break
-
-        if not moved:
+        if best_move is None:
             break
 
-    # Rebuild tasks list with best starts.
-    for t in tasks:
-        if (t.layer_idx, t.kind) in best_per_task_start:
-            t.start_k = int(best_per_task_start[(t.layer_idx, t.kind)])
+        key, new_k, cand_ms = best_move
+        per_task_start[key] = int(new_k)
+        best_ms = float(cand_ms)
+        it += 1
 
-    return (
-        tasks,
-        best_reserved,
-        best_per_task_start,
-        {int(k): v for k, v in sorted(best_launches.items())},
-        float(best_step),
-        list(best_stall),
-        dict(best_stall_bwd),
-        int(chosen_fuse),
-    )
+    return per_task_start, {
+        "iters": int(it),
+        "start_predicted_step_ms": float(start_ms),
+        "final_predicted_step_ms": float(best_ms),
+    }
 
 
 def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Optional[dict]:
@@ -998,6 +1349,9 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     prof = profiling_results.get(graph_id)
     if prof is None or getattr(prof, "fwd_graph", None) is None or getattr(prof, "bwd_graph", None) is None:
         return None
+
+    ds_id_to_wait_pos_fwd = _build_ds_id_to_wait_pos(getattr(prof, "fwd_graph", None))
+    ds_id_to_wait_pos_bwd = _build_ds_id_to_wait_pos(getattr(prof, "bwd_graph", None))
 
     blocks_fwd = _extract_blocks_for_graph(prof.fwd_graph,
                                           getattr(prof, "fwd_mem", []),
@@ -1063,152 +1417,233 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
                 layer_to_ds_ids[i] = sorted(set(int(x) for x in layer_to_ds_ids[i]))
 
     comm_model = _fit_comm_model(graph_id, profiling_results, ds_id_to_size)
-    ds_id_to_bwd_wait_ms = _build_ds_id_to_bwd_wait_ms(graph_id, profiling_results)
     ds_id_to_allgather_ms = _build_ds_id_to_allgather_ms(profiling_results)
-    keep_layers_hint = set(
-        _choose_keep_layers(
-            L=L,
-            layer_to_ds_ids=layer_to_ds_ids,
-            ds_id_to_size=ds_id_to_size,
-            ds_id_to_bwd_wait_ms=ds_id_to_bwd_wait_ms,
-            mem_budget_bytes=mem_budget_bytes,
-        ))
 
-    def run_inner(keep_layers: Set[int]) -> dict:
-        tasks = _build_tasks(L, layer_to_ds_ids, ds_id_to_size, keep_layers)
-        reserved_mem, per_task_start = _assign_task_starts(tasks, blocks, comm_model, cfg)
+    # Approximate fixed (non-prefetch) communication that runs on the comm stream, e.g., grad reduction.
+    # We model it as bandwidth-dominated and proportional to per-layer parameter volume.
+    beta_grad = float(comm_model.beta_ms_per_byte)
+    layer_sizes: List[int] = []
+    for li in range(L):
+        ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
+        ids = sorted(set(ids))
+        layer_sizes.append(int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids)))
 
-        used_fuse_window = int(cfg.fuse_deadline_window_blocks)
-        if int(cfg.inner_refine_max_iters) > 0:
-            tasks, reserved_mem, per_task_start, launches, step_ms, stall_ms_per_block, stall_bwd_per_layer, used_fuse_window = _try_refine_task_starts(
-                tasks, blocks, comm_model, ds_id_to_size, cfg, keep_layers)
-        else:
-            launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg)
-            step_ms, stall_ms_per_block, stall_bwd_per_layer, _ = _simulate_schedule_in_graph_order(
-                blocks, groups_by_start, keep_layers)
+    grad_comm_ms_per_layer = [float(beta_grad) * float(layer_sizes[li]) for li in range(L)]
+    blocks = [
+        _BlockProfile(
+            k=int(b.k),
+            phase=str(b.phase),
+            layer_idx=int(b.layer_idx),
+            compute_ms=float(b.compute_ms),
+            cap_bytes=int(b.cap_bytes),
+            fixed_comm_start_offset_ms=float(b.fixed_comm_start_offset_ms),
+            fixed_comm_ms=float(grad_comm_ms_per_layer[int(b.layer_idx)]) if b.phase == "BWD" else 0.0,
+        ) for b in blocks
+    ]
 
-        keep_ds_ids: List[int] = []
-        for li in sorted(keep_layers):
-            keep_ds_ids.extend([int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size])
-        keep_ds_ids = sorted(set(keep_ds_ids))
+    persistent_ds_ids: List[int] = []
+    persistent_mem_bytes = 0
+    if bool(cfg.set_persistent) and int(mem_budget_bytes) > 0:
 
-        persistent_ds_ids: List[int] = []
-        persistent_mem_bytes = 0
-        if bool(cfg.set_persistent) and int(mem_budget_bytes) > 0:
-            def _time_per_byte(ds_id: int) -> float:
-                size = int(ds_id_to_size.get(int(ds_id), 0))
-                if size <= 0:
-                    return 0.0
-                return float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) / float(size)
+        def _time_per_byte(ds_id: int) -> float:
+            size = int(ds_id_to_size.get(int(ds_id), 0))
+            if size <= 0:
+                return 0.0
+            return float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) / float(size)
 
-            candidates = sorted(
-                keep_ds_ids,
-                key=lambda d: (_time_per_byte(int(d)), float(ds_id_to_allgather_ms.get(int(d), 0.0)),
-                               int(ds_id_to_size.get(int(d), 0)), int(d)),
-                reverse=True,
-            )
-            for ds_id in candidates:
-                size = int(ds_id_to_size.get(int(ds_id), 0))
-                if size <= 0:
-                    continue
-                if persistent_mem_bytes + size > int(mem_budget_bytes):
-                    continue
-                persistent_ds_ids.append(int(ds_id))
-                persistent_mem_bytes += int(size)
+        candidates = sorted(
+            [int(ds_id) for ds_id in ds_id_to_size.keys()],
+            key=lambda d: (_time_per_byte(int(d)), float(ds_id_to_allgather_ms.get(int(d), 0.0)),
+                           int(ds_id_to_size.get(int(d), 0)), int(d)),
+            reverse=True,
+        )
+        for ds_id in candidates:
+            size = int(ds_id_to_size.get(int(ds_id), 0))
+            if size <= 0:
+                continue
+            if persistent_mem_bytes + size > int(mem_budget_bytes):
+                continue
+            persistent_ds_ids.append(int(ds_id))
+            persistent_mem_bytes += int(size)
 
-        schedule = {
-            "version": 4,
-            "mapping_hash": mapping.mapping_hash,
-            "L": L,
-            "keep_layers": sorted(keep_layers),
-            "keep_ds_ids": keep_ds_ids,
-            "persistent_ds_ids": persistent_ds_ids,
-            "launches": {int(k): v for k, v in sorted(launches.items())},
-            "per_task_start_k": {f"layer.{li}.{kind}": int(k) for (li, kind), k in sorted(per_task_start.items())},
-            "predicted_reserved_mem": [int(x) for x in reserved_mem],
+    persistent_set: Set[int] = set(map(int, persistent_ds_ids))
+    forced_keep_layers: Set[int] = set()
+    if persistent_set:
+        for li in range(L):
+            ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
+            if ids and all(int(ds_id) in persistent_set for ds_id in ids):
+                forced_keep_layers.add(int(li))
+
+    # Heuristic improvement: auto-tune lookahead (within a very small candidate set) to find a better
+    # overlap point when the default lookahead is too restrictive. This only affects *when* we launch
+    # prefetches; memory feasibility is still enforced by per-block caps.
+    requested_lookahead = int(cfg.lookahead_blocks)
+    lookahead_candidates: List[int] = [max(0, int(requested_lookahead))]
+    if bool(cfg.autotune_lookahead_blocks):
+        # Prefer trying a moderately larger lookahead (up to 8 blocks) for better overlap.
+        target = min(int(L), max(int(requested_lookahead), 8))
+        if int(target) > int(requested_lookahead) and int(target) not in lookahead_candidates:
+            lookahead_candidates.append(int(target))
+
+    trials: List[dict] = []
+    best = None
+
+    for cand in lookahead_candidates:
+        cfg_cand = replace(cfg, lookahead_blocks=int(cand))
+
+        keep_layers, per_task_start, milp_meta = _solve_milp_schedule(L=L,
+                                                                      blocks=blocks,
+                                                                      layer_to_ds_ids=layer_to_ds_ids,
+                                                                      ds_id_to_size=ds_id_to_size,
+                                                                      cfg=cfg_cand,
+                                                                      comm_model=comm_model,
+                                                                      forced_keep_layers=forced_keep_layers)
+
+        refine_meta: dict = {"iters": 0}
+        if int(cfg_cand.inner_refine_max_iters) > 0:
+            per_task_start, refine_meta = _refine_plan_local_search(L=L,
+                                                                    blocks=blocks,
+                                                                    layer_to_ds_ids=layer_to_ds_ids,
+                                                                    ds_id_to_size=ds_id_to_size,
+                                                                    cfg=cfg_cand,
+                                                                    comm_model=comm_model,
+                                                                    keep_layers=keep_layers,
+                                                                    per_task_start=per_task_start,
+                                                                    persistent_set=persistent_set,
+                                                                    ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                                                    ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+
+        tasks = _build_tasks_from_plan(L=L,
+                                       layer_to_ds_ids=layer_to_ds_ids,
+                                       ds_id_to_size=ds_id_to_size,
+                                       keep_layers=keep_layers,
+                                       per_task_start=per_task_start,
+                                       persistent_set=persistent_set,
+                                       ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                       ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+
+        if not _is_mem_feasible(tasks, blocks):
+            trials.append({
+                "lookahead_blocks": int(cand),
+                "status": "infeasible_mem",
+                "milp": milp_meta,
+                "inner_refine": refine_meta,
+            })
+            continue
+
+        launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg_cand)
+        step_ms, stall_ms_per_block, stall_bwd_per_layer, _ = _simulate_schedule_in_graph_order(
+            blocks,
+            groups_by_start,
+            keep_layers,
+            separate_allgather_communicator=bool(cfg_cand.separate_allgather_communicator),
+        )
+        reserved_mem = _reserved_mem_by_block(tasks, K)
+        total_prefetch_calls = int(sum(len(v) for v in launches.values()))
+
+        trials.append({
+            "lookahead_blocks": int(cand),
+            "status": "ok",
             "predicted_step_ms": float(step_ms),
-            "predicted_stall_ms": [float(x) for x in stall_ms_per_block],
-            "predicted_stall_bwd_per_layer": {int(li): float(v) for li, v in sorted(stall_bwd_per_layer.items())},
-            "comm_model": {
-                "alpha_ms": float(comm_model.alpha_ms),
-                "beta_ms_per_byte": float(comm_model.beta_ms_per_byte),
-            },
-            "block_profiles": {
-                "compute_ms": [float(b.compute_ms) for b in blocks],
-                "cap_bytes": [int(b.cap_bytes) for b in blocks],
-            },
-            "meta": {
-                "lookahead_blocks": cfg.lookahead_blocks,
-                "fuse_max_bytes": cfg.fuse_max_bytes,
-                "fuse_deadline_window_blocks": int(used_fuse_window),
-                "fuse_factor": float(cfg.fuse_factor),
-                "inner_refine_max_iters": int(cfg.inner_refine_max_iters),
-                "inner_refine_min_gain_ms": float(cfg.inner_refine_min_gain_ms),
-                "mem_margin": cfg.mem_margin,
-                "safety_margin_bytes": cfg.safety_margin_bytes,
-                "total_mem_bytes": int(total_mem),
-                "peak_mem_bytes": int(peak_mem),
-                "mem_budget_bytes": int(mem_budget_bytes),
-                "persistent_mem_bytes": int(persistent_mem_bytes),
-                "include_unmapped_params": bool(cfg.include_unmapped_params),
-                "extra_unmapped_ds_ids": len(extra_ds_id_to_layer),
-                "set_persistent": bool(cfg.set_persistent),
-                "keep_layers_hint": sorted(keep_layers_hint),
-            },
-        }
-        schedule["schedule_hash"] = _schedule_hash(schedule)
-        return schedule
+            "prefetch_calls": int(total_prefetch_calls),
+            "milp": milp_meta,
+            "inner_refine": refine_meta,
+        })
 
-    best = run_inner(set())
-    best_step = float(best["predicted_step_ms"])
-    keep_layers: Set[int] = set()
+        if best is None or float(step_ms) < float(best["step_ms"]) - 1e-6:
+            best = {
+                "cfg": cfg_cand,
+                "keep_layers": keep_layers,
+                "per_task_start": per_task_start,
+                "tasks": tasks,
+                "launches": launches,
+                "groups_by_start": groups_by_start,
+                "step_ms": float(step_ms),
+                "stall_ms_per_block": stall_ms_per_block,
+                "stall_bwd_per_layer": stall_bwd_per_layer,
+                "reserved_mem": reserved_mem,
+                "prefetch_calls": total_prefetch_calls,
+                "milp": milp_meta,
+                "inner_refine": refine_meta,
+            }
 
-    if keep_layers_hint:
-        hinted = run_inner(set(keep_layers_hint))
-        hinted_step = float(hinted["predicted_step_ms"])
-        if hinted_step + 1e-6 < best_step:
-            keep_layers = set(keep_layers_hint)
-            best = hinted
-            best_step = hinted_step
+    if best is None:
+        return None
 
-    for _ in range(int(cfg.outer_keep_max_iters)):
-        candidates = []
-        for layer_idx in range(L):
-            if layer_idx in keep_layers:
-                continue
-            layer_ds_ids = [int(ds_id) for ds_id in layer_to_ds_ids[layer_idx] if int(ds_id) in ds_id_to_size]
-            if not layer_ds_ids:
-                continue
-            size_bytes = sum(ds_id_to_size[ds_id] for ds_id in layer_ds_ids)
-            # Use measured backward wait as a cheap benefit proxy to seed candidates; trial schedules decide.
-            benefit_ms = sum(ds_id_to_bwd_wait_ms.get(ds_id, 0.0) for ds_id in layer_ds_ids)
-            span = (2 * L - 1 - layer_idx) - layer_idx
-            cost = max(1, int(size_bytes) * int(span))
-            candidates.append((benefit_ms / cost, benefit_ms, layer_idx))
+    cfg_used = best["cfg"]
+    keep_layers = best["keep_layers"]
+    per_task_start = best["per_task_start"]
+    tasks = best["tasks"]
+    launches = best["launches"]
+    step_ms = float(best["step_ms"])
+    stall_ms_per_block = best["stall_ms_per_block"]
+    stall_bwd_per_layer = best["stall_bwd_per_layer"]
+    reserved_mem = best["reserved_mem"]
+    used_fuse_window = max(0, int(cfg_used.fuse_deadline_window_blocks))
+    total_prefetch_calls = int(best["prefetch_calls"])
+    best_milp_meta = best.get("milp", {})
+    best_refine_meta = best.get("inner_refine", {})
 
-        candidates.sort(reverse=True)
-        if not candidates:
-            break
+    keep_ds_ids: List[int] = []
+    for li in sorted(keep_layers):
+        keep_ds_ids.extend([int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size])
+    keep_ds_ids = sorted(set(keep_ds_ids))
 
-        improved = False
-        for _, benefit_ms, layer_idx in candidates[:int(cfg.outer_keep_top_n)]:
-            if benefit_ms < float(cfg.outer_keep_min_gain_ms):
-                continue
-            trial_keep = set(keep_layers)
-            trial_keep.add(int(layer_idx))
-            trial = run_inner(trial_keep)
-            trial_step = float(trial["predicted_step_ms"])
-            if trial_step + 1e-6 < best_step - float(cfg.outer_keep_min_gain_ms):
-                keep_layers = trial_keep
-                best = trial
-                best_step = trial_step
-                improved = True
-                break
-
-        if not improved:
-            break
-
-    return best
+    schedule = {
+        "version": 7,
+        "mapping_hash": mapping.mapping_hash,
+        "L": L,
+        "keep_layers": sorted(keep_layers),
+        "keep_ds_ids": keep_ds_ids,
+        "persistent_ds_ids": persistent_ds_ids,
+        "launches": {int(k): v for k, v in sorted(launches.items())},
+        "per_task_start_k": {f"layer.{li}.{kind}": int(k) for (li, kind), k in sorted(per_task_start.items())},
+        "predicted_reserved_mem": [int(x) for x in reserved_mem],
+        "predicted_step_ms": float(step_ms),
+        "predicted_stall_ms": [float(x) for x in stall_ms_per_block],
+        "predicted_stall_bwd_per_layer": {int(li): float(v) for li, v in sorted(stall_bwd_per_layer.items())},
+        "comm_model": {
+            "alpha_ms": float(comm_model.alpha_ms),
+            "beta_ms_per_byte": float(comm_model.beta_ms_per_byte),
+        },
+        "block_profiles": {
+            "compute_ms": [float(b.compute_ms) for b in blocks],
+            "cap_bytes": [int(b.cap_bytes) for b in blocks],
+            "fixed_comm_start_offset_ms": [float(b.fixed_comm_start_offset_ms) for b in blocks],
+            "fixed_comm_ms": [float(b.fixed_comm_ms) for b in blocks],
+        },
+        "meta": {
+            "lookahead_blocks": int(cfg_used.lookahead_blocks),
+            "requested_lookahead_blocks": int(requested_lookahead),
+            "autotune_lookahead_blocks": bool(cfg.autotune_lookahead_blocks),
+            "lookahead_trials": trials,
+            "fuse_max_bytes": int(cfg_used.fuse_max_bytes),
+            "fuse_deadline_window_blocks": int(used_fuse_window),
+            "requested_fuse_deadline_window_blocks": int(cfg.fuse_deadline_window_blocks),
+            "fuse_factor": float(cfg_used.fuse_factor),
+            "inner_refine_max_iters": int(cfg_used.inner_refine_max_iters),
+            "inner_refine_min_gain_ms": float(cfg_used.inner_refine_min_gain_ms),
+            "inner_refine": best_refine_meta,
+            "mem_margin": cfg_used.mem_margin,
+            "safety_margin_bytes": int(cfg_used.safety_margin_bytes),
+            "total_mem_bytes": int(total_mem),
+            "peak_mem_bytes": int(peak_mem),
+            "mem_budget_bytes": int(mem_budget_bytes),
+            "persistent_mem_bytes": int(persistent_mem_bytes),
+            "include_unmapped_params": bool(cfg_used.include_unmapped_params),
+            "extra_unmapped_ds_ids": len(extra_ds_id_to_layer),
+            "set_persistent": bool(cfg_used.set_persistent),
+            "prefetch_calls": int(total_prefetch_calls),
+            "milp": best_milp_meta,
+            "milp_time_limit_s": float(cfg_used.milp_time_limit_s),
+            "milp_node_limit": int(cfg_used.milp_node_limit),
+            "milp_rel_gap": float(cfg_used.milp_rel_gap),
+            "milp_presolve": bool(cfg_used.milp_presolve),
+            "separate_allgather_communicator": bool(cfg_used.separate_allgather_communicator),
+        },
+    }
+    schedule["schedule_hash"] = _schedule_hash(schedule)
+    return schedule
 
 
 def _broadcast_and_store_schedule(schedule: dict) -> dict:
@@ -1274,8 +1709,9 @@ def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], pr
         return None
 
     if dist.get_rank() == 0:
+        meta = schedule.get("meta", {})
         log_rank0(
-            f"[{NAME}] Planned schedule: L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} mem_budget_bytes={schedule.get('meta',{}).get('mem_budget_bytes', None)} predicted_step_ms={schedule.get('predicted_step_ms', None)}",
+            f"[{NAME}] Planned schedule: L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} prefetch_calls={meta.get('prefetch_calls', None)} lookahead={meta.get('lookahead_blocks', None)} requested_lookahead={meta.get('requested_lookahead_blocks', None)} mem_budget_bytes={meta.get('mem_budget_bytes', None)} predicted_step_ms={schedule.get('predicted_step_ms', None)}",
             enable=True,
         )
 
@@ -1369,6 +1805,7 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
     launches: Dict[int, List[List[int]]] = {int(k): v for k, v in sched.get("launches", {}).items()}
 
     keep_ds_ids: Set[int] = set(map(int, sched.get("keep_ds_ids", [])))
+    persistent_ds_ids: Set[int] = set(map(int, sched.get("persistent_ds_ids", [])))
 
     anchors = _find_layer_anchors(graph, mapping.ds_id_to_layer, L)
     if not anchors:
@@ -1394,8 +1831,10 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
         env[old] = new
         return new
 
-    def insert_prefetch_for_layer(layer: int) -> None:
-        unified_k = layer if not bwd else (K - 1 - layer)
+    head_k = 0 if not bwd else int(L)
+
+    def insert_prefetch_for_unified_k(unified_k: int) -> bool:
+        inserted = False
         groups = launches.get(int(unified_k), [])
         for gi, ds_ids in enumerate(groups):
             params_new: List[Node] = []
@@ -1415,6 +1854,16 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
                                   torch.ops.dc.prefetch_params_fused.default,
                                   args=(graph_id, params_new, ds_ids_new, dtypes_new),
                                   name=name)
+            inserted = True
+        return inserted
+
+    def insert_prefetch_for_layer(layer: int) -> None:
+        unified_k = layer if not bwd else (K - 1 - layer)
+        # For the first boundary in each graph, we insert prefetch at graph head to overlap
+        # with any prefix compute (e.g., embeddings) that happens before the first layer anchor.
+        if int(unified_k) == int(head_k):
+            return
+        insert_prefetch_for_unified_k(int(unified_k))
 
     def insert_layer_comm(layer: int) -> None:
         ds_ids = [
@@ -1423,26 +1872,27 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
         ]
         for ds_id in sorted(ds_ids):
             ag_old = ds_id_to_ag[ds_id]
-            wait_old = ds_id_to_wait[ds_id]
             if ag_old not in env:
                 copy_node(ag_old)
-            if wait_old not in env:
-                copy_node(wait_old)
 
     moved_ag = set()
-    moved_wait = set()
     for layer in range(L):
         for ds_id in mapping.layer_to_ds_ids[layer]:
             ds_id = int(ds_id)
             if ds_id in ds_id_to_ag and ds_id in ds_id_to_wait:
                 moved_ag.add(ds_id_to_ag[ds_id])
-                moved_wait.add(ds_id_to_wait[ds_id])
 
     changed = False
+    inserted_head = False
     for n in graph.nodes:
         if n.op == "placeholder":
             copy_node(n)
             continue
+
+        if not inserted_head:
+            if insert_prefetch_for_unified_k(int(head_k)):
+                changed = True
+            inserted_head = True
 
         if n in anchor_node_to_layer and cfg.rewrite_comm_ops:
             layer = int(anchor_node_to_layer[n])
@@ -1450,14 +1900,16 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
             insert_layer_comm(layer)
             changed = True
 
-        if n in moved_ag or n in moved_wait:
+        if n in moved_ag:
             # These comm nodes are re-inserted at the layer anchor.
             continue
 
-        if (not bwd) and n.target == torch.ops.dc.release_param.default and _get_ds_id_from_release(n) in keep_ds_ids:
-            env[n] = env[n.args[0]]
-            changed = True
-            continue
+        if n.target == torch.ops.dc.release_param.default:
+            ds_id = _get_ds_id_from_release(n)
+            if ((not bwd) and ds_id in (keep_ds_ids | persistent_ds_ids)) or (bwd and ds_id in persistent_ds_ids):
+                env[n] = env[n.args[0]]
+                changed = True
+                continue
 
         if n.op == "output":
             copy_node(n)
@@ -1471,7 +1923,7 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
     return new_graph
 
 
-def _remove_forward_releases(graph: Graph, keep_ds_ids: Set[int]) -> bool:
+def _remove_releases(graph: Graph, keep_ds_ids: Set[int]) -> bool:
     to_erase: List[Node] = []
     for n in graph.nodes:
         if n.target != torch.ops.dc.release_param.default:
@@ -1521,21 +1973,34 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
 
     graph = gm.graph
 
+    keep_ds_ids = set(map(int, sched.get("keep_ds_ids", [])))
+    persistent_ds_ids = set(map(int, sched.get("persistent_ds_ids", [])))
+
     changed = False
     if not bwd:
-        changed |= _remove_forward_releases(graph, set(map(int, sched.get("keep_ds_ids", []))))
+        # For kept params, bypass forward releases so buffers stay live into backward.
+        # For persistent params, releases are no-ops anyway; bypassing avoids overhead and helps compiler scheduling.
+        changed |= _remove_releases(graph, keep_ds_ids | persistent_ds_ids)
+    else:
+        # For persistent params, release is a no-op; bypass to reduce overhead.
+        changed |= _remove_releases(graph, persistent_ds_ids)
 
     anchors = _find_layer_anchors(graph, mapping.ds_id_to_layer, L)
     ds_id_to_dtype = _ds_id_to_target_dtype(graph, pm)
 
     launches: Dict[int, List[List[int]]] = {int(k): v for k, v in sched.get("launches", {}).items()}
+    head_node = None
+    for n in graph.nodes:
+        if n.op != "placeholder":
+            head_node = n
+            break
 
     if not bwd:
         for k in range(L):
             groups = launches.get(k)
             if not groups:
                 continue
-            anchor = anchors.get(k)
+            anchor = head_node if (k == 0 and head_node is not None) else anchors.get(k)
             if anchor is None:
                 continue
             for gi, ds_ids in enumerate(groups):
@@ -1553,7 +2018,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
             if not groups:
                 continue
             layer = 2 * L - 1 - k
-            anchor = anchors.get(layer)
+            anchor = head_node if (k == L and head_node is not None) else anchors.get(layer)
             if anchor is None:
                 continue
             for gi, ds_ids in enumerate(groups):

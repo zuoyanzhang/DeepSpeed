@@ -73,7 +73,19 @@ class CompileConfig(DeepSpeedConfigModel):
     """ Upper bound on how many layer-tasks can be launched at the same block """
 
     global_layer_scheduler_rewrite_comm_ops: bool = True
-    """ Rewrite/move allgather/wait nodes to layer anchors (can reduce intra-layer overlap; default off) """
+    """ Rewrite/move allgather nodes to layer anchors (keep wait nodes in place to preserve intra-layer overlap) """
+
+    global_layer_scheduler_milp_time_limit_s: float = 2.0
+    """ Time limit (seconds) for the global layer scheduler MILP solver """
+
+    global_layer_scheduler_milp_node_limit: int = 0
+    """ Node limit for the MILP solver (0 means no limit) """
+
+    global_layer_scheduler_milp_rel_gap: float = 0.01
+    """ Relative MIP gap termination criterion for the MILP solver """
+
+    global_layer_scheduler_milp_presolve: bool = True
+    """ Enable/disable MILP presolve """
 
     free_activation: bool = False
     """ Turn on/off the free activation mode """
@@ -110,6 +122,9 @@ class CompileConfig(DeepSpeedConfigModel):
 
     sync_after_allgather: bool = False
     """ Turn on/off the sync after allgather """
+
+    separate_allgather_communicator: bool = True
+    """ If True, use a dedicated NCCL communicator for allgather ops to improve overlap with reduce ops """
 
     keep_int_input_tensors: bool = True
     """ Keep real values for int tensors in InputStorage instead of using dummy values """

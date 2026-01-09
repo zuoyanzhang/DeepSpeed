@@ -162,7 +162,13 @@ def main():
     tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
 
     sampler = DistributedSampler(tokenized_dataset, num_replicas=accelerator.num_processes, rank=accelerator.process_index)
-    data_loader = DataLoader(tokenized_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
+    data_loader = DataLoader(
+        tokenized_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=8,
+        persistent_workers=True,
+    )
 
     # Prepare optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)

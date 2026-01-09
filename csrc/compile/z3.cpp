@@ -33,6 +33,7 @@ public:
                        std::shared_ptr<DSParamRegistry> param_registry,
                        std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets,
                        std::vector<long> ds_ids,
+                       ncclComm_t nccl_ag_comm,
                        ncclComm_t nccl_comm,
                        at::cuda::CUDAStream ag_stream,
                        at::cuda::CUDAStream rs_stream,
@@ -48,6 +49,7 @@ public:
                            rs_stream,
                            copy_stream,
                            pre_div_reduce),
+          nccl_ag_comm_(nccl_ag_comm),
           ag_stream_(ag_stream),
           offload_stream_(offload_stream),
           reload_stream_(reload_stream)
@@ -60,6 +62,10 @@ public:
 
             param_use_count_[ds_id] = 0;
         }
+        // Shared event to order prefetch_params_fused launches against the current stream.
+        // All ds_ids in a single fused prefetch share the same insertion point in the graph,
+        // so one event is sufficient and avoids O(num_ds_ids) record+wait overhead.
+        prefetch_comp_done_event_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     }
     ~Z3CustomOpExecutor() {}
 
@@ -103,7 +109,7 @@ public:
                                                 output_buf.data_ptr(),
                                                 shard_elems,
                                                 get_nccl_data_type(ds_tensor.scalar_type()),
-                                                nccl_comm_,
+                                                nccl_ag_comm_,
                                                 ag_stream_);
 
             if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather failed"); }
@@ -158,7 +164,9 @@ public:
         at::Tensor output_buf;
         if (param_registry_->hasGatheredParam(ds_id)) {
             auto existing = param_registry_->getGatheredParam(ds_id);
-            if (existing.defined() && existing.numel() == padded_numel) { output_buf = existing; }
+            if (existing.defined() && existing.numel() == padded_numel && existing.scalar_type() == target_dtype) {
+                output_buf = existing;
+            }
         }
         if (!output_buf.defined()) {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
@@ -252,7 +260,7 @@ public:
                                                 recv_buf.data_ptr(),
                                                 chunk_size,
                                                 get_nccl_data_type(send_buf.scalar_type()),
-                                                nccl_comm_,
+                                                nccl_ag_comm_,
                                                 ag_stream_);
             if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather (chunk) failed"); }
 
@@ -314,32 +322,29 @@ public:
             const int world_size = process_group_->getSize();
             const int64_t shard_elems = ds_tensor.numel();
             const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+            auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
 
             if (param_registry_->hasGatheredParam(ds_id)) {
                 auto existing = param_registry_->getGatheredParam(ds_id);
-                if (existing.defined() && existing.numel() == padded_numel) {
+                if (existing.defined() && existing.numel() == padded_numel && existing.scalar_type() == target_dtype) {
                     output_bufs[ds_id] = existing;
                     continue;
                 }
             }
-            auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
             output_bufs[ds_id] =
                 torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
         }
 
-        for (const auto& [ds_id, _] : invalid_params) {
-            ag_comp_done_events_[ds_id]->record();
-            ag_comp_done_events_[ds_id]->block(ag_stream_);
+        if (!invalid_params.empty()) {
+            prefetch_comp_done_event_->record();
+            prefetch_comp_done_event_->block(ag_stream_);
         }
 
-        ncclGroupStart();
+        // Record per-ds_id completion events at the correct stream positions so each wait_allgather(ds_id)
+        // can become ready independently (preserving intra-layer overlap and correct deadline semantics).
         for (const auto& [ds_id, _] : invalid_params) {
             assert(hasKey(output_bufs, ds_id));
             launchAllGather(output_bufs.at(ds_id), ds_id, symm_mem);
-        }
-        ncclGroupEnd();
-
-        for (const auto& [ds_id, _] : invalid_params) {
             ag_comm_done_events_[ds_id]->record(ag_stream_);
         }
     }
@@ -550,6 +555,7 @@ private:
     using ChunkEventMap =
         std::unordered_map<ChunkKey, std::shared_ptr<at::cuda::CUDAEvent>, ChunkKeyHash>;
 
+    ncclComm_t nccl_ag_comm_;
     at::cuda::CUDAStream ag_stream_;
     at::cuda::CUDAStream offload_stream_;
     at::cuda::CUDAStream reload_stream_;
@@ -557,6 +563,7 @@ private:
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comp_done_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comm_done_events_;
     std::unordered_map<long, ChunkEventMap> ag_chunk_comm_done_events_;
+    std::shared_ptr<at::cuda::CUDAEvent> prefetch_comp_done_event_;
 
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> offload_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> offload_comp_done_events_;
@@ -579,6 +586,7 @@ void register_graph_z3(long graph_id, const std::vector<long>& ds_ids)
                                                                param_registry,
                                                                reduce_buckets,
                                                                ds_ids,
+                                                               nccl_ag_comm,
                                                                nccl_comm,
                                                                ag_stream,
                                                                rs_stream,
