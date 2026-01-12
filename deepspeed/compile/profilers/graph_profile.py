@@ -4,8 +4,9 @@
 # DeepSpeed Team
 
 import time
-from typing import Any, Tuple, Dict
+from typing import Any, Tuple, Dict, Optional
 import statistics
+import os
 
 import torch
 from torch.fx import GraphModule, Interpreter
@@ -21,6 +22,401 @@ except ImportError:
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from ..util import is_comm_op, is_release_node, get_deepcompile_handle
+
+
+_INPLACE_FUSE_STACK_SUBSTRINGS = ("cross_entropy", "fixed_cross_entropy")
+_INPLACE_FUSE_MIN_BYTES = int(os.getenv("DS_DEEPCOMPILE_PROF_INPLACE_FUSE_MIN_BYTES", 256 * 1024 * 1024))
+_CE_SPARSE_FUSE_ENABLED = os.getenv("DS_DEEPCOMPILE_PROF_CE_SPARSE_FUSE", "1") not in ("0", "false", "False")
+_CE_SPARSE_FUSE_MIN_BYTES = int(os.getenv("DS_DEEPCOMPILE_PROF_CE_SPARSE_FUSE_MIN_BYTES", 256 * 1024 * 1024))
+
+
+class _CEFullNoAlloc:
+
+    __slots__ = ("shape", "fill_value", "dtype", "device")
+
+    def __init__(self, shape, fill_value, dtype, device):
+        self.shape = shape
+        self.fill_value = fill_value
+        self.dtype = dtype
+        self.device = device
+
+    def __repr__(self) -> str:
+        return f"_CEFullNoAlloc(shape={self.shape}, fill_value={self.fill_value}, dtype={self.dtype}, device={self.device})"
+
+
+class _CEScatterValueNoAlloc:
+
+    __slots__ = ("shape", "dim", "index", "value")
+
+    def __init__(self, shape, dim: int, index: torch.Tensor, value):
+        self.shape = shape
+        self.dim = dim
+        self.index = index
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"_CEScatterValueNoAlloc(shape={self.shape}, dim={self.dim}, index_shape={tuple(self.index.shape)}, value={self.value})"
+
+
+class _CESparseScaledNoAlloc:
+
+    __slots__ = ("shape", "dim", "index", "scale", "value")
+
+    def __init__(self, shape, dim: int, index: torch.Tensor, scale: torch.Tensor, value):
+        self.shape = shape
+        self.dim = dim
+        self.index = index
+        self.scale = scale
+        self.value = value
+
+    def __repr__(self) -> str:
+        return (f"_CESparseScaledNoAlloc(shape={self.shape}, dim={self.dim}, index_shape={tuple(self.index.shape)}, "
+                f"scale_shape={tuple(self.scale.shape)}, value={self.value})")
+
+
+class _CEDenseMulNoAlloc:
+
+    __slots__ = ("exp", "sum", "exp_node", "node")
+
+    def __init__(self, exp: torch.Tensor, sum: torch.Tensor, exp_node: Optional[torch.fx.Node], node: torch.fx.Node):
+        self.exp = exp
+        self.sum = sum
+        self.exp_node = exp_node
+        self.node = node
+
+    def __repr__(self) -> str:
+        exp_shape = tuple(self.exp.shape) if torch.is_tensor(self.exp) else None
+        sum_shape = tuple(self.sum.shape) if torch.is_tensor(self.sum) else None
+        return f"_CEDenseMulNoAlloc(exp_shape={exp_shape}, sum_shape={sum_shape}, exp_node={getattr(self.exp_node, 'name', None)})"
+
+
+def _to_int_tuple(v) -> Optional[Tuple[int, ...]]:
+    if not isinstance(v, (tuple, list)):
+        return None
+    dims = []
+    sym_int_ty = getattr(torch, "SymInt", None)
+    for x in v:
+        if sym_int_ty is not None and isinstance(x, sym_int_ty):
+            try:
+                dims.append(int(x.node.hint))
+                continue
+            except Exception:
+                pass
+        try:
+            dims.append(int(x))
+        except Exception:
+            return None
+    return tuple(dims)
+
+
+def _dtype_element_size(dtype) -> int:
+    try:
+        return int(torch.empty((), dtype=dtype).element_size())
+    except Exception:
+        return 0
+
+
+def _full_default_requested_nbytes(args, kwargs) -> int:
+    if not args:
+        return 0
+    shape = _to_int_tuple(args[0])
+    if not shape:
+        return 0
+    dtype = kwargs.get("dtype", None)
+    if not isinstance(dtype, torch.dtype):
+        return 0
+    es = _dtype_element_size(dtype)
+    if es <= 0:
+        return 0
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    return int(numel * es)
+
+
+def _match_ce_sparse_decomp(full_node: torch.fx.Node):
+    if full_node.op != "call_function" or full_node.target != torch.ops.aten.full.default:
+        return None
+    if not _has_any_stack_substring(full_node, _INPLACE_FUSE_STACK_SUBSTRINGS):
+        return None
+    users = list(full_node.users)
+    if len(users) != 1:
+        return None
+
+    scatter_node = users[0]
+    if scatter_node.op != "call_function" or scatter_node.target != torch.ops.aten.scatter.value:
+        return None
+    if not scatter_node.args or scatter_node.args[0] is not full_node:
+        return None
+    if len(scatter_node.args) < 4:
+        return None
+    try:
+        dim = int(scatter_node.args[1])
+        value = float(scatter_node.args[3])
+    except Exception:
+        return None
+    if dim != 1 or value != -1.0:
+        return None
+    scatter_users = list(scatter_node.users)
+    if len(scatter_users) != 1:
+        return None
+
+    mul_sparse = scatter_users[0]
+    if mul_sparse.op != "call_function" or mul_sparse.target != torch.ops.aten.mul.Tensor:
+        return None
+    if not (mul_sparse.args and (mul_sparse.args[0] is scatter_node or mul_sparse.args[1] is scatter_node)):
+        return None
+
+    sum_nodes = [u for u in mul_sparse.users if u.op == "call_function" and u.target == torch.ops.aten.sum.dim_IntList]
+    if len(sum_nodes) != 1:
+        return None
+    sum_node = sum_nodes[0]
+    if not sum_node.args or sum_node.args[0] is not mul_sparse:
+        return None
+    if len(sum_node.args) < 3:
+        return None
+    try:
+        if list(sum_node.args[1]) != [1] or sum_node.args[2] is not True:
+            return None
+    except Exception:
+        return None
+    sum_users = list(sum_node.users)
+    if len(sum_users) != 1:
+        return None
+
+    mul_dense = sum_users[0]
+    if mul_dense.op != "call_function" or mul_dense.target != torch.ops.aten.mul.Tensor:
+        return None
+    if not (mul_dense.args and (mul_dense.args[0] is sum_node or mul_dense.args[1] is sum_node)):
+        return None
+    mul_dense_users = list(mul_dense.users)
+    if len(mul_dense_users) != 1:
+        return None
+
+    # Expect sub.Tensor(mul_sparse, mul_dense)
+    sub_nodes = [
+        u for u in mul_sparse.users
+        if u.op == "call_function" and u.target == torch.ops.aten.sub.Tensor and u.args and u.args[0] is mul_sparse
+        and u.args[1] is mul_dense
+    ]
+    if len(sub_nodes) != 1:
+        return None
+    if mul_dense_users[0] is not sub_nodes[0]:
+        return None
+
+    return (full_node, scatter_node, mul_sparse, sum_node, mul_dense, sub_nodes[0])
+
+
+def _build_ce_sparse_fusion_role_map(graph) -> Dict[torch.fx.Node, str]:
+    if not _CE_SPARSE_FUSE_ENABLED:
+        return {}
+
+    roles: Dict[torch.fx.Node, str] = {}
+    for n in graph.nodes:
+        m = _match_ce_sparse_decomp(n)
+        if not m:
+            continue
+        full_node, scatter_node, mul_sparse, sum_node, mul_dense, sub_node = m
+        # Avoid fusing small cases; the motivation is to prevent huge allocations/OOM.
+        if _full_default_requested_nbytes(full_node.args, full_node.kwargs) < _CE_SPARSE_FUSE_MIN_BYTES:
+            continue
+        roles[full_node] = "ce_full"
+        roles[scatter_node] = "ce_scatter"
+        roles[mul_sparse] = "ce_mul_sparse"
+        roles[sum_node] = "ce_sum"
+        roles[mul_dense] = "ce_mul_dense"
+        roles[sub_node] = "ce_sub"
+
+    return roles
+
+
+def _has_any_stack_substring(n: torch.fx.Node, substrings) -> bool:
+    st = getattr(n, "stack_trace", None) or ""
+    return any(s in st for s in substrings)
+
+
+def _tensor_nbytes(v) -> int:
+    if not torch.is_tensor(v):
+        return 0
+    try:
+        return int(v.numel() * v.element_size())
+    except Exception:
+        return 0
+
+
+def _is_non_view_tensor(v) -> bool:
+    # Best-effort aliasing guard: only inplace-update tensors that are not views.
+    if not torch.is_tensor(v):
+        return False
+    return getattr(v, "_base", None) is None
+
+
+def _should_try_inplace_fuse(interp: Interpreter, n: torch.fx.Node, args) -> bool:
+    if not getattr(interp, "garbage_collect_values", False):
+        return False
+    if n.op != "call_function":
+        return False
+    if not _has_any_stack_substring(n, _INPLACE_FUSE_STACK_SUBSTRINGS):
+        return False
+    return _tensor_nbytes(args[0]) >= _INPLACE_FUSE_MIN_BYTES if args else False
+
+
+def _maybe_inplace_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
+    """
+    Best-effort inplace fusion for the cross-entropy backward decomposition.
+
+    When profiling FX graphs node-by-node, some decomposed primitives allocate multiple
+    huge [B*Seq, Vocab] fp32 intermediates (e.g., one-hot/scatter + exp + sub), causing
+    OOM even though real execution is fused and fits. Here we opportunistically reuse
+    dead buffers (based on FX last-use analysis) to avoid extra allocations.
+    """
+
+    if not _should_try_inplace_fuse(interp, n, args):
+        return None
+
+    last_uses = getattr(interp, "user_to_last_uses", {}).get(n, [])
+
+    # scatter.value(self, dim, index, value) -> Tensor
+    if n.target == torch.ops.aten.scatter.value:
+        if len(args) == 4 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses and _is_non_view_tensor(args[0]):
+            out = args[0]
+            out.scatter_(int(args[1]), args[2], args[3])
+            return out
+
+    # mul.Tensor(self, other) -> Tensor  (broadcasted)
+    if n.target == torch.ops.aten.mul.Tensor:
+        if (len(args) == 2 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses and _is_non_view_tensor(args[0])
+                and torch.is_tensor(args[1])):
+            out = args[0]
+            out.mul_(args[1])
+            return out
+
+    # sub.Tensor(self, other) -> Tensor
+    if n.target == torch.ops.aten.sub.Tensor:
+        if (len(args) == 2 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses and _is_non_view_tensor(args[0])
+                and torch.is_tensor(args[1])):
+            out = args[0]
+            out.sub_(args[1])
+            return out
+
+    return None
+
+
+def _maybe_ce_sparse_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
+    role_map = getattr(interp, "_ce_sparse_fusion_roles", None)
+    if not role_map:
+        return None
+    role = role_map.get(n)
+    if role is None:
+        return None
+
+    if role == "ce_full":
+        shape = _to_int_tuple(args[0]) if args else None
+        if not shape:
+            return None
+        fill_value = args[1] if len(args) > 1 else None
+        dtype = kwargs.get("dtype", None)
+        device = kwargs.get("device", None)
+        if _full_default_requested_nbytes(args, kwargs) < _CE_SPARSE_FUSE_MIN_BYTES:
+            return None
+        return _CEFullNoAlloc(shape=shape, fill_value=fill_value, dtype=dtype, device=device)
+
+    if role == "ce_scatter":
+        if len(args) != 4 or not isinstance(args[0], _CEFullNoAlloc):
+            return None
+        dim = int(args[1])
+        index = args[2]
+        value = args[3]
+        if dim != 1 or not torch.is_tensor(index):
+            return None
+        return _CEScatterValueNoAlloc(shape=args[0].shape, dim=dim, index=index, value=value)
+
+    if role == "ce_mul_sparse":
+        if len(args) != 2:
+            return None
+        if isinstance(args[0], _CEScatterValueNoAlloc) and torch.is_tensor(args[1]):
+            scatter, scale = args[0], args[1]
+        elif isinstance(args[1], _CEScatterValueNoAlloc) and torch.is_tensor(args[0]):
+            scatter, scale = args[1], args[0]
+        else:
+            return None
+        return _CESparseScaledNoAlloc(shape=scatter.shape, dim=scatter.dim, index=scatter.index, scale=scale,
+                                      value=scatter.value)
+
+    if role == "ce_sum":
+        if not args or not isinstance(args[0], _CESparseScaledNoAlloc):
+            return None
+        sparse = args[0]
+        if len(args) < 3:
+            return None
+        dim_list = args[1]
+        keepdim = args[2]
+        if list(dim_list) != [sparse.dim]:
+            return None
+        if keepdim not in (True, False):
+            return None
+        out = sparse.scale.mul(float(sparse.value))
+        if not keepdim and torch.is_tensor(out) and out.dim() == 2 and out.shape[1] == 1:
+            out = out.squeeze(1)
+        return out
+
+    if role == "ce_mul_dense":
+        if len(args) != 2 or not (torch.is_tensor(args[0]) and torch.is_tensor(args[1])):
+            return None
+
+        if _tensor_nbytes(args[0]) >= _CE_SPARSE_FUSE_MIN_BYTES and _tensor_nbytes(args[1]) < _CE_SPARSE_FUSE_MIN_BYTES:
+            exp, sum_ = args[0], args[1]
+            exp_node = n.args[0] if isinstance(n.args[0], torch.fx.Node) else None
+        elif _tensor_nbytes(args[1]) >= _CE_SPARSE_FUSE_MIN_BYTES and _tensor_nbytes(args[0]) < _CE_SPARSE_FUSE_MIN_BYTES:
+            exp, sum_ = args[1], args[0]
+            exp_node = n.args[1] if isinstance(n.args[1], torch.fx.Node) else None
+        else:
+            return None
+
+        return _CEDenseMulNoAlloc(exp=exp, sum=sum_, exp_node=exp_node, node=n)
+
+    if role == "ce_sub":
+        if len(args) != 2 or not (isinstance(args[0], _CESparseScaledNoAlloc) and isinstance(args[1], _CEDenseMulNoAlloc)):
+            return None
+        sparse, dense = args[0], args[1]
+        if sparse.dim != 1:
+            return None
+        if not (torch.is_tensor(sparse.index) and torch.is_tensor(dense.exp) and torch.is_tensor(dense.sum)):
+            return None
+
+        can_reuse_exp = _is_non_view_tensor(dense.exp) and dense.exp_node is not None and (
+            dense.exp_node in getattr(interp, "user_to_last_uses", {}).get(dense.node, []))
+
+        out = dense.exp if can_reuse_exp else dense.exp.clone()
+        neg_sum = dense.sum.neg()
+        out.mul_(neg_sum)
+        out.scatter_add_(sparse.dim, sparse.index, dense.sum)
+        return out
+
+    return None
+
+
+def _can_inplace_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs) -> bool:
+    if not _should_try_inplace_fuse(interp, n, args):
+        return False
+    last_uses = getattr(interp, "user_to_last_uses", {}).get(n, [])
+    if n.target == torch.ops.aten.scatter.value:
+        return (len(args) == 4 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses
+                and _is_non_view_tensor(args[0]))
+    if n.target == torch.ops.aten.mul.Tensor:
+        return (len(args) == 2 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses
+                and _is_non_view_tensor(args[0]) and torch.is_tensor(args[1]))
+    if n.target == torch.ops.aten.sub.Tensor:
+        return (len(args) == 2 and isinstance(n.args[0], torch.fx.Node) and n.args[0] in last_uses
+                and _is_non_view_tensor(args[0]) and torch.is_tensor(args[1]))
+    return False
+
+
+def _maybe_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
+    ret = _maybe_ce_sparse_fuse_call(interp, n, args, kwargs)
+    if ret is not None:
+        return ret
+    return _maybe_inplace_fuse_call(interp, n, args, kwargs)
 
 
 def _all_real_if_tensor(args):
@@ -92,6 +488,7 @@ class ProfilingInterpreter(Interpreter):
         self.allgather_mem: Dict[int, int] = {}
         self.debug_log = debug_log
         self.mem_usage_out_of_torch = 0
+        self._ce_sparse_fusion_roles = _build_ce_sparse_fusion_role_map(gm.graph)
 
     def run(self, *args) -> Any:
         """Run the graph with profiling enabled.
@@ -164,7 +561,9 @@ class ProfilingInterpreter(Interpreter):
             n.meta["tensor_size"] = tensor_size
 
         is_release_op = is_release_node(n)
-        run_only_once = cache_hit or is_release_op
+        # Inplace fusion mutates buffers; do not run multiple warmup/iterations.
+        run_only_once = cache_hit or is_release_op or (self._ce_sparse_fusion_roles.get(n) == "ce_sub"
+                                                       or _can_inplace_fuse_call(self, n, args, kwargs))
         iteration = 1 if run_only_once else self.iteration
         accelerator = get_accelerator()
         start_events = [accelerator.Event(enable_timing=True) for _ in range(iteration)]
@@ -176,7 +575,9 @@ class ProfilingInterpreter(Interpreter):
 
         if not run_only_once:
             for i in range(self.warmup):
-                out = getattr(self, n.op)(n.target, args, kwargs)
+                out = _maybe_fuse_call(self, n, args, kwargs)
+                if out is None:
+                    out = getattr(self, n.op)(n.target, args, kwargs)
 
         if is_comm_op(n):
             assert self.distributed, f"Distributed environment is not initialized but comm operator {n.name} {n.target} is used."
@@ -185,7 +586,9 @@ class ProfilingInterpreter(Interpreter):
         start = time.time()
         for i in range(iteration):
             start_events[i].record()
-            out = getattr(self, n.op)(n.target, args, kwargs)
+            out = _maybe_fuse_call(self, n, args, kwargs)
+            if out is None:
+                out = getattr(self, n.op)(n.target, args, kwargs)
             end_events[i].record()
         accelerator.synchronize()
         walltime_sum = time.time() - start
@@ -251,6 +654,7 @@ class MemoryProfilingInterpreter(Interpreter):
         self.device = torch.device(get_accelerator().current_device())
         self.mem_record = []
         self.last_alloc = get_accelerator().memory_allocated()
+        self._ce_sparse_fusion_roles = _build_ce_sparse_fusion_role_map(gm.graph)
 
         self.node_counter = 0
         self.node_num = len(gm.graph.nodes)
@@ -282,7 +686,9 @@ class MemoryProfilingInterpreter(Interpreter):
             args, kwargs = self.fetch_args_kwargs_from_env(n)
             args = map_aggregate(args, lambda x: _to(x, self.device))
             kwargs = map_aggregate(kwargs, lambda x: _to(x, self.device))
-            ret = getattr(self, n.op)(n.target, args, kwargs)
+            ret = _maybe_fuse_call(self, n, args, kwargs)
+            if ret is None:
+                ret = getattr(self, n.op)(n.target, args, kwargs)
 
             del args, kwargs
 
