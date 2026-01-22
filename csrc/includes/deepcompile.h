@@ -387,7 +387,9 @@ public:
 
     void registerGatheredParam(long ds_id, at::Tensor ds_tensor)
     {
-        gathered_params_.emplace(ds_id, ds_tensor);
+        // Overwrite any existing entry so callers can safely refresh/replace
+        // gathered buffers (e.g., after invalidation or dtype changes).
+        gathered_params_[ds_id] = std::move(ds_tensor);
     }
 
     void unregisterGatheredParam(long ds_id)

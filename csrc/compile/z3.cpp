@@ -92,6 +92,14 @@ public:
     {
         const DSParam& param = param_registry_->getParam(ds_id);
         at::Tensor ds_tensor = param.getDSTensor();
+        const int world_size = process_group_->getSize();
+        const int64_t shard_elems = ds_tensor.numel();
+        const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+
+        // Treat output_buf as the param-shaped tensor, but communicate via a padded 1D view over its storage.
+        // This lets release_param() mutate the exact TensorImpl used by the graph while still giving NCCL
+        // a flat contiguous destination sized for world_size * shard_elems.
+        at::Tensor comm_buf = output_buf.as_strided({padded_numel}, {1}, 0);
 
         if (ds_tensor.scalar_type() != output_buf.scalar_type()) {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
@@ -100,13 +108,12 @@ public:
 
         if (symm_mem == nullptr) {
             // Fast path: assume uniform shard sizes (ZeRO-3 partitions are padded to uniform size)
-            const int world_size = process_group_->getSize();
-            const int64_t shard_elems = ds_tensor.numel();
-
             // Perform all-gather directly into the pre-allocated padded output buffer
             // NCCL requires contiguous storage; use .contiguous() explicitly
-            ncclResult_t result = ncclAllGather(ds_tensor.contiguous().data_ptr(),
-                                                output_buf.data_ptr(),
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            at::Tensor send_buf = ds_tensor.contiguous();
+            ncclResult_t result = ncclAllGather(send_buf.data_ptr(),
+                                                comm_buf.data_ptr(),
                                                 shard_elems,
                                                 get_nccl_data_type(ds_tensor.scalar_type()),
                                                 nccl_ag_comm_,
@@ -115,7 +122,6 @@ public:
             if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather failed"); }
         } else {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
-            int world_size = process_group_->getSize();
             int rank = process_group_->getRank();
 
             at::Tensor local_buf =
@@ -123,7 +129,7 @@ public:
             local_buf.copy_(ds_tensor, true);
 
             symm_mem->barrier(0, TIMEOUT_SYMMETRIC_MEMORY_BARRIER);
-            auto chunks = output_buf.flatten().chunk(world_size);
+            auto chunks = comm_buf.chunk(world_size);
             for (int step = 0; step < world_size; step++) {
                 int remote_rank = (rank - step + world_size) % world_size;
                 auto src_buf = symm_mem->get_buffer(
@@ -133,6 +139,8 @@ public:
             symm_mem->barrier(0, TIMEOUT_SYMMETRIC_MEMORY_BARRIER);
         }
 
+        // Present the gathered buffer with the true parameter shape (the padded tail is not visible).
+        output_buf.resize_(param.getShape());
         param_registry_->registerGatheredParam(ds_id, output_buf);
         param_registry_->setValid(ds_id, true);
     }
@@ -145,26 +153,24 @@ public:
         const at::Tensor& ds_tensor = param.getDSTensor();
         const int world_size = process_group_->getSize();
         const int64_t true_numel = static_cast<int64_t>(productDim(param.getShape()));
-        const int64_t padded_per_rank = (true_numel + world_size - 1) / world_size;
-        const int64_t padded_numel = static_cast<int64_t>(world_size) * padded_per_rank;
+        const int64_t shard_elems = ds_tensor.numel();
+        const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
         at::ScalarType target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
 
         if (param_registry_->isValid(ds_id)) {
-            // Return a view sliced to the true size with the original shape
-            //
-            // Persistent params are gathered in their original dtype which may
-            // be different from the requested.
             auto base = param_registry_->getGatheredParam(ds_id);
-            return base.flatten()
-                .to(target_dtype)
-                .index({torch::indexing::Slice(0, true_numel)})
-                .view(param.getShape());
+            if (base.defined() && base.scalar_type() == target_dtype) { return base; }
+            // If the cached gathered buffer dtype doesn't match the request, treat it as invalid so we
+            // can refresh the buffer in the requested dtype (avoids per-use cast allocations that
+            // cannot be freed by release_param()).
+            param_registry_->setValid(ds_id, false);
         }
 
         at::Tensor output_buf;
         if (param_registry_->hasGatheredParam(ds_id)) {
             auto existing = param_registry_->getGatheredParam(ds_id);
-            if (existing.defined() && existing.numel() == padded_numel && existing.scalar_type() == target_dtype) {
+            if (existing.defined() && existing.scalar_type() == target_dtype &&
+                (existing.numel() == true_numel || existing.numel() == padded_numel)) {
                 output_buf = existing;
             }
         }
@@ -180,10 +186,8 @@ public:
         launchAllGather(output_buf, ds_id, symm_mem);
 
         ag_comm_done_events_[ds_id]->record(ag_stream_);
-        // Return a view of the gathered padded buffer matching the true param shape
-        return output_buf.flatten()
-            .index({torch::indexing::Slice(0, true_numel)})
-            .view(param.getShape());
+        // output_buf is resized in-place by launchAllGather() to match the true parameter shape.
+        return output_buf;
     }
 
     at::Tensor allgatherParamChunk(long ds_id,
@@ -322,11 +326,13 @@ public:
             const int world_size = process_group_->getSize();
             const int64_t shard_elems = ds_tensor.numel();
             const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+            const int64_t true_numel = static_cast<int64_t>(productDim(param.getShape()));
             auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
 
             if (param_registry_->hasGatheredParam(ds_id)) {
                 auto existing = param_registry_->getGatheredParam(ds_id);
-                if (existing.defined() && existing.numel() == padded_numel && existing.scalar_type() == target_dtype) {
+                if (existing.defined() && existing.scalar_type() == target_dtype &&
+                    (existing.numel() == true_numel || existing.numel() == padded_numel)) {
                     output_bufs[ds_id] = existing;
                     continue;
                 }
