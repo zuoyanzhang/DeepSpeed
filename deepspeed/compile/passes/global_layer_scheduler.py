@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -20,9 +21,15 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 
 from ..graph_param import DSGraphParamManager
-from ..util import get_deepcompile_handle, log_rank0
+from ..util import (get_deepcompile_handle, get_tracked_step_peak_memory_bytes, get_tracked_step_peak_reserved_memory_bytes,
+                    log_rank0)
 
 NAME = "global_layer_scheduler"
+
+try:
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+except Exception:
+    unset_fake_temporarily = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +71,8 @@ class _LayerMapping:
 _CFG: Optional[_SchedulerConfig] = None
 _LAYER_MAPPING: Optional[_LayerMapping] = None
 _LATEST_SCHEDULE: Optional[dict] = None
+_PERSISTENT_SET_DONE: bool = False
+_PERSISTENT_SET_LOCK = threading.Lock()
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -222,10 +231,44 @@ def _peak_mem_bytes(profiling_results) -> int:
 def _min_total_mem_bytes_across_ranks() -> int:
     total_mem = int(get_accelerator().total_memory())
     if dist.is_initialized() and dist.get_world_size() > 1:
-        vals = torch.tensor([total_mem], device=torch.device(get_accelerator().current_device()))
-        dist.all_reduce(vals, dist.ReduceOp.MIN)
-        total_mem = int(vals[0].item())
+        device = get_accelerator().device(get_accelerator().current_device())
+        if unset_fake_temporarily is None:
+            vals = torch.tensor([total_mem], device=device, dtype=torch.int64)
+            dist.all_reduce(vals, dist.ReduceOp.MIN)
+            total_mem = int(vals[0].item())
+        else:
+            with unset_fake_temporarily():
+                vals = torch.tensor([total_mem], device=device, dtype=torch.int64)
+                dist.all_reduce(vals, dist.ReduceOp.MIN)
+                total_mem = int(vals[0].item())
     return total_mem
+
+
+def _estimate_non_torch_mem_bytes() -> int:
+    """Best-effort estimate of non-PyTorch (or non-caching-allocator) GPU memory in use.
+
+    This uses `torch.cuda.mem_get_info()` to read device-wide free/total bytes and
+    subtracts the current caching allocator reservation.
+    """
+    try:
+        accelerator = get_accelerator()
+        if accelerator.device_name() != "cuda":
+            return 0
+        if not hasattr(torch.cuda, "mem_get_info"):
+            return 0
+        device_index = int(accelerator.current_device())
+
+        def _read() -> int:
+            free, total = torch.cuda.mem_get_info(device_index)
+            reserved = accelerator.memory_reserved(device_index) or 0
+            return max(0, int(total) - int(free) - int(reserved))
+
+        if unset_fake_temporarily is None:
+            return int(_read())
+        with unset_fake_temporarily():
+            return int(_read())
+    except Exception:
+        return 0
 
 
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
@@ -267,6 +310,41 @@ def _build_ds_id_to_allgather_ms(profiling_results) -> Dict[int, float]:
                     ds_id = int(n.args[2])
                     out[ds_id] = out.get(ds_id, 0.0) + float(n.meta["device_time"])
     return out
+
+
+def _rank_persistent_candidates(ds_id_to_size: Dict[int, int], ds_id_to_allgather_ms: Dict[int, float]) -> List[int]:
+    def _time_per_byte(ds_id: int) -> float:
+        size = int(ds_id_to_size.get(int(ds_id), 0))
+        if size <= 0:
+            return 0.0
+        return float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) / float(size)
+
+    candidates = sorted(
+        [int(ds_id) for ds_id in ds_id_to_size.keys()],
+        key=lambda d: (_time_per_byte(int(d)), float(ds_id_to_allgather_ms.get(int(d), 0.0)),
+                       int(ds_id_to_size.get(int(d), 0)), int(d)),
+        reverse=True,
+    )
+    return candidates
+
+
+def _select_persistent_ds_ids(candidates: Sequence[int], ds_id_to_size: Dict[int, int],
+                              budget_bytes: int) -> Tuple[List[int], int]:
+    budget = max(0, int(budget_bytes))
+    persistent_ds_ids: List[int] = []
+    persistent_mem_bytes = 0
+    if budget <= 0:
+        return persistent_ds_ids, 0
+    for ds_id in candidates:
+        ds_id = int(ds_id)
+        size = int(ds_id_to_size.get(int(ds_id), 0))
+        if size <= 0:
+            continue
+        if persistent_mem_bytes + size > budget:
+            continue
+        persistent_ds_ids.append(int(ds_id))
+        persistent_mem_bytes += int(size)
+    return persistent_ds_ids, int(persistent_mem_bytes)
 
 
 def _build_ds_id_to_wait_pos(graph: Optional[Graph]) -> Dict[int, int]:
@@ -1441,38 +1519,21 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
         ) for b in blocks
     ]
 
+    persistent_candidates: List[int] = []
+    if bool(cfg.set_persistent) and int(mem_budget_bytes) > 0:
+        # Rank candidates once during planning. The actual persistent set is
+        # selected later (apply stage) based on observed runtime peak memory.
+        persistent_candidates = _rank_persistent_candidates(ds_id_to_size, ds_id_to_allgather_ms)
+
+    # NOTE: Persistent gathered buffers are *allocated* in the runtime (C++) and
+    # can significantly increase the optimizer-step peak memory. Profiling-based
+    # peak_mem does not include optimizer.step(), so selecting the persistent set
+    # here can be overly optimistic and lead to OOM. We defer the selection &
+    # allocation to apply(), where we can use the observed warmup-step peak.
     persistent_ds_ids: List[int] = []
     persistent_mem_bytes = 0
-    if bool(cfg.set_persistent) and int(mem_budget_bytes) > 0:
-
-        def _time_per_byte(ds_id: int) -> float:
-            size = int(ds_id_to_size.get(int(ds_id), 0))
-            if size <= 0:
-                return 0.0
-            return float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) / float(size)
-
-        candidates = sorted(
-            [int(ds_id) for ds_id in ds_id_to_size.keys()],
-            key=lambda d: (_time_per_byte(int(d)), float(ds_id_to_allgather_ms.get(int(d), 0.0)),
-                           int(ds_id_to_size.get(int(d), 0)), int(d)),
-            reverse=True,
-        )
-        for ds_id in candidates:
-            size = int(ds_id_to_size.get(int(ds_id), 0))
-            if size <= 0:
-                continue
-            if persistent_mem_bytes + size > int(mem_budget_bytes):
-                continue
-            persistent_ds_ids.append(int(ds_id))
-            persistent_mem_bytes += int(size)
-
-    persistent_set: Set[int] = set(map(int, persistent_ds_ids))
+    persistent_set: Set[int] = set()
     forced_keep_layers: Set[int] = set()
-    if persistent_set:
-        for li in range(L):
-            ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
-            if ids and all(int(ds_id) in persistent_set for ds_id in ids):
-                forced_keep_layers.add(int(li))
 
     # Heuristic improvement: auto-tune lookahead (within a very small candidate set) to find a better
     # overlap point when the default lookahead is too restrictive. This only affects *when* we launch
@@ -1590,7 +1651,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     keep_ds_ids = sorted(set(keep_ds_ids))
 
     schedule = {
-        "version": 7,
+        "version": 8,
         "mapping_hash": mapping.mapping_hash,
         "L": L,
         "keep_layers": sorted(keep_layers),
@@ -1630,6 +1691,10 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "peak_mem_bytes": int(peak_mem),
             "mem_budget_bytes": int(mem_budget_bytes),
             "persistent_mem_bytes": int(persistent_mem_bytes),
+            "persistent_deferred": bool(cfg_used.set_persistent),
+            "persistent_candidates": [int(x) for x in persistent_candidates],
+            "persistent_candidate_sizes": {str(int(ds_id)): int(ds_id_to_size.get(int(ds_id), 0)) for ds_id in persistent_candidates},
+            "persistent_candidate_allgather_ms": {str(int(ds_id)): float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) for ds_id in persistent_candidates},
             "include_unmapped_params": bool(cfg_used.include_unmapped_params),
             "extra_unmapped_ds_ids": len(extra_ds_id_to_layer),
             "set_persistent": bool(cfg_used.set_persistent),
@@ -1686,8 +1751,17 @@ def _maybe_set_persistent(persistent_ds_ids: Sequence[int]) -> None:
     if not ds_ids:
         return
     nz3 = get_deepcompile_handle()
-    for ds_id in ds_ids:
-        nz3.set_persistent(int(ds_id))
+    # DeepCompile's `set_persistent()` eagerly allocates gathered buffers by
+    # calling into the Z3 custom op executor. When torch.compile is using
+    # FakeTensorMode, executing this op can fail because NCCL/allgather needs
+    # real data pointers. Temporarily disable fake tensor mode here.
+    if unset_fake_temporarily is None:
+        for ds_id in ds_ids:
+            nz3.set_persistent(int(ds_id))
+    else:
+        with unset_fake_temporarily():
+            for ds_id in ds_ids:
+                nz3.set_persistent(int(ds_id))
     log_rank0(f"[{NAME}] Set persistent buffers: {len(ds_ids)} ds_ids", enable=True)
 
 
@@ -1716,7 +1790,10 @@ def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], pr
         )
 
     schedule = _broadcast_and_store_schedule(schedule)
-    _maybe_set_persistent(schedule.get("persistent_ds_ids", []))
+    global _PERSISTENT_SET_DONE
+    _PERSISTENT_SET_DONE = False
+    if dist.get_rank() == 0 and bool(_CFG and _CFG.set_persistent):
+        log_rank0(f"[{NAME}] Persistent buffers will be selected/allocated in apply() using observed warmup-step peak memory.", enable=True)
     _dump_schedule_if_enabled(schedule)
     return None
 
@@ -1944,7 +2021,7 @@ def _remove_releases(graph: Graph, keep_ds_ids: Set[int]) -> bool:
 
 def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results, create_inputs_fn,
           mem_budget: float, param_manager: Dict[int, DSGraphParamManager], bwd: bool) -> GraphModule:
-    del graph_order, profiling_results, create_inputs_fn, mem_budget
+    del create_inputs_fn, mem_budget
 
     if _LATEST_SCHEDULE is None or _LAYER_MAPPING is None or _CFG is None:
         return None
@@ -1963,6 +2040,106 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
     pm = param_manager.get(graph_id)
     if pm is None:
         return None
+
+    # If enabled, select + allocate persistent buffers using observed runtime
+    # peak memory (warmup steps), not compile-time peak memory.
+    global _PERSISTENT_SET_DONE
+    if bool(cfg.set_persistent) and not _PERSISTENT_SET_DONE:
+        # This codepath runs inside the torch.compile backend and can be reached
+        # by multiple graphs (and potentially multiple threads). Ensure the
+        # persistent selection + collectives run exactly once per process.
+        with _PERSISTENT_SET_LOCK:
+            if _PERSISTENT_SET_DONE:
+                pass
+            else:
+                meta = sched.get("meta", {})
+
+                device = get_accelerator().device(get_accelerator().current_device())
+
+                # Use the maximum observed per-step CUDA peak across ranks.
+                observed_peak_alloc = int(get_tracked_step_peak_memory_bytes())
+                observed_peak_reserved = int(get_tracked_step_peak_reserved_memory_bytes())
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    if unset_fake_temporarily is None:
+                        vals = torch.tensor([observed_peak_alloc, observed_peak_reserved], device=device, dtype=torch.int64)
+                        dist.all_reduce(vals, dist.ReduceOp.MAX)
+                        observed_peak_alloc = int(vals[0].item())
+                        observed_peak_reserved = int(vals[1].item())
+                    else:
+                        with unset_fake_temporarily():
+                            vals = torch.tensor([observed_peak_alloc, observed_peak_reserved], device=device, dtype=torch.int64)
+                            dist.all_reduce(vals, dist.ReduceOp.MAX)
+                            observed_peak_alloc = int(vals[0].item())
+                            observed_peak_reserved = int(vals[1].item())
+                observed_peak = max(int(observed_peak_alloc), int(observed_peak_reserved))
+
+                profile_peak = int(meta.get("peak_mem_bytes", 0))
+                baseline_peak = int(observed_peak) if int(observed_peak) > 0 else int(profile_peak)
+
+                total_mem = int(meta.get("total_mem_bytes", _min_total_mem_bytes_across_ranks()))
+                mem_margin = float(meta.get("mem_margin", cfg.mem_margin))
+                safety_margin_bytes = int(meta.get("safety_margin_bytes", cfg.safety_margin_bytes))
+                safe_total = int(total_mem * (1.0 - float(mem_margin)))
+
+                # Non-torch memory (CUDA context, NCCL, other processes, allocator bypass) reduces
+                # the effective budget available to the caching allocator.
+                non_torch_bytes = int(_estimate_non_torch_mem_bytes())
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    if unset_fake_temporarily is None:
+                        vals = torch.tensor([non_torch_bytes], device=device, dtype=torch.int64)
+                        dist.all_reduce(vals, dist.ReduceOp.MAX)
+                        non_torch_bytes = int(vals[0].item())
+                    else:
+                        with unset_fake_temporarily():
+                            vals = torch.tensor([non_torch_bytes], device=device, dtype=torch.int64)
+                            dist.all_reduce(vals, dist.ReduceOp.MAX)
+                            non_torch_bytes = int(vals[0].item())
+
+                safe_total_for_torch = max(0, int(safe_total) - int(non_torch_bytes))
+                persistent_budget_bytes = max(0, int(safe_total_for_torch) - int(baseline_peak) - int(safety_margin_bytes))
+
+                # Load candidate ranking and sizes from the planned schedule when available.
+                cand_list = meta.get("persistent_candidates", [])
+                cand_sizes = meta.get("persistent_candidate_sizes", {})
+                ds_id_to_size = {int(k): int(v) for k, v in cand_sizes.items()}
+                candidates = [int(x) for x in cand_list if int(x) in ds_id_to_size]
+
+                if not candidates:
+                    # Fallback: derive candidates from whatever profiling results are available
+                    # in the current compilation step.
+                    ds_id_to_size = _build_ds_id_to_size_bytes(graph_id, profiling_results, param_manager)
+                    ds_id_to_allgather_ms = _build_ds_id_to_allgather_ms(profiling_results)
+                    candidates = _rank_persistent_candidates(ds_id_to_size, ds_id_to_allgather_ms)
+
+                persistent_ds_ids, persistent_mem_bytes = _select_persistent_ds_ids(candidates, ds_id_to_size,
+                                                                                    persistent_budget_bytes)
+                if dist.get_rank() == 0:
+                    log_rank0(
+                        f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
+                        f"observed_peak_reserved_bytes={int(observed_peak_reserved)} "
+                        f"non_torch_bytes={int(non_torch_bytes)} "
+                        f"profile_peak_bytes={int(profile_peak)} baseline_peak_bytes={int(baseline_peak)} "
+                        f"persistent_budget_bytes={int(persistent_budget_bytes)} selected_ds_ids={len(persistent_ds_ids)} "
+                        f"persistent_mem_bytes={int(persistent_mem_bytes)}",
+                        enable=True,
+                    )
+
+                # Keep meta consistent across ranks (selection is deterministic).
+                persistent_mem_bytes = int(sum(int(ds_id_to_size.get(int(ds_id), 0)) for ds_id in persistent_ds_ids))
+
+                sched["persistent_ds_ids"] = [int(x) for x in persistent_ds_ids]
+                meta["observed_peak_mem_alloc_bytes"] = int(observed_peak_alloc)
+                meta["observed_peak_mem_reserved_bytes"] = int(observed_peak_reserved)
+                meta["observed_peak_mem_bytes"] = int(observed_peak)
+                meta["non_torch_mem_bytes"] = int(non_torch_bytes)
+                meta["persistent_budget_bytes"] = int(persistent_budget_bytes)
+                meta["persistent_mem_bytes"] = int(persistent_mem_bytes)
+                meta["persistent_deferred"] = False
+                sched["meta"] = meta
+                sched["schedule_hash"] = _schedule_hash(sched)
+
+                _maybe_set_persistent(persistent_ds_ids)
+                _PERSISTENT_SET_DONE = True
 
     if cfg.rewrite_comm_ops:
         new_graph = _rewrite_graph_with_layer_comm(gm.graph, graph_id, pm, mapping, sched, bwd=bwd, cfg=cfg)

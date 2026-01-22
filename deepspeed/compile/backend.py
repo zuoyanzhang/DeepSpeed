@@ -29,7 +29,8 @@ from .graph_param import DSGraphParamManager
 from .profilers import ProfilingResult
 from .profilers.graph_profile import MemoryProfilingInterpreter
 from .patch_compiled_func import patch_compiled_func, unpatch_compiled_func, get_backward_inputs
-from .util import get_input_nodes, get_activation_node_names, get_index_by_graph_id, get_deepcompile_handle, log_rank0, is_backend_inductor
+from .util import (get_input_nodes, get_activation_node_names, get_index_by_graph_id, get_deepcompile_handle, log_rank0,
+                   is_backend_inductor, track_and_reset_step_peak_memory)
 from .partitioner import get_wrapped_partitioner
 from .inductor import register_custom_ops, patch_create_aot_dispatcher_function
 from .input_storage import InputStorage
@@ -86,6 +87,12 @@ def init_schedule(schedule):
 
 def launch_compile_passes(global_steps: int):
     global next_pass_step, next_passes
+
+    # Track the previous step's peak memory and reset peak stats for the current
+    # step. This enables later compile passes (e.g., global_layer_scheduler) to
+    # plan against an observed runtime peak (including optimizer.step()) rather
+    # than a compile-time-only estimate.
+    track_and_reset_step_peak_memory(global_steps)
 
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
         _, next_passes = remaining_schedule.pop(0)

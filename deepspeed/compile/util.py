@@ -76,6 +76,68 @@ def log_rank0(msg: str, enable: bool = False):
         print(msg)
 
 
+# ---- Runtime peak-memory tracking (for scheduling heuristics) -----------------
+#
+# DeepCompile compile passes can be launched at step boundaries via
+# engine.launch_compile_passes(). This hook runs in engine.forward() at the start
+# of each step, which is a convenient place to record the previous step's peak
+# memory and reset the peak stats for the upcoming step.
+_STEP_PEAK_LAST_STEP: Optional[int] = None
+_STEP_PEAK_MAX_ALLOC_BYTES: int = 0
+_STEP_PEAK_MAX_RESERVED_BYTES: int = 0
+
+
+def track_and_reset_step_peak_memory(global_steps: int) -> None:
+    """Track per-step CUDA peak memory and reset peak stats at step boundaries.
+
+    This is intentionally lightweight and best-effort; it is used by passes like
+    global_layer_scheduler to avoid planning against an overly optimistic
+    compile-time peak-memory baseline (e.g., missing optimizer.step() peaks).
+    """
+    global _STEP_PEAK_LAST_STEP, _STEP_PEAK_MAX_ALLOC_BYTES, _STEP_PEAK_MAX_RESERVED_BYTES
+    try:
+        accelerator = get_accelerator()
+        if accelerator.device_name() != "cuda":
+            return
+        step = int(global_steps)
+
+        if _STEP_PEAK_LAST_STEP is None:
+            _STEP_PEAK_LAST_STEP = step
+            accelerator.reset_peak_memory_stats()
+            return
+
+        if step <= int(_STEP_PEAK_LAST_STEP):
+            return
+
+        try:
+            peak_alloc = int(accelerator.max_memory_allocated())
+        except Exception:
+            peak_alloc = 0
+        try:
+            peak_reserved = int(accelerator.max_memory_reserved())
+        except Exception:
+            peak_reserved = 0
+
+        _STEP_PEAK_MAX_ALLOC_BYTES = max(int(_STEP_PEAK_MAX_ALLOC_BYTES), int(peak_alloc))
+        _STEP_PEAK_MAX_RESERVED_BYTES = max(int(_STEP_PEAK_MAX_RESERVED_BYTES), int(peak_reserved))
+
+        _STEP_PEAK_LAST_STEP = step
+        accelerator.reset_peak_memory_stats()
+    except Exception:
+        # Best-effort only; never fail the training loop.
+        return
+
+
+def get_tracked_step_peak_memory_bytes() -> int:
+    """Return the maximum observed per-step CUDA peak allocated memory (bytes) so far."""
+    return int(_STEP_PEAK_MAX_ALLOC_BYTES)
+
+
+def get_tracked_step_peak_reserved_memory_bytes() -> int:
+    """Return the maximum observed per-step CUDA peak reserved memory (bytes) so far."""
+    return int(_STEP_PEAK_MAX_RESERVED_BYTES)
+
+
 @functools.lru_cache
 def get_no_copy_ops():
     # Need to compile custom ops
