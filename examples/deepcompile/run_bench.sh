@@ -10,9 +10,9 @@ MODEL_PATH=${MODEL_PATH:-"/home/bingxing2/home/scx7euw/.cache/modelscope/hub/mod
 
 export NUM_NODES=${NUM_NODES:-4}
 
-MODEL=${MODEL_NAME:-"Llama-3.2-1B-Instruct"}
+MODEL=${MODEL_NAME:-"llama-2-7b"}
 BATCH_SIZE_OPTS=(2)
-SEQ_LENGTH_OPTS=(4096)
+SEQ_LENGTH_OPTS=(1024)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
         # 如果要预加载权重, 加上${LOAD_OPTS}， 固定种子--deterministic
