@@ -171,8 +171,9 @@ elif [ "${BACKEND}" != "deepspeed" ]; then
     exit 1
 fi
 
+# 当后端是fsdp时默认使用zero3
 if [ "${BACKEND}" != "deepspeed" ]; then
-    ZERO_STAGE=0
+    ZERO_STAGE=3
 fi
 
 echo "HOST_IP: ${HOST_IP}"
