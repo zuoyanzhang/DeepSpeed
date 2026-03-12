@@ -28,6 +28,11 @@ _INPLACE_FUSE_STACK_SUBSTRINGS = ("cross_entropy", "fixed_cross_entropy")
 _INPLACE_FUSE_MIN_BYTES = int(os.getenv("DS_DEEPCOMPILE_PROF_INPLACE_FUSE_MIN_BYTES", 256 * 1024 * 1024))
 _CE_SPARSE_FUSE_ENABLED = os.getenv("DS_DEEPCOMPILE_PROF_CE_SPARSE_FUSE", "1") not in ("0", "false", "False")
 _CE_SPARSE_FUSE_MIN_BYTES = int(os.getenv("DS_DEEPCOMPILE_PROF_CE_SPARSE_FUSE_MIN_BYTES", 256 * 1024 * 1024))
+_LARGE_DENSE_GRAD_FUSE_ENABLED = os.getenv("DS_DEEPCOMPILE_PROF_LARGE_DENSE_GRAD_FUSE", "1") not in (
+    "0", "false", "False")
+_LARGE_DENSE_GRAD_FUSE_MIN_BYTES = int(
+    os.getenv("DS_DEEPCOMPILE_PROF_LARGE_DENSE_GRAD_FUSE_MIN_BYTES", 256 * 1024 * 1024))
+_LARGE_DENSE_GRAD_STACK_SUBSTRINGS = ("embed_tokens", "word_embeddings", ".wte")
 
 
 class _CEFullNoAlloc:
@@ -88,6 +93,39 @@ class _CEDenseMulNoAlloc:
         exp_shape = tuple(self.exp.shape) if torch.is_tensor(self.exp) else None
         sum_shape = tuple(self.sum.shape) if torch.is_tensor(self.sum) else None
         return f"_CEDenseMulNoAlloc(exp_shape={exp_shape}, sum_shape={sum_shape}, exp_node={getattr(self.exp_node, 'name', None)})"
+
+
+class _LargeDenseGradFullNoAlloc:
+
+    __slots__ = ("shape", "fill_value", "dtype", "device", "reserve_bytes", "kind")
+
+    def __init__(self, shape, fill_value, dtype, device, reserve_bytes: int, kind: str):
+        self.shape = shape
+        self.fill_value = fill_value
+        self.dtype = dtype
+        self.device = device
+        self.reserve_bytes = int(reserve_bytes)
+        self.kind = str(kind)
+
+    def __repr__(self) -> str:
+        return (f"_LargeDenseGradFullNoAlloc(shape={self.shape}, dtype={self.dtype}, device={self.device}, "
+                f"reserve_bytes={self.reserve_bytes}, kind={self.kind})")
+
+
+class _LargeDenseGradNoAlloc:
+
+    __slots__ = ("shape", "dtype", "device", "reserve_bytes", "kind")
+
+    def __init__(self, shape, dtype, device, reserve_bytes: int, kind: str):
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+        self.reserve_bytes = int(reserve_bytes)
+        self.kind = str(kind)
+
+    def __repr__(self) -> str:
+        return (f"_LargeDenseGradNoAlloc(shape={self.shape}, dtype={self.dtype}, device={self.device}, "
+                f"reserve_bytes={self.reserve_bytes}, kind={self.kind})")
 
 
 def _to_int_tuple(v) -> Optional[Tuple[int, ...]]:
@@ -207,6 +245,55 @@ def _match_ce_sparse_decomp(full_node: torch.fx.Node):
     return (full_node, scatter_node, mul_sparse, sum_node, mul_dense, sub_nodes[0])
 
 
+def _mark_explicit_temp_reserve(node: torch.fx.Node, reserve_bytes: int, kind: str):
+    meta = node.meta
+    prev = int(meta.get("explicit_temp_reserve_bytes", 0))
+    if int(reserve_bytes) > prev:
+        meta["explicit_temp_reserve_bytes"] = int(reserve_bytes)
+    meta["explicit_temp_reserve_kind"] = str(kind)
+
+
+def _match_large_dense_grad_decomp(full_node: torch.fx.Node):
+    if not _LARGE_DENSE_GRAD_FUSE_ENABLED:
+        return None
+    if full_node.op != "call_function" or full_node.target != torch.ops.aten.full.default:
+        return None
+    requested_nbytes = _full_default_requested_nbytes(full_node.args, full_node.kwargs)
+    if requested_nbytes < _LARGE_DENSE_GRAD_FUSE_MIN_BYTES:
+        return None
+
+    shape = _to_int_tuple(full_node.args[0]) if full_node.args else None
+    if not shape or len(shape) != 2:
+        return None
+
+    dtype = full_node.kwargs.get("dtype", None)
+    if dtype != torch.float32:
+        return None
+
+    if not _has_any_stack_substring(full_node, _LARGE_DENSE_GRAD_STACK_SUBSTRINGS):
+        return None
+
+    users = list(full_node.users)
+    if len(users) != 1:
+        return None
+
+    index_put_node = users[0]
+    if index_put_node.op != "call_function" or index_put_node.target != torch.ops.aten.index_put.default:
+        return None
+    if not index_put_node.args or index_put_node.args[0] is not full_node:
+        return None
+
+    accumulate = None
+    if len(index_put_node.args) >= 4:
+        accumulate = index_put_node.args[3]
+    elif "accumulate" in index_put_node.kwargs:
+        accumulate = index_put_node.kwargs["accumulate"]
+    if accumulate not in (True, 1):
+        return None
+
+    return (full_node, index_put_node, int(requested_nbytes))
+
+
 def _build_ce_sparse_fusion_role_map(graph) -> Dict[torch.fx.Node, str]:
     if not _CE_SPARSE_FUSE_ENABLED:
         return {}
@@ -226,6 +313,24 @@ def _build_ce_sparse_fusion_role_map(graph) -> Dict[torch.fx.Node, str]:
         roles[sum_node] = "ce_sum"
         roles[mul_dense] = "ce_mul_dense"
         roles[sub_node] = "ce_sub"
+
+    return roles
+
+
+def _build_large_dense_grad_role_map(graph) -> Dict[torch.fx.Node, str]:
+    if not _LARGE_DENSE_GRAD_FUSE_ENABLED:
+        return {}
+
+    roles: Dict[torch.fx.Node, str] = {}
+    for n in graph.nodes:
+        matched = _match_large_dense_grad_decomp(n)
+        if not matched:
+            continue
+        full_node, index_put_node, reserve_bytes = matched
+        roles[full_node] = "dense_full"
+        roles[index_put_node] = "dense_index_put"
+        _mark_explicit_temp_reserve(full_node, reserve_bytes, "embedding_dense_grad_fp32")
+        _mark_explicit_temp_reserve(index_put_node, reserve_bytes, "embedding_dense_grad_fp32")
 
     return roles
 
@@ -396,6 +501,65 @@ def _maybe_ce_sparse_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwar
     return None
 
 
+def _maybe_large_dense_grad_noalloc_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
+    role_map = getattr(interp, "_large_dense_grad_roles", None)
+    role = role_map.get(n) if role_map else None
+
+    if role == "dense_full":
+        shape = _to_int_tuple(args[0]) if args else None
+        if not shape:
+            return None
+        fill_value = args[1] if len(args) > 1 else None
+        dtype = kwargs.get("dtype", None)
+        device = kwargs.get("device", None)
+        reserve_bytes = int(getattr(n, "meta", {}).get("explicit_temp_reserve_bytes",
+                                                       _full_default_requested_nbytes(args, kwargs)))
+        kind = str(getattr(n, "meta", {}).get("explicit_temp_reserve_kind", "large_dense_grad"))
+        return _LargeDenseGradFullNoAlloc(shape=shape,
+                                          fill_value=fill_value,
+                                          dtype=dtype,
+                                          device=device,
+                                          reserve_bytes=reserve_bytes,
+                                          kind=kind)
+
+    if role == "dense_index_put":
+        if len(args) < 3 or not isinstance(args[0], _LargeDenseGradFullNoAlloc):
+            return None
+        full = args[0]
+        return _LargeDenseGradNoAlloc(shape=full.shape,
+                                      dtype=full.dtype,
+                                      device=full.device,
+                                      reserve_bytes=full.reserve_bytes,
+                                      kind=full.kind)
+
+    if args and isinstance(args[0], _LargeDenseGradNoAlloc):
+        dense = args[0]
+        if n.target == torch.ops.prims.convert_element_type.default:
+            if len(args) < 2 or not isinstance(args[1], torch.dtype):
+                return None
+            return _LargeDenseGradNoAlloc(shape=dense.shape,
+                                          dtype=args[1],
+                                          device=dense.device,
+                                          reserve_bytes=dense.reserve_bytes,
+                                          kind=dense.kind)
+        if n.target == torch.ops.aten._to_copy.default:
+            dtype = kwargs.get("dtype", None)
+            if not isinstance(dtype, torch.dtype):
+                return None
+            return _LargeDenseGradNoAlloc(shape=dense.shape,
+                                          dtype=dtype,
+                                          device=dense.device,
+                                          reserve_bytes=dense.reserve_bytes,
+                                          kind=dense.kind)
+        if n.target == torch.ops.dc.reduce_grad.default:
+            dtype = dense.dtype if isinstance(dense.dtype, torch.dtype) else torch.float32
+            device = dense.device if dense.device is not None else getattr(interp, "device", None)
+            with unset_fake_temporarily():
+                return torch.empty([0], dtype=dtype, device=device)
+
+    return None
+
+
 def _can_inplace_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs) -> bool:
     if not _should_try_inplace_fuse(interp, n, args):
         return False
@@ -414,6 +578,9 @@ def _can_inplace_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs) 
 
 def _maybe_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
     ret = _maybe_ce_sparse_fuse_call(interp, n, args, kwargs)
+    if ret is not None:
+        return ret
+    ret = _maybe_large_dense_grad_noalloc_call(interp, n, args, kwargs)
     if ret is not None:
         return ret
     return _maybe_inplace_fuse_call(interp, n, args, kwargs)
@@ -489,6 +656,7 @@ class ProfilingInterpreter(Interpreter):
         self.debug_log = debug_log
         self.mem_usage_out_of_torch = 0
         self._ce_sparse_fusion_roles = _build_ce_sparse_fusion_role_map(gm.graph)
+        self._large_dense_grad_roles = _build_large_dense_grad_role_map(gm.graph)
 
     def run(self, *args) -> Any:
         """Run the graph with profiling enabled.
@@ -655,6 +823,7 @@ class MemoryProfilingInterpreter(Interpreter):
         self.mem_record = []
         self.last_alloc = get_accelerator().memory_allocated()
         self._ce_sparse_fusion_roles = _build_ce_sparse_fusion_role_map(gm.graph)
+        self._large_dense_grad_roles = _build_large_dense_grad_role_map(gm.graph)
 
         self.node_counter = 0
         self.node_num = len(gm.graph.nodes)

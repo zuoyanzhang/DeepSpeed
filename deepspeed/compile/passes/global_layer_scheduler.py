@@ -263,6 +263,10 @@ def _estimate_non_torch_mem_bytes() -> int:
         return 0
 
 
+def _allocator_margin_bytes() -> int:
+    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 512 * 1024 * 1024)))
+
+
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
     ds_id_to_size: Dict[int, int] = {}
 
@@ -339,6 +343,89 @@ def _select_persistent_ds_ids(candidates: Sequence[int], ds_id_to_size: Dict[int
     return persistent_ds_ids, int(persistent_mem_bytes)
 
 
+def _persistent_increment_blocks_for_ds_id(ds_id: int, sched: dict, ds_id_to_layer: Dict[int, int]) -> Tuple[int, ...]:
+    layer = ds_id_to_layer.get(int(ds_id))
+    if layer is None:
+        return ()
+
+    L = int(sched.get("L", 0))
+    K = 2 * L
+    if L <= 0:
+        return ()
+
+    per_task_start = {str(k): int(v) for k, v in sched.get("per_task_start_k", {}).items()}
+    start_f = per_task_start.get(f"layer.{int(layer)}.FWD")
+    if start_f is None:
+        return ()
+
+    f_deadline = int(layer)
+    b_deadline = int(K - 1 - int(layer))
+    keep_layers = set(map(int, sched.get("keep_layers", [])))
+
+    if int(layer) in keep_layers:
+        extra_start = int(b_deadline + 1)
+        if extra_start > int(K - 1):
+            return ()
+        return tuple(range(extra_start, K))
+
+    start_b = per_task_start.get(f"layer.{int(layer)}.BWD")
+    blocks: List[int] = []
+    if start_b is None:
+        if int(f_deadline + 1) <= int(K - 1):
+            blocks.extend(range(int(f_deadline + 1), K))
+        return tuple(blocks)
+
+    if int(f_deadline + 1) <= int(start_b - 1):
+        blocks.extend(range(int(f_deadline + 1), int(start_b)))
+    if int(b_deadline + 1) <= int(K - 1):
+        blocks.extend(range(int(b_deadline + 1), K))
+    return tuple(blocks)
+
+
+def _select_persistent_ds_ids_block_safe(candidates: Sequence[int], ds_id_to_size: Dict[int, int], budget_bytes: int,
+                                         sched: dict, ds_id_to_layer: Dict[int, int]) -> Tuple[List[int], int]:
+    budget = max(0, int(budget_bytes))
+    if budget <= 0:
+        return [], 0
+
+    base_reserved = [int(x) for x in sched.get("predicted_reserved_mem", [])]
+    block_profiles = sched.get("block_profiles", {})
+    cap_bytes = [int(x) for x in block_profiles.get("cap_bytes", [])]
+    if not base_reserved or len(base_reserved) != len(cap_bytes) or not ds_id_to_layer:
+        return _select_persistent_ds_ids(candidates, ds_id_to_size, budget)
+
+    extra_reserved = [0 for _ in range(len(cap_bytes))]
+    persistent_ds_ids: List[int] = []
+    persistent_mem_bytes = 0
+
+    for ds_id in candidates:
+        ds_id = int(ds_id)
+        size = int(ds_id_to_size.get(int(ds_id), 0))
+        if size <= 0:
+            continue
+        if persistent_mem_bytes + size > budget:
+            continue
+
+        incr_blocks = _persistent_increment_blocks_for_ds_id(int(ds_id), sched, ds_id_to_layer)
+        feasible = True
+        for k in incr_blocks:
+            if int(k) < 0 or int(k) >= len(cap_bytes):
+                continue
+            if int(base_reserved[int(k)]) + int(extra_reserved[int(k)]) + int(size) > int(cap_bytes[int(k)]):
+                feasible = False
+                break
+        if not feasible:
+            continue
+
+        persistent_ds_ids.append(int(ds_id))
+        persistent_mem_bytes += int(size)
+        for k in incr_blocks:
+            if 0 <= int(k) < len(extra_reserved):
+                extra_reserved[int(k)] += int(size)
+
+    return persistent_ds_ids, int(persistent_mem_bytes)
+
+
 def _build_ds_id_to_wait_pos(graph: Optional[Graph]) -> Dict[int, int]:
     # Approximate first-use order for each ds_id using wait_allgather positions (fallback to allgather positions).
     out: Dict[int, int] = {}
@@ -376,6 +463,8 @@ class _BlockProfile:
     layer_idx: int
     compute_ms: float
     cap_bytes: int
+    explicit_temp_reserve_bytes: int
+    non_param_floor_bytes: int
     fixed_comm_start_offset_ms: float
     fixed_comm_ms: float
 
@@ -418,6 +507,13 @@ def _is_comm_node(n: Node) -> bool:
 def _is_fixed_comm_marker_node(n: Node) -> bool:
     # Comm nodes that are not part of param-prefetch scheduling (e.g., grad reduction).
     return _is_comm_node(n) and not _is_param_comm_node(n)
+
+
+def _node_explicit_temp_reserve_bytes(n: Node) -> int:
+    try:
+        return max(0, int(getattr(n, "meta", {}).get("explicit_temp_reserve_bytes", 0)))
+    except Exception:
+        return 0
 
 
 def _build_mem_peak_by_node_name(mem_list, graph: Graph) -> Dict[str, int]:
@@ -472,7 +568,8 @@ def _live_param_bytes_by_node(graph: Graph, ds_id_to_size: Dict[int, int]) -> Di
 
 
 def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Dict[int, int],
-                              ds_id_to_size: Dict[int, int], total_mem_bytes: int, bwd: bool) -> List[_BlockProfile]:
+                              ds_id_to_size: Dict[int, int], total_mem_bytes: int, allocator_margin_bytes: int,
+                              bwd: bool) -> List[_BlockProfile]:
     anchors = _find_layer_anchors(graph, ds_id_to_layer, L)
     if len(anchors) == 0:
         return []
@@ -483,6 +580,7 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
     live_by_node = _live_param_bytes_by_node(graph, ds_id_to_size)
 
     safe_total = int(total_mem_bytes)
+    allocator_margin_bytes = max(0, int(allocator_margin_bytes))
     blocks: List[_BlockProfile] = []
 
     layer_order = list(range(L)) if not bwd else list(reversed(range(L)))
@@ -507,6 +605,7 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
         fixed_comm_start_offset_ms = 0.0
         saw_fixed_comm_marker = False
         base_mem_excl_params = 0
+        explicit_temp_reserve_bytes = 0
         for n in nodes[start:end]:
             if not _is_param_comm_node(n) and not _is_fixed_comm_marker_node(n) and n.target != torch.ops.dc.end_backward.default:
                 compute_ms += float(n.meta.get("device_time", 0.0))
@@ -516,8 +615,10 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
             peak = int(peak_by_name.get(n.name, 0))
             live = int(live_by_node.get(n, 0))
             base_mem_excl_params = max(base_mem_excl_params, max(0, peak - live))
+            explicit_temp_reserve_bytes = max(explicit_temp_reserve_bytes, _node_explicit_temp_reserve_bytes(n))
 
-        cap_bytes = max(0, safe_total - base_mem_excl_params)
+        non_param_floor_bytes = max(int(base_mem_excl_params), int(explicit_temp_reserve_bytes))
+        cap_bytes = max(0, safe_total - non_param_floor_bytes - allocator_margin_bytes)
         unified_k = layer if not bwd else L + idx_in_phase
         blocks.append(
             _BlockProfile(
@@ -526,6 +627,8 @@ def _extract_blocks_for_graph(graph: Graph, mem_list, L: int, ds_id_to_layer: Di
                 layer_idx=int(layer),
                 compute_ms=float(compute_ms),
                 cap_bytes=int(cap_bytes),
+                explicit_temp_reserve_bytes=int(explicit_temp_reserve_bytes),
+                non_param_floor_bytes=int(non_param_floor_bytes),
                 fixed_comm_start_offset_ms=float(fixed_comm_start_offset_ms),
                 fixed_comm_ms=0.0,
             ))
@@ -1413,6 +1516,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     total_mem = _min_total_mem_bytes_across_ranks()
     peak_mem = _peak_mem_bytes(profiling_results)
     mem_budget_bytes = max(0, int(total_mem) - int(peak_mem))
+    allocator_margin_bytes = _allocator_margin_bytes()
 
     prof = profiling_results.get(graph_id)
     if prof is None or getattr(prof, "fwd_graph", None) is None or getattr(prof, "bwd_graph", None) is None:
@@ -1427,6 +1531,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
                                           mapping.ds_id_to_layer,
                                           ds_id_to_size,
                                           total_mem_bytes=total_mem,
+                                          allocator_margin_bytes=allocator_margin_bytes,
                                           bwd=False)
     blocks_bwd = _extract_blocks_for_graph(prof.bwd_graph,
                                           getattr(prof, "bwd_mem", []),
@@ -1434,6 +1539,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
                                           mapping.ds_id_to_layer,
                                           ds_id_to_size,
                                           total_mem_bytes=total_mem,
+                                          allocator_margin_bytes=allocator_margin_bytes,
                                           bwd=True)
 
     K = 2 * L
@@ -1499,6 +1605,8 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             layer_idx=int(b.layer_idx),
             compute_ms=float(b.compute_ms),
             cap_bytes=int(b.cap_bytes),
+            explicit_temp_reserve_bytes=int(b.explicit_temp_reserve_bytes),
+            non_param_floor_bytes=int(b.non_param_floor_bytes),
             fixed_comm_start_offset_ms=float(b.fixed_comm_start_offset_ms),
             fixed_comm_ms=float(grad_comm_ms_per_layer[int(b.layer_idx)]) if b.phase == "BWD" else 0.0,
         ) for b in blocks
@@ -1606,6 +1714,8 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
         "block_profiles": {
             "compute_ms": [float(b.compute_ms) for b in blocks],
             "cap_bytes": [int(b.cap_bytes) for b in blocks],
+            "explicit_temp_reserve_bytes": [int(b.explicit_temp_reserve_bytes) for b in blocks],
+            "non_param_floor_bytes": [int(b.non_param_floor_bytes) for b in blocks],
             "fixed_comm_start_offset_ms": [float(b.fixed_comm_start_offset_ms) for b in blocks],
             "fixed_comm_ms": [float(b.fixed_comm_ms) for b in blocks],
         },
@@ -1622,11 +1732,19 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "total_mem_bytes": int(total_mem),
             "peak_mem_bytes": int(peak_mem),
             "mem_budget_bytes": int(mem_budget_bytes),
+            "allocator_margin_bytes": int(allocator_margin_bytes),
+            "explicit_temp_reserve_bytes": int(max((int(b.explicit_temp_reserve_bytes) for b in blocks), default=0)),
             "persistent_mem_bytes": int(persistent_mem_bytes),
             "persistent_deferred": True,
             "persistent_candidates": [int(x) for x in persistent_candidates],
             "persistent_candidate_sizes": {str(int(ds_id)): int(ds_id_to_size.get(int(ds_id), 0)) for ds_id in persistent_candidates},
             "persistent_candidate_allgather_ms": {str(int(ds_id)): float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) for ds_id in persistent_candidates},
+            "ds_id_to_layer": {
+                str(int(ds_id)): int(layer) for ds_id, layer in sorted({
+                    **{int(k): int(v) for k, v in mapping.ds_id_to_layer.items()},
+                    **{int(k): int(v) for k, v in extra_ds_id_to_layer.items()},
+                }.items())
+            },
             "extra_unmapped_ds_ids": len(extra_ds_id_to_layer),
             "prefetch_calls": int(total_prefetch_calls),
             "milp": best_milp_meta,
@@ -1964,6 +2082,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
 
                 total_mem = int(meta.get("total_mem_bytes", _min_total_mem_bytes_across_ranks()))
                 safe_total = int(total_mem)
+                allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes()))
 
                 # Non-torch memory (CUDA context, NCCL, other processes, allocator bypass) reduces
                 # the effective budget available to the caching allocator.
@@ -1980,7 +2099,8 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                             non_torch_bytes = int(vals[0].item())
 
                 safe_total_for_torch = max(0, int(safe_total) - int(non_torch_bytes))
-                persistent_budget_bytes = max(0, int(safe_total_for_torch) - int(baseline_peak))
+                persistent_budget_bytes = max(
+                    0, int(safe_total_for_torch) - int(baseline_peak) - int(allocator_margin_bytes))
 
                 # Load candidate ranking and sizes from the planned schedule when available.
                 cand_list = meta.get("persistent_candidates", [])
@@ -1995,14 +2115,16 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                     ds_id_to_allgather_ms = _build_ds_id_to_allgather_ms(profiling_results)
                     candidates = _rank_persistent_candidates(ds_id_to_size, ds_id_to_allgather_ms)
 
-                persistent_ds_ids, persistent_mem_bytes = _select_persistent_ds_ids(candidates, ds_id_to_size,
-                                                                                    persistent_budget_bytes)
+                ds_id_to_layer = {int(k): int(v) for k, v in meta.get("ds_id_to_layer", {}).items()}
+                persistent_ds_ids, persistent_mem_bytes = _select_persistent_ds_ids_block_safe(
+                    candidates, ds_id_to_size, persistent_budget_bytes, sched, ds_id_to_layer)
                 if dist.get_rank() == 0:
                     log_rank0(
                         f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
                         f"observed_peak_reserved_bytes={int(observed_peak_reserved)} "
                         f"non_torch_bytes={int(non_torch_bytes)} "
                         f"profile_peak_bytes={int(profile_peak)} baseline_peak_bytes={int(baseline_peak)} "
+                        f"allocator_margin_bytes={int(allocator_margin_bytes)} "
                         f"persistent_budget_bytes={int(persistent_budget_bytes)} selected_ds_ids={len(persistent_ds_ids)} "
                         f"persistent_mem_bytes={int(persistent_mem_bytes)}",
                         enable=True,
@@ -2016,6 +2138,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 meta["observed_peak_mem_reserved_bytes"] = int(observed_peak_reserved)
                 meta["observed_peak_mem_bytes"] = int(observed_peak)
                 meta["non_torch_mem_bytes"] = int(non_torch_bytes)
+                meta["allocator_margin_bytes"] = int(allocator_margin_bytes)
                 meta["persistent_budget_bytes"] = int(persistent_budget_bytes)
                 meta["persistent_mem_bytes"] = int(persistent_mem_bytes)
                 meta["persistent_deferred"] = False
