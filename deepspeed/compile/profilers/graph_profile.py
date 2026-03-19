@@ -502,6 +502,38 @@ def _maybe_ce_sparse_fuse_call(interp: Interpreter, n: torch.fx.Node, args, kwar
 
 
 def _maybe_large_dense_grad_noalloc_call(interp: Interpreter, n: torch.fx.Node, args, kwargs):
+    def _make_large_dense_grad_noalloc(base: _LargeDenseGradNoAlloc,
+                                       other=None,
+                                       *,
+                                       dtype: Optional[torch.dtype] = None,
+                                       device=None,
+                                       reserve_bytes: Optional[int] = None):
+        dtype = base.dtype if dtype is None else dtype
+        device = base.device if device is None else device
+        kind = base.kind
+        if isinstance(other, _LargeDenseGradNoAlloc):
+            if other.shape != base.shape:
+                return None
+            if isinstance(other.dtype, torch.dtype):
+                dtype = torch.promote_types(dtype, other.dtype) if isinstance(dtype, torch.dtype) else other.dtype
+            if other.device is not None:
+                device = other.device
+            reserve_bytes = max(int(base.reserve_bytes), int(other.reserve_bytes))
+        elif torch.is_tensor(other):
+            if tuple(other.shape) != tuple(base.shape):
+                return None
+            dtype = torch.promote_types(dtype, other.dtype) if isinstance(dtype, torch.dtype) else other.dtype
+            device = other.device
+
+        if reserve_bytes is None:
+            reserve_bytes = int(base.reserve_bytes)
+
+        return _LargeDenseGradNoAlloc(shape=base.shape,
+                                      dtype=dtype,
+                                      device=device,
+                                      reserve_bytes=int(reserve_bytes),
+                                      kind=kind)
+
     role_map = getattr(interp, "_large_dense_grad_roles", None)
     role = role_map.get(n) if role_map else None
 
@@ -532,25 +564,32 @@ def _maybe_large_dense_grad_noalloc_call(interp: Interpreter, n: torch.fx.Node, 
                                       reserve_bytes=full.reserve_bytes,
                                       kind=full.kind)
 
-    if args and isinstance(args[0], _LargeDenseGradNoAlloc):
-        dense = args[0]
+    dense0 = args[0] if args and isinstance(args[0], _LargeDenseGradNoAlloc) else None
+    dense1 = args[1] if len(args) > 1 and isinstance(args[1], _LargeDenseGradNoAlloc) else None
+    dense = dense0 if dense0 is not None else dense1
+    if dense is not None:
         if n.target == torch.ops.prims.convert_element_type.default:
             if len(args) < 2 or not isinstance(args[1], torch.dtype):
                 return None
-            return _LargeDenseGradNoAlloc(shape=dense.shape,
-                                          dtype=args[1],
-                                          device=dense.device,
-                                          reserve_bytes=dense.reserve_bytes,
-                                          kind=dense.kind)
+            return _make_large_dense_grad_noalloc(dense,
+                                                  dtype=args[1],
+                                                  device=dense.device,
+                                                  reserve_bytes=dense.reserve_bytes)
         if n.target == torch.ops.aten._to_copy.default:
             dtype = kwargs.get("dtype", None)
             if not isinstance(dtype, torch.dtype):
                 return None
-            return _LargeDenseGradNoAlloc(shape=dense.shape,
-                                          dtype=dtype,
-                                          device=dense.device,
-                                          reserve_bytes=dense.reserve_bytes,
-                                          kind=dense.kind)
+            return _make_large_dense_grad_noalloc(dense,
+                                                  dtype=dtype,
+                                                  device=kwargs.get("device", dense.device),
+                                                  reserve_bytes=dense.reserve_bytes)
+        if n.target in (torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor):
+            if len(args) < 2:
+                return None
+            other = args[1] if dense0 is not None else args[0]
+            if not (torch.is_tensor(other) or isinstance(other, _LargeDenseGradNoAlloc)):
+                return None
+            return _make_large_dense_grad_noalloc(dense, other=other)
         if n.target == torch.ops.dc.reduce_grad.default:
             dtype = dense.dtype if isinstance(dense.dtype, torch.dtype) else torch.float32
             device = dense.device if dense.device is not None else getattr(interp, "device", None)

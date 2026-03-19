@@ -424,10 +424,12 @@ class DeepSpeedEngine(Module):
         self._is_compiled = False
         if is_deepcompile_supported():
             # Predefined compile passes
+            from deepspeed.compile.passes import selective_activation_recompute
             self.register_compile_pass(zero3_compile.NAME, zero3_compile.add_z3_gather_release)
             self.register_compile_pass(prefetch.NAME, prefetch.schedule_prefetch)
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
+            self.register_compile_pass(selective_activation_recompute.NAME, selective_activation_recompute.plan)
 
         # We now support PyTorch style backward, but it relies on the counter in ZeRO optimizers.
         # However, we need some internal APIs to count the number of only used parameters.

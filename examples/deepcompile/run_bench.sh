@@ -12,18 +12,20 @@ export NUM_NODES=${NUM_NODES:-4}
 
 MODEL=${MODEL_NAME:-"llama-2-7b"}
 BATCH_SIZE_OPTS=(2)
-SEQ_LENGTH_OPTS=(1024)
+SEQ_LENGTH_OPTS=(2048)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
         # 如果要预加载权重, 加上${LOAD_OPTS}， 固定种子--deterministic
-        ARGS="--model ${MODEL} ${LOAD_OPTS} --model_path ${MODEL_PATH} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} ${ACC_OPTS} ${AC_OPTS}"
+        ARGS="--model ${MODEL} ${LOAD_OPTS} --model_path ${MODEL_PATH} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} ${ACC_OPTS}"
         # bash ./run_multinode.sh --backend deepspeed ${ARGS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${COMPILE_OPTS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS}
         # bash ./run_multinode.sh --backend fsdp ${ARGS}
         # bash ./run_multinode.sh --backend fsdp ${ARGS} ${COMPILE_OPTS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch,selective_gather
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes global_layer_scheduler
+        # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes global_layer_scheduler
+        # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS}
+        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes selective_activation_recompute
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes selective_gather
 

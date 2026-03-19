@@ -48,7 +48,8 @@ def get_args():
 
 
 def make_schedule(passes: List[str], warmup):
-    from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states, global_layer_scheduler
+    from deepspeed.compile.passes import (zero3_compile, prefetch, selective_gather, offload_adam_states,
+                                          global_layer_scheduler, selective_activation_recompute)
 
     schedule = []
 
@@ -59,6 +60,10 @@ def make_schedule(passes: List[str], warmup):
     elif "offload_adam_states_sync" in passes:
         assert len(passes) == 1, "offload_adam_states_sync should be the only pass"
         schedule.append((0, [zero3_compile.add_z3_gather_release, offload_adam_states.move_opt_states_sync]))
+    elif "selective_activation_recompute" in passes:
+        assert len(passes) == 1, "selective_activation_recompute should be the only pass in the MVP"
+        schedule.append((0, [zero3_compile.add_z3_gather_release, selective_activation_recompute.plan]))
+        schedule.append((warmup, [zero3_compile.add_z3_gather_release, selective_activation_recompute.apply]))
     else:
         if "global_layer_scheduler" in passes:
             assert "prefetch" not in passes and "selective_gather" not in passes, \
@@ -224,6 +229,7 @@ def main():
 
     global_step = 0
     iter_times = []
+    iter_times_by_step = {}
 
     # See https://github.com/microsoft/DeepSpeed/issues/6793
     acc_context = nullcontext if is_deepspeed else accelerator.accumulate
@@ -260,6 +266,7 @@ def main():
                             print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item()} sync: {accelerator.sync_gradients} time: {step_time} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB")
 
                         iter_times.append(step_time)
+                        iter_times_by_step[int(global_step)] = float(step_time)
                         step_compute_time = 0.0
                     else:
                         step_compute_time += time.time() - micro_start
@@ -267,13 +274,18 @@ def main():
                 if do_profile:
                     prof.step()
 
-                stop = global_step >= args.bench_step * args.gradient_accumulation_steps
+                # Only run through step 11 for faster experiments.
+                stop = global_step >= 11 * args.gradient_accumulation_steps
                 if stop:
                     break
             if stop:
                 break
 
-    iter_times = iter_times[args.warmup_step:]
+    # Report iteration time as the mean of true times from step 7..11 (5 steps).
+    _report_steps = list(range(7, 12))
+    report_times = [iter_times_by_step[s] for s in _report_steps if s in iter_times_by_step]
+    if not report_times:
+        report_times = iter_times
 
     if accelerator.is_main_process:
         compile_time_sum = 0
@@ -285,7 +297,7 @@ def main():
         is_deepcompile = is_deepspeed and model._config.compile_config.deepcompile
         alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
         peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(iter_times) / len(iter_times):.4f} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB"
+        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(report_times) / len(report_times):.4f} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB"
         print(msg)
 
         if args.profile_dir:

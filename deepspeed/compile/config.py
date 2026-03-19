@@ -45,6 +45,30 @@ class CompileConfig(DeepSpeedConfigModel):
     global_layer_scheduler_dump_dir: str = ""
     """ Directory to dump schedule JSON (defaults to CWD if empty) """
 
+    selective_activation_recompute: bool = False
+    """ Enable DeepCompile selective activation recompute planning """
+
+    selective_activation_recompute_layer_regexes: list = [
+        r"(?:^|\.)layers\.(\d+)(?:\.|$)",
+        r"(?:^|\.)h\.(\d+)(?:\.|$)",
+    ]
+    """ Regex patterns used to map parameter names to transformer layer indices for selective recompute """
+
+    selective_activation_recompute_module_regexes: list = [
+        r"(?:^|\.)layers\.(\d+)$",
+        r"(?:^|\.)h\.(\d+)$",
+    ]
+    """ Regex patterns used to detect checkpoint-capable layer modules for selective recompute """
+
+    selective_activation_recompute_dump_plan: bool = False
+    """ Dump the selective recompute plan JSON on rank0 """
+
+    selective_activation_recompute_dump_dir: str = ""
+    """ Directory to dump selective recompute plan JSON (defaults to CWD if empty) """
+
+    selective_activation_recompute_pressure_ratio: float = 0.9
+    """ Safety ratio (0,1] for planning memory budget. Effective budget ~= total_mem * ratio. """
+
     global_layer_scheduler_milp_time_limit_s: float = 2.0
     """ Time limit (seconds) for the global layer scheduler MILP solver """
 

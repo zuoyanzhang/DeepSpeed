@@ -16,6 +16,10 @@
     "compile": {
         "deepcompile": {{ deepcompile }},
         "global_layer_scheduler": false,
+        "selective_activation_recompute": false,
+        "selective_activation_recompute_dump_plan": false,
+        "selective_activation_recompute_dump_dir": "",
+        "selective_activation_recompute_pressure_ratio": 0.95,
         "global_layer_scheduler_fuse_max_bytes": 268435456,
         "global_layer_scheduler_fuse_deadline_window_blocks": 1,
         "global_layer_scheduler_fuse_factor": 0.9,

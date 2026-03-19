@@ -98,6 +98,12 @@ def launch_compile_passes(global_steps: int):
         _, next_passes = remaining_schedule.pop(0)
         log_rank0(f"Launching compile passes: global_steps={global_steps} passes={next_passes}", True)
 
+        try:
+            from .passes import selective_activation_recompute
+            selective_activation_recompute.maybe_apply_before_recompile(next_passes)
+        except Exception:
+            pass
+
         torch._dynamo.reset()
         get_deepcompile_handle().reset()
         graph_order_with_frame_id.clear()

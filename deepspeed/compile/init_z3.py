@@ -10,7 +10,8 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToModuleSubClasses
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
-from .passes import zero3_compile, prefetch, selective_gather, offload_parameters, global_layer_scheduler
+from .passes import (zero3_compile, prefetch, selective_gather, offload_parameters, global_layer_scheduler,
+                     selective_activation_recompute)
 from .backend import make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook
@@ -64,11 +65,19 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
     if schedule is None:
         schedule = []
         if (compile_config.offload_parameters):
+            if getattr(compile_config, "selective_activation_recompute", False):
+                raise RuntimeError("selective_activation_recompute is not supported together with offload_parameters")
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
         else:
             if getattr(compile_config, "global_layer_scheduler", False):
+                if getattr(compile_config, "selective_activation_recompute", False):
+                    raise RuntimeError("selective_activation_recompute + global_layer_scheduler is not implemented yet")
                 schedule.append((0, [zero3_compile.add_z3_gather_release, global_layer_scheduler.plan]))
                 schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, global_layer_scheduler.apply]))
+            elif getattr(compile_config, "selective_activation_recompute", False):
+                schedule.append((0, [zero3_compile.add_z3_gather_release, selective_activation_recompute.plan]))
+                schedule.append((WARMUP,
+                                 [zero3_compile.add_z3_gather_release, selective_activation_recompute.apply]))
             else:
                 schedule.append((0, [zero3_compile.add_z3_gather_release]))
                 schedule.append((WARMUP, [
@@ -76,6 +85,7 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                 ]))
 
     global_layer_scheduler.maybe_init_layer_mapping(engine.module, compile_config, schedule)
+    selective_activation_recompute.maybe_init_layer_mapping(engine.module, compile_config, schedule)
 
     init_schedule(schedule)
 
