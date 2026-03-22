@@ -299,6 +299,7 @@ class DeepSpeedZeRoOffload(object):
         def _pre_forward_module_hook(module, *args):
             self.pre_sub_module_forward_function(module)
 
+        @torch.compiler.disable
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
 
@@ -347,6 +348,7 @@ class DeepSpeedZeRoOffload(object):
                 "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and " \
                 "output tensors and therefore may not get triggered properly."
 
+        @torch.compiler.disable
         def _pre_backward_module_hook(module, inputs, output):
 
             return apply_to_tensors_only(module.pre_bwd_fn.apply,
