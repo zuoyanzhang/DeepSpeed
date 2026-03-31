@@ -2214,6 +2214,29 @@ class DeepSpeedEngine(Module):
         if not self.autotuning_profile_model_info():
             see_memory_usage("Engine after forward", force=self.memory_breakdown())
 
+    def _begin_deepcompile_eager_param_forward(self):
+        candidate_params = getattr(self, "_deepcompile_eager_param_candidates", ())
+        if not candidate_params:
+            return []
+
+        for param in getattr(self, "_deepcompile_pending_eager_release_params", ()):
+            if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_persist:
+                param.partition()
+        self._deepcompile_pending_eager_release_params = ()
+
+        eager_param_ds_ids = getattr(self, "_deepcompile_eager_param_ds_ids", None)
+        active_params = []
+        for param in candidate_params:
+            if eager_param_ds_ids is not None and param.ds_id not in eager_param_ds_ids:
+                continue
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                param.all_gather()
+                active_params.append(param)
+        return active_params
+
+    def _finalize_deepcompile_eager_param_forward(self, active_params):
+        self._deepcompile_pending_eager_release_params = tuple(active_params)
+
     @instrument_w_nvtx
     def forward(self, *inputs, **kwargs):
         r"""Execute forward propagation
@@ -2233,8 +2256,16 @@ class DeepSpeedEngine(Module):
             # We can't have this in forward prologue as the compiler compiles hooks including the forward prologue.
             self.launch_compile_passes(self.global_steps)
 
-        with autocast_if_enabled(self):
-            loss = self.module(*inputs, **kwargs)
+        eager_deepcompile_params = []
+        if self.is_deepcompile_active() and self.zero_optimization_partition_weights():
+            eager_deepcompile_params = self._begin_deepcompile_eager_param_forward()
+
+        try:
+            with autocast_if_enabled(self):
+                loss = self.module(*inputs, **kwargs)
+        finally:
+            if self.is_deepcompile_active() and self.zero_optimization_partition_weights():
+                self._finalize_deepcompile_eager_param_forward(eager_deepcompile_params)
 
         # Register output backward hooks
         # preprocess_once_fn is called for preprocessing
@@ -2295,6 +2326,13 @@ class DeepSpeedEngine(Module):
         # Skip gradient reduction when DeepCompile is enabled
         # DeepCompile handles its own gradient reduction through compiled graph operations
         if self.is_deepcompile_active():
+            flush_eager_gradients = getattr(self.optimizer, "flush_deepcompile_eager_gradients", None)
+            if flush_eager_gradients is not None:
+                flush_eager_gradients()
+            for param in getattr(self, "_deepcompile_pending_eager_release_params", ()):
+                if param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_persist:
+                    param.partition()
+            self._deepcompile_pending_eager_release_params = ()
             return
 
         # Pass (PP) gas boundary flag to optimizer (required for zero)

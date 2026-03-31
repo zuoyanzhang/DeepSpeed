@@ -36,8 +36,6 @@ def get_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--profile_dir", type=str, default=None)
-    parser.add_argument("--bench_step", type=int, default=30)
-    parser.add_argument("--warmup_step", type=int, default=15)
     parser.add_argument("--zero_stage", type=int, default=3)
     parser.add_argument("--print_interval", type=int, default=1)
     parser.add_argument("--save_weights", action="store_true")
@@ -84,7 +82,6 @@ def make_schedule(passes: List[str], warmup):
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false" # to suppress tokenizer parallelism warning
     args = get_args()
-    args.load_weights = True # 必须设置为true，否则还是从huggingface中下载权重，不走本地路径
     print(args)
 
     if args.passes is not None and "offload_adam_states" in args.passes:
@@ -108,23 +105,31 @@ def main():
 
     # model_weight_path = f"{model_name.split('/')[1]}_cp_layer{args.num_layers}"
     model_weight_path = os.path.join(args.model_path, args.model_name)
+    local_config_path = os.path.join(model_weight_path, "config.json")
+    local_tokenizer_json = os.path.join(model_weight_path, "tokenizer.json")
+    local_tokenizer_model = os.path.join(model_weight_path, "tokenizer.model")
+    config_source = model_weight_path if os.path.isfile(local_config_path) else model_name
+    tokenizer_source = model_weight_path if os.path.isfile(local_tokenizer_json) or os.path.isfile(local_tokenizer_model) else model_name
+    use_config_init = args.num_layers > 0
     
     if accelerator.is_main_process:
         print(f"model_weight_path: {model_weight_path}")
-    if args.load_weights:
+        print(f"config_source: {config_source}")
+        print(f"tokenizer_source: {tokenizer_source}")
+        print(f"use_config_init: {use_config_init}")
+    if use_config_init:
+        model_config = AutoConfig.from_pretrained(config_source,
+                                                  attn_implementation=args.attn_impl,
+                                                  trust_remote_code=True)
+        print(f"num_hidden_layers: {model_config.num_hidden_layers} -> {args.num_layers}")
+        model_config.num_hidden_layers = args.num_layers
+        model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
+    elif args.load_weights:
         model = AutoModelForCausalLM.from_pretrained(model_weight_path, 
                                                      trust_remote_code=True)
     else:
-        if args.num_layers > 0:
-            model_config = AutoConfig.from_pretrained(model_name, 
-                                                      attn_implementation=args.attn_impl, 
-                                                      trust_remote_code=True)
-            print(f"num_hidden_layers: {model_config.num_hidden_layers} -> {args.num_layers}")
-            model_config.num_hidden_layers = args.num_layers
-            model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                         trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, 
+                                                     trust_remote_code=True)
             
     # 有些buffer类型是float32，使用fsdp+compile的时候需要强制将buffer提前转换成bfloat16，
     # 否则torch.compile的dynamo会触发类型转换错误
@@ -137,7 +142,7 @@ def main():
         print(f"model is {model}")
 
     # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_weight_path, 
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, 
                                               trust_remote_code=True)
 
     if args.save_weights and accelerator.is_main_process:
@@ -228,6 +233,7 @@ def main():
         model.train()
 
     global_step = 0
+    completed_steps = 0
     iter_times = []
     iter_times_by_step = {}
 
@@ -258,15 +264,16 @@ def main():
                     global_step += 1
 
                     if update_step:
+                        completed_steps += 1
                         step_compute_time += time.time() - micro_start
                         step_time = step_compute_time
                         alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
                         peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                        if accelerator.is_main_process and global_step % (args.print_interval * args.gradient_accumulation_steps) == 0:
-                            print(f"Epoch {epoch+1}, Step {global_step}, Loss: {loss.item()} sync: {accelerator.sync_gradients} time: {step_time} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB")
+                        if accelerator.is_main_process and completed_steps % args.print_interval == 0:
+                            print(f"Epoch {epoch+1}, Step {completed_steps}, Loss: {loss.item()} sync: {accelerator.sync_gradients} time: {step_time} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB")
 
                         iter_times.append(step_time)
-                        iter_times_by_step[int(global_step)] = float(step_time)
+                        iter_times_by_step[int(completed_steps)] = float(step_time)
                         step_compute_time = 0.0
                     else:
                         step_compute_time += time.time() - micro_start
@@ -274,15 +281,15 @@ def main():
                 if do_profile:
                     prof.step()
 
-                # Only run through step 11 for faster experiments.
-                stop = global_step >= 11 * args.gradient_accumulation_steps
+                # Stop after step 10.
+                stop = completed_steps >= 10
                 if stop:
                     break
             if stop:
                 break
 
-    # Report iteration time as the mean of true times from step 7..11 (5 steps).
-    _report_steps = list(range(7, 12))
+    # Report iteration time as the mean over steps 7..10.
+    _report_steps = list(range(7, 11))
     report_times = [iter_times_by_step[s] for s in _report_steps if s in iter_times_by_step]
     if not report_times:
         report_times = iter_times

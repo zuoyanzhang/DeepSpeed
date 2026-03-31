@@ -61,7 +61,13 @@ class GraphOrder:
 
 graph_order_with_frame_id = GraphOrder()
 
-frames_needing_bwd = set()
+# Track which compiled graphs still need their first backward compiler run
+# before we can safely unpatch CompiledFunction interception.
+graphs_needing_bwd = set()
+# Parameters in data-dependent eager regions (for example MoE experts selected
+# per-rank) must not receive graph-level ZeRO communication insertion, or
+# different ranks can compile incompatible comm sequences.
+z3_param_ds_ids_excluded_from_graph = set()
 profiling_results: Dict[int, ProfilingResult] = {}
 opt_pass_times = []
 opt_passes = {}
@@ -71,6 +77,11 @@ fwd_real_inputs = []
 
 def register_compile_pass(name: str, opt_pass_fn):
     opt_passes[name] = opt_pass_fn
+
+
+def set_z3_param_ds_ids_excluded_from_graph(ds_ids):
+    global z3_param_ds_ids_excluded_from_graph
+    z3_param_ds_ids_excluded_from_graph = set(ds_ids)
 
 
 def init_schedule(schedule):
@@ -109,6 +120,7 @@ def launch_compile_passes(global_steps: int):
         graph_order_with_frame_id.clear()
         profiling_results.clear()
         param_manager.clear()
+        graphs_needing_bwd.clear()
 
 
 def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results):
@@ -253,7 +265,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
         z3_partition = any(hasattr(v, "ds_id") for v in real_inputs)
         if z3_partition:
             param_indices = [(i, input_val.ds_id, input_val.ds_shape) for i, input_val in enumerate(real_inputs)
-                             if isinstance(input_val, torch.nn.Parameter)]
+                             if isinstance(input_val, torch.nn.Parameter)
+                             and input_val.ds_id not in z3_param_ds_ids_excluded_from_graph]
         else:
             assert all(hasattr(v, "param_id") for v in real_inputs
                        if isinstance(v, torch.nn.Parameter)), "All param inputs should have param_id"
@@ -284,9 +297,9 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             graph_index = len(graph_order) - 1
 
             if needs_backward:
-                if len(frames_needing_bwd) == 0:
+                if len(graphs_needing_bwd) == 0:
                     patch_compiled_func()
-                frames_needing_bwd.add(frame_id)
+                graphs_needing_bwd.add(graph_id)
 
             # Try to get real_inputs from the list first, then from storage
             if fwd_real_inputs:
@@ -366,8 +379,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 add_free_activations(graph_id, gm.graph,
                                      get_activation_node_names(gm.graph, param_nodes_bw, non_param_input_names))
 
-            frames_needing_bwd.remove(frame_id)
-            if len(frames_needing_bwd) == 0:
+            graphs_needing_bwd.discard(graph_id)
+            if len(graphs_needing_bwd) == 0:
                 unpatch_compiled_func()
 
             log_rank0(
