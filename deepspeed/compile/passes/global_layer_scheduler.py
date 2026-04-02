@@ -264,7 +264,7 @@ def _estimate_non_torch_mem_bytes() -> int:
 
 
 def _allocator_margin_bytes() -> int:
-    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 512 * 1024 * 1024)))
+    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 8 * 512 * 1024 * 1024)))
 
 
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
@@ -343,6 +343,163 @@ def _select_persistent_ds_ids(candidates: Sequence[int], ds_id_to_size: Dict[int
     return persistent_ds_ids, int(persistent_mem_bytes)
 
 
+def _select_persistent_ds_ids_knapsack(candidates: Sequence[int],
+                                       ds_id_to_size: Dict[int, int],
+                                       ds_id_to_value: Dict[int, float],
+                                       budget_bytes: int,
+                                       *,
+                                       block_increments: Optional[Dict[int, Tuple[int, ...]]] = None,
+                                       base_reserved: Optional[Sequence[int]] = None,
+                                       cap_bytes: Optional[Sequence[int]] = None) -> Tuple[List[int], int, float, dict]:
+    budget = max(0, int(budget_bytes))
+    if budget <= 0:
+        return [], 0, 0.0, {"method": "none", "status": "empty_budget"}
+
+    items: List[Tuple[int, int, float, Tuple[int, ...]]] = []
+    cap_list = [int(x) for x in cap_bytes] if cap_bytes is not None else []
+    base_reserved_list = [int(x) for x in base_reserved] if base_reserved is not None else []
+    use_block_caps = bool(block_increments) and bool(cap_list) and len(cap_list) == len(base_reserved_list)
+
+    for ds_id in candidates:
+        ds_id = int(ds_id)
+        size = int(ds_id_to_size.get(int(ds_id), 0))
+        if size <= 0 or size > budget:
+            continue
+        incr_blocks = tuple(block_increments.get(int(ds_id), ())) if use_block_caps and block_increments is not None else ()
+        individually_feasible = True
+        for k in incr_blocks:
+            if int(k) < 0 or int(k) >= len(cap_list):
+                continue
+            if int(base_reserved_list[int(k)]) + int(size) > int(cap_list[int(k)]):
+                individually_feasible = False
+                break
+        if not individually_feasible:
+            continue
+        items.append((int(ds_id), int(size), max(0.0, float(ds_id_to_value.get(int(ds_id), 0.0))), incr_blocks))
+
+    if not items:
+        return [], 0, 0.0, {"method": "none", "status": "no_candidates"}
+
+    if not any(float(value) > 0.0 for _, _, value, _ in items):
+        return [], 0, 0.0, {"method": "none", "status": "no_positive_value"}
+
+    try:
+        import numpy as np
+        from scipy.optimize import Bounds, LinearConstraint, milp
+        from scipy.sparse import coo_matrix
+    except Exception as exc:
+        greedy_selected: List[int] = []
+        greedy_mem = 0
+        greedy_value = 0.0
+        extra_reserved = [0 for _ in range(len(cap_list))]
+        for ds_id, size, value, incr_blocks in items:
+            if greedy_mem + int(size) > budget:
+                continue
+            feasible = True
+            for k in incr_blocks:
+                if int(k) < 0 or int(k) >= len(cap_list):
+                    continue
+                if int(base_reserved_list[int(k)]) + int(extra_reserved[int(k)]) + int(size) > int(cap_list[int(k)]):
+                    feasible = False
+                    break
+            if not feasible:
+                continue
+            greedy_selected.append(int(ds_id))
+            greedy_mem += int(size)
+            greedy_value += float(value)
+            for k in incr_blocks:
+                if 0 <= int(k) < len(extra_reserved):
+                    extra_reserved[int(k)] += int(size)
+        return greedy_selected, int(greedy_mem), float(greedy_value), {
+            "method": "greedy_fallback",
+            "status": f"import_error: {exc}",
+        }
+
+    n_items = len(items)
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
+    ub_rows: List[float] = []
+    row = 0
+
+    def add_row(coeffs: Sequence[Tuple[int, float]], rhs: float) -> None:
+        nonlocal row
+        for j, v in coeffs:
+            if float(v) == 0.0:
+                continue
+            rows.append(int(row))
+            cols.append(int(j))
+            data.append(float(v))
+        ub_rows.append(float(rhs))
+        row += 1
+
+    add_row([(idx, float(size)) for idx, (_, size, _, _) in enumerate(items)], float(budget))
+
+    if use_block_caps:
+        for k in range(len(cap_list)):
+            coeffs = [(idx, float(size)) for idx, (_, size, _, incr_blocks) in enumerate(items) if int(k) in incr_blocks]
+            if not coeffs:
+                continue
+            rhs = float(int(cap_list[int(k)]) - int(base_reserved_list[int(k)]))
+            if rhs < 0.0:
+                return [], 0, 0.0, {"method": "none", "status": f"infeasible_block_{k}"}
+            add_row(coeffs, rhs)
+
+    A = coo_matrix((np.array(data, dtype=float), (np.array(rows, dtype=int), np.array(cols, dtype=int))),
+                   shape=(row, n_items)).tocsr()
+    constraint = LinearConstraint(A, -np.inf * np.ones(row, dtype=float), np.array(ub_rows, dtype=float))
+
+    c = np.array(
+        [-(float(value) + 1e-9 * float(n_items - idx)) for idx, (_, _, value, _) in enumerate(items)],
+        dtype=float,
+    )
+    integrality = np.ones(n_items, dtype=int)
+    lb = np.zeros(n_items, dtype=float)
+    ub = np.ones(n_items, dtype=float)
+
+    milp_time_limit_s = 2.0
+    milp_rel_gap = 0.01
+    if _CFG is not None:
+        try:
+            milp_time_limit_s = float(getattr(_CFG, "milp_time_limit_s", milp_time_limit_s))
+            milp_rel_gap = float(getattr(_CFG, "milp_rel_gap", milp_rel_gap))
+        except Exception:
+            pass
+
+    res = milp(
+        c=c,
+        integrality=integrality,
+        bounds=Bounds(lb, ub),
+        constraints=constraint,
+        options={
+            "disp": False,
+            "time_limit": float(milp_time_limit_s),
+            "mip_rel_gap": float(max(0.0, milp_rel_gap)),
+        },
+    )
+
+    x = getattr(res, "x", None)
+    if x is None:
+        return [], 0, 0.0, {
+            "method": "milp",
+            "status": f"no_solution: {getattr(res, 'message', 'unknown')}",
+            "solver_status": int(getattr(res, "status", -1)),
+        }
+
+    chosen_indices = [idx for idx, value in enumerate(x) if float(value) >= 0.5]
+    selected = [int(items[idx][0]) for idx in chosen_indices]
+    selected_mem = int(sum(int(items[idx][1]) for idx in chosen_indices))
+    selected_value = float(sum(float(items[idx][2]) for idx in chosen_indices))
+    return selected, int(selected_mem), float(selected_value), {
+        "method": "milp",
+        "status": str(getattr(res, "message", "ok")),
+        "solver_status": int(getattr(res, "status", 0)),
+        "mip_gap": float(getattr(res, "mip_gap", float("nan"))) if hasattr(res, "mip_gap") else float("nan"),
+        "objective": float(-res.fun) if getattr(res, "fun", None) is not None else None,
+        "num_items": int(n_items),
+    }
+
+
 def _persistent_increment_blocks_for_ds_id(ds_id: int, sched: dict, ds_id_to_layer: Dict[int, int]) -> Tuple[int, ...]:
     layer = ds_id_to_layer.get(int(ds_id))
     if layer is None:
@@ -383,47 +540,34 @@ def _persistent_increment_blocks_for_ds_id(ds_id: int, sched: dict, ds_id_to_lay
 
 
 def _select_persistent_ds_ids_block_safe(candidates: Sequence[int], ds_id_to_size: Dict[int, int], budget_bytes: int,
-                                         sched: dict, ds_id_to_layer: Dict[int, int]) -> Tuple[List[int], int]:
+                                         sched: dict, ds_id_to_layer: Dict[int, int],
+                                         ds_id_to_value: Optional[Dict[int, float]] = None) -> Tuple[List[int], int, float, dict]:
     budget = max(0, int(budget_bytes))
     if budget <= 0:
-        return [], 0
+        return [], 0, 0.0, {"method": "none", "status": "empty_budget"}
 
     base_reserved = [int(x) for x in sched.get("predicted_reserved_mem", [])]
     block_profiles = sched.get("block_profiles", {})
     cap_bytes = [int(x) for x in block_profiles.get("cap_bytes", [])]
+    values = {int(k): max(0.0, float(v)) for k, v in (ds_id_to_value or {}).items()}
     if not base_reserved or len(base_reserved) != len(cap_bytes) or not ds_id_to_layer:
-        return _select_persistent_ds_ids(candidates, ds_id_to_size, budget)
+        selected, mem, value, meta = _select_persistent_ds_ids_knapsack(candidates,
+                                                                        ds_id_to_size,
+                                                                        values,
+                                                                        budget)
+        return selected, int(mem), float(value), meta
 
-    extra_reserved = [0 for _ in range(len(cap_bytes))]
-    persistent_ds_ids: List[int] = []
-    persistent_mem_bytes = 0
-
-    for ds_id in candidates:
-        ds_id = int(ds_id)
-        size = int(ds_id_to_size.get(int(ds_id), 0))
-        if size <= 0:
-            continue
-        if persistent_mem_bytes + size > budget:
-            continue
-
-        incr_blocks = _persistent_increment_blocks_for_ds_id(int(ds_id), sched, ds_id_to_layer)
-        feasible = True
-        for k in incr_blocks:
-            if int(k) < 0 or int(k) >= len(cap_bytes):
-                continue
-            if int(base_reserved[int(k)]) + int(extra_reserved[int(k)]) + int(size) > int(cap_bytes[int(k)]):
-                feasible = False
-                break
-        if not feasible:
-            continue
-
-        persistent_ds_ids.append(int(ds_id))
-        persistent_mem_bytes += int(size)
-        for k in incr_blocks:
-            if 0 <= int(k) < len(extra_reserved):
-                extra_reserved[int(k)] += int(size)
-
-    return persistent_ds_ids, int(persistent_mem_bytes)
+    block_increments = {
+        int(ds_id): _persistent_increment_blocks_for_ds_id(int(ds_id), sched, ds_id_to_layer) for ds_id in candidates
+    }
+    selected, mem, value, meta = _select_persistent_ds_ids_knapsack(candidates,
+                                                                    ds_id_to_size,
+                                                                    values,
+                                                                    budget,
+                                                                    block_increments=block_increments,
+                                                                    base_reserved=base_reserved,
+                                                                    cap_bytes=cap_bytes)
+    return selected, int(mem), float(value), meta
 
 
 def _build_ds_id_to_wait_pos(graph: Optional[Graph]) -> Dict[int, int]:
@@ -2105,19 +2249,28 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 # Load candidate ranking and sizes from the planned schedule when available.
                 cand_list = meta.get("persistent_candidates", [])
                 cand_sizes = meta.get("persistent_candidate_sizes", {})
+                cand_values = meta.get("persistent_candidate_allgather_ms", {})
                 ds_id_to_size = {int(k): int(v) for k, v in cand_sizes.items()}
+                ds_id_to_value = {int(k): max(0.0, float(v)) for k, v in cand_values.items()}
                 candidates = [int(x) for x in cand_list if int(x) in ds_id_to_size]
+
+                if candidates and not ds_id_to_value:
+                    ds_id_to_allgather_ms = _build_ds_id_to_allgather_ms(profiling_results)
+                    ds_id_to_value = {
+                        int(ds_id): max(0.0, float(ds_id_to_allgather_ms.get(int(ds_id), 0.0))) for ds_id in candidates
+                    }
 
                 if not candidates:
                     # Fallback: derive candidates from whatever profiling results are available
                     # in the current compilation step.
                     ds_id_to_size = _build_ds_id_to_size_bytes(graph_id, profiling_results, param_manager)
                     ds_id_to_allgather_ms = _build_ds_id_to_allgather_ms(profiling_results)
+                    ds_id_to_value = {int(k): max(0.0, float(v)) for k, v in ds_id_to_allgather_ms.items()}
                     candidates = _rank_persistent_candidates(ds_id_to_size, ds_id_to_allgather_ms)
 
                 ds_id_to_layer = {int(k): int(v) for k, v in meta.get("ds_id_to_layer", {}).items()}
-                persistent_ds_ids, persistent_mem_bytes = _select_persistent_ds_ids_block_safe(
-                    candidates, ds_id_to_size, persistent_budget_bytes, sched, ds_id_to_layer)
+                persistent_ds_ids, persistent_mem_bytes, persistent_value_ms, persistent_select_meta = _select_persistent_ds_ids_block_safe(
+                    candidates, ds_id_to_size, persistent_budget_bytes, sched, ds_id_to_layer, ds_id_to_value)
                 if dist.get_rank() == 0:
                     log_rank0(
                         f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
@@ -2126,7 +2279,9 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                         f"profile_peak_bytes={int(profile_peak)} baseline_peak_bytes={int(baseline_peak)} "
                         f"allocator_margin_bytes={int(allocator_margin_bytes)} "
                         f"persistent_budget_bytes={int(persistent_budget_bytes)} selected_ds_ids={len(persistent_ds_ids)} "
-                        f"persistent_mem_bytes={int(persistent_mem_bytes)}",
+                        f"persistent_mem_bytes={int(persistent_mem_bytes)} selected_value_ms={float(persistent_value_ms):.4f} "
+                        f"selection_method={persistent_select_meta.get('method', 'unknown')} "
+                        f"selection_status={persistent_select_meta.get('status', 'unknown')}",
                         enable=True,
                     )
 
@@ -2141,6 +2296,10 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 meta["allocator_margin_bytes"] = int(allocator_margin_bytes)
                 meta["persistent_budget_bytes"] = int(persistent_budget_bytes)
                 meta["persistent_mem_bytes"] = int(persistent_mem_bytes)
+                meta["persistent_value_ms"] = float(persistent_value_ms)
+                meta["persistent_selection"] = {
+                    str(k): (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in persistent_select_meta.items()
+                }
                 meta["persistent_deferred"] = False
                 sched["meta"] = meta
                 sched["schedule_hash"] = _schedule_hash(sched)
