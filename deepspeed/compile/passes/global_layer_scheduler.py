@@ -264,7 +264,7 @@ def _estimate_non_torch_mem_bytes() -> int:
 
 
 def _allocator_margin_bytes() -> int:
-    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 8 * 512 * 1024 * 1024)))
+    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 4 * 1024 * 1024 * 1024)))
 
 
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
@@ -2220,13 +2220,43 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                             observed_peak_alloc = int(vals[0].item())
                             observed_peak_reserved = int(vals[1].item())
                 observed_peak = max(int(observed_peak_alloc), int(observed_peak_reserved))
-
                 profile_peak = int(meta.get("peak_mem_bytes", 0))
-                baseline_peak = int(observed_peak) if int(observed_peak) > 0 else int(profile_peak)
-
                 total_mem = int(meta.get("total_mem_bytes", _min_total_mem_bytes_across_ranks()))
                 safe_total = int(total_mem)
                 allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes()))
+                # run_opt_passes() calls empty_cache() before invoking this
+                # pass, so the current reserved-vs-alloc gap is a much better
+                # approximation of the allocator floor than the warmup-step
+                # peak reserved memory.
+                accelerator = get_accelerator()
+                device_index = int(accelerator.current_device())
+                current_alloc = int(accelerator.memory_allocated(device_index) or 0)
+                current_reserved = int(accelerator.memory_reserved(device_index) or 0)
+                current_allocator_floor_slack = max(0, int(current_reserved) - int(current_alloc))
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    if unset_fake_temporarily is None:
+                        vals = torch.tensor([current_alloc, current_reserved, current_allocator_floor_slack],
+                                            device=device,
+                                            dtype=torch.int64)
+                        dist.all_reduce(vals, dist.ReduceOp.MAX)
+                        current_alloc = int(vals[0].item())
+                        current_reserved = int(vals[1].item())
+                        current_allocator_floor_slack = int(vals[2].item())
+                    else:
+                        with unset_fake_temporarily():
+                            vals = torch.tensor([current_alloc, current_reserved, current_allocator_floor_slack],
+                                                device=device,
+                                                dtype=torch.int64)
+                            dist.all_reduce(vals, dist.ReduceOp.MAX)
+                            current_alloc = int(vals[0].item())
+                            current_reserved = int(vals[1].item())
+                            current_allocator_floor_slack = int(vals[2].item())
+
+                # Budget persistent buffers against the observed live tensor
+                # peak, plus the allocator floor still present after the
+                # backend-level empty_cache() before apply().
+                baseline_live_peak = max(int(observed_peak_alloc), int(profile_peak))
+                baseline_peak = int(baseline_live_peak) + int(current_allocator_floor_slack)
 
                 # Non-torch memory (CUDA context, NCCL, other processes, allocator bypass) reduces
                 # the effective budget available to the caching allocator.
@@ -2275,8 +2305,12 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                     log_rank0(
                         f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
                         f"observed_peak_reserved_bytes={int(observed_peak_reserved)} "
+                        f"current_alloc_bytes={int(current_alloc)} "
+                        f"current_reserved_bytes={int(current_reserved)} "
+                        f"current_allocator_floor_slack_bytes={int(current_allocator_floor_slack)} "
                         f"non_torch_bytes={int(non_torch_bytes)} "
-                        f"profile_peak_bytes={int(profile_peak)} baseline_peak_bytes={int(baseline_peak)} "
+                        f"profile_peak_bytes={int(profile_peak)} baseline_live_peak_bytes={int(baseline_live_peak)} "
+                        f"baseline_peak_bytes={int(baseline_peak)} "
                         f"allocator_margin_bytes={int(allocator_margin_bytes)} "
                         f"persistent_budget_bytes={int(persistent_budget_bytes)} selected_ds_ids={len(persistent_ds_ids)} "
                         f"persistent_mem_bytes={int(persistent_mem_bytes)} selected_value_ms={float(persistent_value_ms):.4f} "
@@ -2292,8 +2326,13 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 meta["observed_peak_mem_alloc_bytes"] = int(observed_peak_alloc)
                 meta["observed_peak_mem_reserved_bytes"] = int(observed_peak_reserved)
                 meta["observed_peak_mem_bytes"] = int(observed_peak)
+                meta["current_alloc_bytes"] = int(current_alloc)
+                meta["current_reserved_bytes"] = int(current_reserved)
+                meta["current_allocator_floor_slack_bytes"] = int(current_allocator_floor_slack)
                 meta["non_torch_mem_bytes"] = int(non_torch_bytes)
                 meta["allocator_margin_bytes"] = int(allocator_margin_bytes)
+                meta["baseline_live_peak_bytes"] = int(baseline_live_peak)
+                meta["baseline_peak_bytes"] = int(baseline_peak)
                 meta["persistent_budget_bytes"] = int(persistent_budget_bytes)
                 meta["persistent_mem_bytes"] = int(persistent_mem_bytes)
                 meta["persistent_value_ms"] = float(persistent_value_ms)

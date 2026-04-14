@@ -73,6 +73,14 @@ def register_compile_pass(name: str, opt_pass_fn):
     opt_passes[name] = opt_pass_fn
 
 
+def _gls_persistent_set_done() -> bool:
+    try:
+        from .passes import global_layer_scheduler
+        return bool(getattr(global_layer_scheduler, "_PERSISTENT_SET_DONE", False))
+    except Exception:
+        return False
+
+
 def init_schedule(schedule):
 
     assert isinstance(schedule, list), f"schedule should be a list, but got {type(schedule)}"
@@ -215,17 +223,32 @@ def run_opt_passes(opt_passes: List[Callable],
             gm.graph.lint()
             gm.recompile()
 
-            mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log)
-            mem_prof.run(*create_inputs_fn())
-            # Backward graphs should be executed with grad disabled to avoid unnecessary memory tracking
-            if bwd:
-                with torch.no_grad():
-                    mem_prof.run(*create_inputs_fn())
-            else:
-                mem_prof.run(*create_inputs_fn())
-            mem = [(name, current_alloc, delta, peak) for name, current_alloc, delta, peak in mem_prof.mem_record]
+            skip_reason = None
+            if _gls_persistent_set_done():
+                skip_reason = "gls_persistent_set_done"
+            elif (
+                i == len(opt_passes) - 1 and
+                getattr(opt_pass_fn, "__name__", "") == "apply" and
+                getattr(opt_pass_fn, "__module__", "").endswith(".global_layer_scheduler")
+            ):
+                skip_reason = "gls_apply_last_pass"
 
-            set_time_and_tensor_size(graph_id, gm.graph, mem, bwd, profiling_results)
+            if skip_reason is not None:
+                log_rank0(
+                    f"Skipping post-recompile memory profiling for graph {graph_id}. bwd={bwd} pass={opt_pass_fn} reason={skip_reason}",
+                    enable=debug_log)
+            else:
+                mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log)
+                mem_prof.run(*create_inputs_fn())
+                # Backward graphs should be executed with grad disabled to avoid unnecessary memory tracking
+                if bwd:
+                    with torch.no_grad():
+                        mem_prof.run(*create_inputs_fn())
+                else:
+                    mem_prof.run(*create_inputs_fn())
+                mem = [(name, current_alloc, delta, peak) for name, current_alloc, delta, peak in mem_prof.mem_record]
+
+                set_time_and_tensor_size(graph_id, gm.graph, mem, bwd, profiling_results)
 
         with unset_fake_temporarily():
             get_accelerator().synchronize()
