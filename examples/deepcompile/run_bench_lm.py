@@ -84,7 +84,10 @@ def make_schedule(passes: List[str], warmup):
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false" # to suppress tokenizer parallelism warning
     args = get_args()
-    args.load_weights = True # 必须设置为true，否则还是从huggingface中下载权重，不走本地路径
+    # When --num_layers is set, build a smaller randomly initialized model from
+    # the local config instead of loading pretrained weights.
+    if args.num_layers > 0:
+        args.load_weights = False
     print(args)
 
     if args.passes is not None and "offload_adam_states" in args.passes:
@@ -115,16 +118,14 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(model_weight_path, 
                                                      trust_remote_code=True)
     else:
+        config_source = model_weight_path if os.path.exists(model_weight_path) else model_name
+        model_config = AutoConfig.from_pretrained(config_source,
+                                                  attn_implementation=args.attn_impl,
+                                                  trust_remote_code=True)
         if args.num_layers > 0:
-            model_config = AutoConfig.from_pretrained(model_name, 
-                                                      attn_implementation=args.attn_impl, 
-                                                      trust_remote_code=True)
             print(f"num_hidden_layers: {model_config.num_hidden_layers} -> {args.num_layers}")
             model_config.num_hidden_layers = args.num_layers
-            model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                         trust_remote_code=True)
+        model = AutoModelForCausalLM.from_config(model_config, trust_remote_code=True)
             
     # 有些buffer类型是float32，使用fsdp+compile的时候需要强制将buffer提前转换成bfloat16，
     # 否则torch.compile的dynamo会触发类型转换错误
@@ -182,7 +183,7 @@ def main():
     model, optimizer, data_loader = accelerator.prepare(model, optimizer, data_loader)
     print(f"Model prepared: {model.__class__} optimizer: {optimizer.__class__}")
 
-    if "Mixtral" in model_name:
+    if "Mixtral" in model_name or "MoE" in model_name:
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
         torch._dynamo.config.capture_scalar_outputs = True
 
