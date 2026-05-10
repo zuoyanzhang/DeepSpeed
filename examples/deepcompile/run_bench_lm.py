@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from typing import List
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, enable_full_determinism
 from datasets import load_dataset, DownloadConfig
 from accelerate import Accelerator
@@ -36,7 +37,6 @@ def get_args():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--profile_dir", type=str, default=None)
-    parser.add_argument("--bench_step", type=int, default=30)
     parser.add_argument("--warmup_step", type=int, default=15)
     parser.add_argument("--zero_stage", type=int, default=3)
     parser.add_argument("--print_interval", type=int, default=1)
@@ -246,10 +246,21 @@ def main():
                 # Time only the training compute segment (exclude dataloader/epoch-boundary overhead).
                 # Start timing after the batch is already moved to device.
                 micro_start = time.time()
-
+                
                 with acc_context(model):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
                     loss = outputs.loss
+
+                # 解决batch size=1时，triton报错的问题
+                # with acc_context(model):
+                #     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                #     logits = outputs.logits
+                #     shift_labels = F.pad(input_ids, (0, 1), value=-100)[..., 1:].contiguous()
+                #     loss = F.cross_entropy(
+                #         logits.float().view(-1, logits.size(-1)),
+                #         shift_labels.view(-1).to(logits.device),
+                #         ignore_index=-100,
+                #     )
 
                     update_step = (is_deepspeed and model.is_gradient_accumulation_boundary()) \
                         or (not is_deepspeed and accelerator.sync_gradients)
