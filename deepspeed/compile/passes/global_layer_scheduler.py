@@ -263,8 +263,15 @@ def _estimate_non_torch_mem_bytes() -> int:
         return 0
 
 
-def _allocator_margin_bytes() -> int:
-    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 4 * 1024 * 1024 * 1024)))
+def _allocator_margin_bytes(total_mem_bytes: Optional[int] = None) -> int:
+    explicit_margin = os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", "").strip()
+    if explicit_margin:
+        return max(0, int(explicit_margin))
+
+    total_mem = int(total_mem_bytes) if total_mem_bytes is not None else _min_total_mem_bytes_across_ranks()
+    usable_fraction = float(os.getenv("DS_DEEPCOMPILE_GLS_USABLE_MEMORY_FRACTION", "0.9"))
+    usable_fraction = max(0.0, min(1.0, usable_fraction))
+    return max(0, int(float(total_mem) * (1.0 - usable_fraction)))
 
 
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
@@ -568,6 +575,29 @@ def _select_persistent_ds_ids_block_safe(candidates: Sequence[int], ds_id_to_siz
                                                                     base_reserved=base_reserved,
                                                                     cap_bytes=cap_bytes)
     return selected, int(mem), float(value), meta
+
+
+def _predicted_peak_mem_bytes_from_schedule(sched: dict,
+                                            ds_id_to_size: Optional[Dict[int, int]] = None,
+                                            ds_id_to_layer: Optional[Dict[int, int]] = None) -> int:
+    reserved = [int(x) for x in sched.get("predicted_reserved_mem", [])]
+    floors = [int(x) for x in sched.get("block_profiles", {}).get("non_param_floor_bytes", [])]
+    if not reserved or not floors:
+        return 0
+
+    K = min(len(reserved), len(floors))
+    persistent_extra = [0 for _ in range(K)]
+    if ds_id_to_size and ds_id_to_layer:
+        for ds_id in sched.get("persistent_ds_ids", []):
+            ds_id = int(ds_id)
+            size = int(ds_id_to_size.get(ds_id, 0))
+            if size <= 0:
+                continue
+            for k in _persistent_increment_blocks_for_ds_id(ds_id, sched, ds_id_to_layer):
+                if 0 <= int(k) < K:
+                    persistent_extra[int(k)] += size
+
+    return max((int(reserved[i]) + int(floors[i]) + int(persistent_extra[i]) for i in range(K)), default=0)
 
 
 def _build_ds_id_to_wait_pos(graph: Optional[Graph]) -> Dict[int, int]:
@@ -1660,7 +1690,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     total_mem = _min_total_mem_bytes_across_ranks()
     peak_mem = _peak_mem_bytes(profiling_results)
     mem_budget_bytes = max(0, int(total_mem) - int(peak_mem))
-    allocator_margin_bytes = _allocator_margin_bytes()
+    allocator_margin_bytes = _allocator_margin_bytes(total_mem)
 
     prof = profiling_results.get(graph_id)
     if prof is None or getattr(prof, "fwd_graph", None) is None or getattr(prof, "bwd_graph", None) is None:
@@ -1899,6 +1929,13 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "separate_allgather_communicator": bool(cfg_used.separate_allgather_communicator),
         },
     }
+    predicted_graph_peak_mem_bytes = _predicted_peak_mem_bytes_from_schedule(schedule)
+    schedule["meta"]["predicted_graph_peak_mem_bytes"] = int(predicted_graph_peak_mem_bytes)
+    schedule["meta"]["predicted_graph_peak_mem_gb"] = float(predicted_graph_peak_mem_bytes) / float(1024**3)
+    schedule["meta"]["predicted_peak_mem_bytes"] = int(predicted_graph_peak_mem_bytes)
+    schedule["meta"]["predicted_peak_mem_gb"] = float(predicted_graph_peak_mem_bytes) / float(1024**3)
+    schedule["meta"]["predicted_peak_memory_scope"] = "graph_only_until_apply"
+    schedule["meta"]["predicted_peak_includes_persistent"] = False
     schedule["schedule_hash"] = _schedule_hash(schedule)
     return schedule
 
@@ -1977,7 +2014,7 @@ def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], pr
     if dist.get_rank() == 0:
         meta = schedule.get("meta", {})
         log_rank0(
-            f"[{NAME}] Planned schedule: L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} prefetch_calls={meta.get('prefetch_calls', None)} lookahead={meta.get('lookahead_blocks', None)} mem_budget_bytes={meta.get('mem_budget_bytes', None)}",
+            f"[{NAME}] Planned schedule: L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} prefetch_calls={meta.get('prefetch_calls', None)} lookahead={meta.get('lookahead_blocks', None)} predicted_graph_peak_mem_gb={meta.get('predicted_graph_peak_mem_gb', None)} mem_budget_bytes={meta.get('mem_budget_bytes', None)}",
             enable=True,
         )
 
@@ -2223,7 +2260,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 profile_peak = int(meta.get("peak_mem_bytes", 0))
                 total_mem = int(meta.get("total_mem_bytes", _min_total_mem_bytes_across_ranks()))
                 safe_total = int(total_mem)
-                allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes()))
+                allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes(total_mem)))
                 # run_opt_passes() calls empty_cache() before invoking this
                 # pass, so the current reserved-vs-alloc gap is a much better
                 # approximation of the allocator floor than the warmup-step
@@ -2340,6 +2377,22 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                     str(k): (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in persistent_select_meta.items()
                 }
                 meta["persistent_deferred"] = False
+                sched["meta"] = meta
+                predicted_graph_peak_mem_bytes = _predicted_peak_mem_bytes_from_schedule(sched, ds_id_to_size,
+                                                                                         ds_id_to_layer)
+                predicted_peak_baseline_offset_bytes = max(0, int(observed_peak_alloc) - int(profile_peak))
+                predicted_total_peak_mem_bytes = int(predicted_graph_peak_mem_bytes) + int(
+                    predicted_peak_baseline_offset_bytes)
+                meta["predicted_graph_peak_mem_bytes"] = int(predicted_graph_peak_mem_bytes)
+                meta["predicted_graph_peak_mem_gb"] = float(predicted_graph_peak_mem_bytes) / float(1024**3)
+                meta["predicted_peak_baseline_offset_bytes"] = int(predicted_peak_baseline_offset_bytes)
+                meta["predicted_peak_baseline_offset_gb"] = float(predicted_peak_baseline_offset_bytes) / float(1024**3)
+                meta["predicted_total_peak_mem_bytes"] = int(predicted_total_peak_mem_bytes)
+                meta["predicted_total_peak_mem_gb"] = float(predicted_total_peak_mem_bytes) / float(1024**3)
+                meta["predicted_peak_mem_bytes"] = int(predicted_total_peak_mem_bytes)
+                meta["predicted_peak_mem_gb"] = float(predicted_total_peak_mem_bytes) / float(1024**3)
+                meta["predicted_peak_memory_scope"] = "total_cuda_allocated"
+                meta["predicted_peak_includes_persistent"] = True
                 sched["meta"] = meta
                 sched["schedule_hash"] = _schedule_hash(sched)
 

@@ -16,6 +16,16 @@ from torch.utils.data import SequentialSampler
 
 from datasets.utils.logging import disable_progress_bar
 
+
+def distributed_max_int(value: int) -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return int(value)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    tensor = torch.tensor([int(value)], device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return int(tensor.item())
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-2-7b-hf")
@@ -231,6 +241,8 @@ def main():
     global_step = 0
     iter_times = []
     iter_times_by_step = {}
+    memory_report_start_step = 7
+    memory_peak_reset_done = False
 
     # See https://github.com/microsoft/DeepSpeed/issues/6793
     acc_context = nullcontext if is_deepspeed else accelerator.accumulate
@@ -247,20 +259,20 @@ def main():
                 # Start timing after the batch is already moved to device.
                 micro_start = time.time()
                 
-                with acc_context(model):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
-                    loss = outputs.loss
+                # with acc_context(model):
+                #     outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
+                #     loss = outputs.loss
 
                 # 解决batch size=1时，triton报错的问题
-                # with acc_context(model):
-                #     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                #     logits = outputs.logits
-                #     shift_labels = F.pad(input_ids, (0, 1), value=-100)[..., 1:].contiguous()
-                #     loss = F.cross_entropy(
-                #         logits.float().view(-1, logits.size(-1)),
-                #         shift_labels.view(-1).to(logits.device),
-                #         ignore_index=-100,
-                #     )
+                with acc_context(model):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                    logits = outputs.logits
+                    shift_labels = F.pad(input_ids, (0, 1), value=-100)[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        logits.float().view(-1, logits.size(-1)),
+                        shift_labels.view(-1).to(logits.device),
+                        ignore_index=-100,
+                    )
 
                     update_step = (is_deepspeed and model.is_gradient_accumulation_boundary()) \
                         or (not is_deepspeed and accelerator.sync_gradients)
@@ -280,6 +292,9 @@ def main():
                         iter_times.append(step_time)
                         iter_times_by_step[int(global_step)] = float(step_time)
                         step_compute_time = 0.0
+                        if (not memory_peak_reset_done) and global_step >= memory_report_start_step - 1:
+                            torch.cuda.reset_peak_memory_stats()
+                            memory_peak_reset_done = True
                     else:
                         step_compute_time += time.time() - micro_start
 
@@ -299,6 +314,10 @@ def main():
     if not report_times:
         report_times = iter_times
 
+    alloc_bytes = int(torch.cuda.memory_allocated())
+    peak_bytes = int(torch.cuda.max_memory_allocated())
+    peak_global_bytes = distributed_max_int(peak_bytes)
+
     if accelerator.is_main_process:
         compile_time_sum = 0
         compile_time = 0
@@ -307,9 +326,46 @@ def main():
             compile_time_sum = sum(t for _, _, _, t in compile_time)
 
         is_deepcompile = is_deepspeed and model._config.compile_config.deepcompile
-        alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-        peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(report_times) / len(report_times):.4f} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB"
+        alloc_gb = float(alloc_bytes) / (1024**3)
+        peak_gb = float(peak_bytes) / (1024**3)
+        peak_global_gb = float(peak_global_bytes) / (1024**3)
+
+        predicted_peak = ""
+        try:
+            from deepspeed.compile.passes import global_layer_scheduler
+            schedule = getattr(global_layer_scheduler, "_LATEST_SCHEDULE", None)
+            if schedule:
+                meta = schedule.get("meta", {})
+                predicted_total_peak_bytes = int(
+                    meta.get("predicted_total_peak_mem_bytes", meta.get("predicted_peak_mem_bytes", 0)))
+                predicted_total_peak_gb = float(
+                    meta.get("predicted_total_peak_mem_gb", meta.get("predicted_peak_mem_gb", 0.0)))
+                predicted_graph_peak_bytes = int(meta.get("predicted_graph_peak_mem_bytes", 0))
+                predicted_graph_peak_gb = float(meta.get("predicted_graph_peak_mem_gb", 0.0))
+                predicted_baseline_offset_bytes = int(meta.get("predicted_peak_baseline_offset_bytes", 0))
+                predicted_baseline_offset_gb = float(meta.get("predicted_peak_baseline_offset_gb", 0.0))
+                if predicted_total_peak_gb > 0.0 or predicted_total_peak_bytes > 0:
+                    prediction_error_bytes = int(peak_global_bytes) - int(predicted_total_peak_bytes)
+                    prediction_error_gb = float(prediction_error_bytes) / (1024**3)
+                    prediction_error_pct = (
+                        abs(float(prediction_error_bytes)) / float(peak_global_bytes) * 100.0
+                        if int(peak_global_bytes) > 0 else 0.0
+                    )
+                    predicted_peak = (
+                        f" predicted_total_peak_mem: {predicted_total_peak_gb:.2f} GB"
+                        f" predicted_total_peak_mem_bytes: {predicted_total_peak_bytes}"
+                        f" predicted_graph_peak_mem: {predicted_graph_peak_gb:.2f} GB"
+                        f" predicted_graph_peak_mem_bytes: {predicted_graph_peak_bytes}"
+                        f" predicted_peak_baseline_offset: {predicted_baseline_offset_gb:.2f} GB"
+                        f" predicted_peak_baseline_offset_bytes: {predicted_baseline_offset_bytes}"
+                        f" prediction_error: {prediction_error_gb:.2f} GB"
+                        f" prediction_error_bytes: {prediction_error_bytes}"
+                        f" prediction_abs_error_pct: {prediction_error_pct:.2f}"
+                    )
+        except Exception:
+            predicted_peak = ""
+
+        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(report_times) / len(report_times):.4f} alloc_mem: {alloc_gb:.2f} GB peak_mem: {peak_gb:.2f} GB peak_mem_global: {peak_global_gb:.2f} GB peak_mem_global_bytes: {peak_global_bytes} memory_peak_start_step: {memory_report_start_step}{predicted_peak}"
         print(msg)
 
         if args.profile_dir:
