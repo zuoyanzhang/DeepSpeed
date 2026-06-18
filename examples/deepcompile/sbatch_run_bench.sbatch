@@ -37,5 +37,10 @@ if [ -z "${MASTER_ADDR:-}" ]; then
 fi
 export MASTER_PORT=${MASTER_PORT:-$((15000 + RANDOM % 10000))}
 
+# export DS_DEEPCOMPILE_GLS_DISABLE_GLOBAL_SCHEDULING=1
+# export DS_DEEPCOMPILE_GLS_DISABLE_STEP_LOCAL_KEEP=1
+# export DS_DEEPCOMPILE_GLS_DISABLE_FUSED_PREFETCH=1
+# export DS_DEEPCOMPILE_GLS_DISABLE_PERSISTENT=1
+
 # 运行基准脚本（多节点启动由 run_multinode.sh 内部的 srun 负责）
 bash ./run_bench.sh

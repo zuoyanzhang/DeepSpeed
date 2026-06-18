@@ -263,8 +263,52 @@ def _estimate_non_torch_mem_bytes() -> int:
         return 0
 
 
-def _allocator_margin_bytes() -> int:
-    return max(0, int(os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", 4 * 1024 * 1024 * 1024)))
+def _allocator_margin_bytes(total_mem_bytes: Optional[int] = None) -> int:
+    explicit_margin = os.getenv("DS_DEEPCOMPILE_GLS_ALLOCATOR_MARGIN_BYTES", "").strip()
+    if explicit_margin:
+        return max(0, int(explicit_margin))
+
+    total_mem = int(total_mem_bytes) if total_mem_bytes is not None else _min_total_mem_bytes_across_ranks()
+    usable_fraction = float(os.getenv("DS_DEEPCOMPILE_GLS_USABLE_MEMORY_FRACTION", "0.9"))
+    usable_fraction = max(0.0, min(1.0, usable_fraction))
+    return max(0, int(float(total_mem) * (1.0 - usable_fraction)))
+
+
+def _env_flag(*names: str) -> bool:
+    for name in names:
+        value = os.getenv(name, "")
+        if str(value).strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def _disable_global_scheduling() -> bool:
+    return _env_flag("CHORUS_DISABLE_GLOBAL_SCHEDULING", "DS_DEEPCOMPILE_GLS_DISABLE_GLOBAL_SCHEDULING")
+
+
+def _disable_step_local_keep() -> bool:
+    return _env_flag("CHORUS_DISABLE_STEP_LOCAL_KEEP", "DS_DEEPCOMPILE_GLS_DISABLE_STEP_LOCAL_KEEP")
+
+
+def _disable_fused_prefetch() -> bool:
+    return _env_flag("CHORUS_DISABLE_FUSED_PREFETCH", "DS_DEEPCOMPILE_GLS_DISABLE_FUSED_PREFETCH")
+
+
+def _disable_persistent() -> bool:
+    return _env_flag("CHORUS_DISABLE_PERSISTENT", "DS_DEEPCOMPILE_GLS_DISABLE_PERSISTENT")
+
+
+def _local_keep_max_layers(L: int) -> int:
+    default = max(1, int(L) // 8) if int(L) > 0 else 0
+    for name in ("CHORUS_LOCAL_KEEP_MAX_LAYERS", "DS_DEEPCOMPILE_GLS_LOCAL_KEEP_MAX_LAYERS"):
+        value = os.getenv(name, "").strip()
+        if not value:
+            continue
+        try:
+            return max(0, min(int(L), int(value)))
+        except Exception:
+            continue
+    return int(default)
 
 
 def _build_ds_id_to_size_bytes(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Dict[int, int]:
@@ -518,15 +562,23 @@ def _persistent_increment_blocks_for_ds_id(ds_id: int, sched: dict, ds_id_to_lay
     f_deadline = int(layer)
     b_deadline = int(K - 1 - int(layer))
     keep_layers = set(map(int, sched.get("keep_layers", [])))
+    blocks: List[int] = []
+
+    # A persistent gathered buffer is allocated for the whole step. It only
+    # replaces the normal scheduled allgather buffer while that buffer would
+    # already be live, so every block before the scheduled FWD prefetch is an
+    # additional memory increment and must be charged to the block caps.
+    if int(start_f) > 0:
+        blocks.extend(range(0, int(start_f)))
 
     if int(layer) in keep_layers:
         extra_start = int(b_deadline + 1)
         if extra_start > int(K - 1):
-            return ()
-        return tuple(range(extra_start, K))
+            return tuple(blocks)
+        blocks.extend(range(extra_start, K))
+        return tuple(blocks)
 
     start_b = per_task_start.get(f"layer.{int(layer)}.BWD")
-    blocks: List[int] = []
     if start_b is None:
         if int(f_deadline + 1) <= int(K - 1):
             blocks.extend(range(int(f_deadline + 1), K))
@@ -822,7 +874,8 @@ def _build_comm_groups(tasks: Sequence[_Task],
                        ds_id_to_size: Dict[int, int],
                        cfg: _SchedulerConfig,
                        *,
-                       fuse_deadline_window_blocks: Optional[int] = None) -> Tuple[Dict[int, List[List[int]]], Dict[int, List[_CommGroup]]]:
+                       fuse_deadline_window_blocks: Optional[int] = None,
+                       allow_fused_prefetch: bool = True) -> Tuple[Dict[int, List[List[int]]], Dict[int, List[_CommGroup]]]:
     # launches[start_k] -> list[list[ds_id]] (one list per fused prefetch call)
     tasks_by_start: Dict[int, List[_Task]] = {}
     for t in tasks:
@@ -902,6 +955,12 @@ def _build_comm_groups(tasks: Sequence[_Task],
             cur_deadline = None
 
         for t in ts:
+            if not bool(allow_fused_prefetch):
+                cur_tasks = [t]
+                cur_bytes = int(t.size_bytes)
+                cur_deadline = int(t.deadline_k)
+                flush()
+                continue
             if not cur_tasks:
                 cur_tasks = [t]
                 cur_bytes = int(t.size_bytes)
@@ -1021,6 +1080,7 @@ def _solve_milp_schedule(
     cfg: _SchedulerConfig,
     comm_model: _CommModel,
     forced_keep_layers: Optional[Set[int]] = None,
+    allow_keep_layers: bool = True,
 ) -> Tuple[Set[int], Dict[Tuple[int, str], int], dict]:
     # MILP model (HiGHS via SciPy) chooses:
     # - keep_layers (step-level keep-unshard)
@@ -1121,7 +1181,9 @@ def _solve_milp_schedule(
         if li not in active_layers:
             ub[keep_idx[li]] = 0.0
             continue
-        if forced_keep_layers is not None and li in forced_keep_layers:
+        if not bool(allow_keep_layers):
+            ub[keep_idx[li]] = 0.0
+        elif forced_keep_layers is not None and li in forced_keep_layers:
             lb[keep_idx[li]] = 1.0
             ub[keep_idx[li]] = 1.0
         else:
@@ -1134,7 +1196,7 @@ def _solve_milp_schedule(
             ub[j] = 1.0
         for _, j in xB_idx[li].items():
             integrality[j] = 1
-            if forced_keep_layers is not None and li in forced_keep_layers:
+            if bool(allow_keep_layers) and forced_keep_layers is not None and li in forced_keep_layers:
                 ub[j] = 0.0
             else:
                 ub[j] = 1.0
@@ -1514,8 +1576,13 @@ def _evaluate_plan_ms(*,
                       keep_layers: Set[int],
                       comm_model: _CommModel,
                       ds_id_to_size: Dict[int, int],
-                      cfg: _SchedulerConfig) -> Tuple[float, Dict[int, List[List[int]]]]:
-    launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg)
+                      cfg: _SchedulerConfig,
+                      allow_fused_prefetch: bool = True) -> Tuple[float, Dict[int, List[List[int]]]]:
+    launches, groups_by_start = _build_comm_groups(tasks,
+                                                   comm_model,
+                                                   ds_id_to_size,
+                                                   cfg,
+                                                   allow_fused_prefetch=allow_fused_prefetch)
     step_ms, _, _, _ = _simulate_schedule_in_graph_order(blocks,
                                                          groups_by_start,
                                                          keep_layers,
@@ -1534,6 +1601,7 @@ def _refine_plan_local_search(*,
                               keep_layers: Set[int],
                               per_task_start: Dict[Tuple[int, str], int],
                               persistent_set: Set[int],
+                              allow_fused_prefetch: bool = True,
                               ds_id_to_wait_pos_fwd: Optional[Dict[int, int]] = None,
                               ds_id_to_wait_pos_bwd: Optional[Dict[int, int]] = None) -> Tuple[Dict[Tuple[int, str], int], dict]:
     max_iters = int(cfg.inner_refine_max_iters)
@@ -1565,7 +1633,8 @@ def _refine_plan_local_search(*,
                                    keep_layers=keep_layers,
                                    comm_model=comm_model,
                                    ds_id_to_size=ds_id_to_size,
-                                   cfg=cfg)
+                                   cfg=cfg,
+                                   allow_fused_prefetch=allow_fused_prefetch)
     start_ms = float(best_ms)
 
     it = 0
@@ -1620,7 +1689,8 @@ def _refine_plan_local_search(*,
                                                keep_layers=keep_layers,
                                                comm_model=comm_model,
                                                ds_id_to_size=ds_id_to_size,
-                                               cfg=cfg)
+                                               cfg=cfg,
+                                               allow_fused_prefetch=allow_fused_prefetch)
                 improved = float(cand_ms) < float(best_ms) - float(min_gain)
                 if improved:
                     if best_move is None:
@@ -1645,6 +1715,98 @@ def _refine_plan_local_search(*,
     }
 
 
+def _build_local_layer_order_plan(*,
+                                  L: int,
+                                  blocks: Sequence[_BlockProfile],
+                                  layer_to_ds_ids: Sequence[Sequence[int]],
+                                  ds_id_to_size: Dict[int, int],
+                                  cfg: _SchedulerConfig,
+                                  comm_model: _CommModel,
+                                  persistent_set: Set[int],
+                                  ds_id_to_allgather_ms: Dict[int, float],
+                                  allow_keep_layers: bool = True,
+                                  ds_id_to_wait_pos_fwd: Optional[Dict[int, int]] = None,
+                                  ds_id_to_wait_pos_bwd: Optional[Dict[int, int]] = None
+                                  ) -> Tuple[Set[int], Dict[Tuple[int, str], int], dict]:
+    active_layers: List[int] = []
+    layer_sizes: Dict[int, int] = {}
+    layer_values: Dict[int, float] = {}
+    for li in range(L):
+        ids = sorted(set(int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size))
+        size = int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids))
+        if not ids or size <= 0:
+            continue
+        active_layers.append(int(li))
+        layer_sizes[int(li)] = int(size)
+        prof_value = float(sum(float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)) for ds_id in ids))
+        model_value = float(comm_model.alpha_ms) * float(len(ids)) + float(comm_model.beta_ms_per_byte) * float(size)
+        layer_values[int(li)] = max(0.0, prof_value, model_value)
+
+    def make_starts(keep_layers: Set[int], lookahead: int) -> Dict[Tuple[int, str], int]:
+        starts: Dict[Tuple[int, str], int] = {}
+        for li in active_layers:
+            starts[(int(li), "FWD")] = max(0, int(li) - int(lookahead))
+            if int(li) in keep_layers:
+                continue
+            b_deadline = int(2 * L - 1 - int(li))
+            starts[(int(li), "BWD")] = max(int(li) + 1, int(b_deadline) - int(lookahead))
+        return starts
+
+    def build_tasks(keep_layers: Set[int],
+                    starts: Dict[Tuple[int, str], int]) -> List[_Task]:
+        return _build_tasks_from_plan(L=L,
+                                      layer_to_ds_ids=layer_to_ds_ids,
+                                      ds_id_to_size=ds_id_to_size,
+                                      keep_layers=keep_layers,
+                                      per_task_start=starts,
+                                      persistent_set=persistent_set,
+                                      ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                      ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+
+    # Local-order policy: launch each layer at most one layer before its use.
+    # If even that is too aggressive for the profiled memory caps, fall back to
+    # just-in-time launch at the layer deadline.
+    lookahead = 1
+    keep_layers: Set[int] = set()
+    per_task_start = make_starts(keep_layers, lookahead)
+    if not _is_mem_feasible(build_tasks(keep_layers, per_task_start), blocks):
+        lookahead = 0
+        per_task_start = make_starts(keep_layers, lookahead)
+
+    keep_candidates = sorted(
+        active_layers,
+        key=lambda li: (float(layer_values.get(int(li), 0.0)) / max(1, int(layer_sizes.get(int(li), 0))),
+                        float(layer_values.get(int(li), 0.0)), int(layer_sizes.get(int(li), 0)), -int(li)),
+        reverse=True,
+    )
+    max_keep_layers = _local_keep_max_layers(L) if bool(allow_keep_layers) else 0
+
+    selected_keep: List[int] = []
+    for li in keep_candidates:
+        if len(keep_layers) >= int(max_keep_layers):
+            break
+        if float(layer_values.get(int(li), 0.0)) <= 0.0:
+            continue
+        cand_keep = set(keep_layers)
+        cand_keep.add(int(li))
+        cand_starts = make_starts(cand_keep, lookahead)
+        cand_tasks = build_tasks(cand_keep, cand_starts)
+        if not _is_mem_feasible(cand_tasks, blocks):
+            continue
+        keep_layers = cand_keep
+        per_task_start = cand_starts
+        selected_keep.append(int(li))
+
+    return keep_layers, per_task_start, {
+        "method": "local_layer_order",
+        "status": "global_scheduling_disabled",
+        "local_lookahead_blocks": int(lookahead),
+        "local_keep_max_layers": int(max_keep_layers),
+        "active_layers": int(len(active_layers)),
+        "selected_keep_layers": [int(x) for x in selected_keep],
+    }
+
+
 def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, DSGraphParamManager]) -> Optional[dict]:
     if _CFG is None or _LAYER_MAPPING is None:
         return None
@@ -1660,7 +1822,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     total_mem = _min_total_mem_bytes_across_ranks()
     peak_mem = _peak_mem_bytes(profiling_results)
     mem_budget_bytes = max(0, int(total_mem) - int(peak_mem))
-    allocator_margin_bytes = _allocator_margin_bytes()
+    allocator_margin_bytes = _allocator_margin_bytes(total_mem)
 
     prof = profiling_results.get(graph_id)
     if prof is None or getattr(prof, "fwd_graph", None) is None or getattr(prof, "bwd_graph", None) is None:
@@ -1775,28 +1937,53 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     lookahead_blocks = _lookahead_blocks_for_num_layers(L)
     max_tasks_per_block = _max_tasks_per_block_for_num_layers(L)
     cfg_used = replace(cfg, lookahead_blocks=int(lookahead_blocks), max_tasks_per_block=int(max_tasks_per_block))
+    global_scheduling_disabled = _disable_global_scheduling()
+    step_local_keep_disabled = _disable_step_local_keep()
+    fused_prefetch_disabled = _disable_fused_prefetch()
+    allow_keep_layers = not bool(step_local_keep_disabled)
+    allow_fused_prefetch = not bool(fused_prefetch_disabled)
+    if fused_prefetch_disabled:
+        cfg_used = replace(cfg_used, fuse_deadline_window_blocks=0, fuse_factor=1.0)
 
-    keep_layers, per_task_start, milp_meta = _solve_milp_schedule(L=L,
-                                                                  blocks=blocks,
-                                                                  layer_to_ds_ids=layer_to_ds_ids,
-                                                                  ds_id_to_size=ds_id_to_size,
-                                                                  cfg=cfg_used,
-                                                                  comm_model=comm_model,
-                                                                  forced_keep_layers=forced_keep_layers)
+    if global_scheduling_disabled:
+        keep_layers, per_task_start, milp_meta = _build_local_layer_order_plan(
+            L=L,
+            blocks=blocks,
+            layer_to_ds_ids=layer_to_ds_ids,
+            ds_id_to_size=ds_id_to_size,
+            cfg=cfg_used,
+            comm_model=comm_model,
+            persistent_set=persistent_set,
+            ds_id_to_allgather_ms=ds_id_to_allgather_ms,
+            allow_keep_layers=allow_keep_layers,
+            ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+            ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd,
+        )
+        refine_meta: dict = {"iters": 0, "skipped": "global_scheduling_disabled"}
+    else:
+        keep_layers, per_task_start, milp_meta = _solve_milp_schedule(L=L,
+                                                                      blocks=blocks,
+                                                                      layer_to_ds_ids=layer_to_ds_ids,
+                                                                      ds_id_to_size=ds_id_to_size,
+                                                                      cfg=cfg_used,
+                                                                      comm_model=comm_model,
+                                                                      forced_keep_layers=forced_keep_layers,
+                                                                      allow_keep_layers=allow_keep_layers)
 
-    refine_meta: dict = {"iters": 0}
-    if int(cfg_used.inner_refine_max_iters) > 0:
-        per_task_start, refine_meta = _refine_plan_local_search(L=L,
-                                                                blocks=blocks,
-                                                                layer_to_ds_ids=layer_to_ds_ids,
-                                                                ds_id_to_size=ds_id_to_size,
-                                                                cfg=cfg_used,
-                                                                comm_model=comm_model,
-                                                                keep_layers=keep_layers,
-                                                                per_task_start=per_task_start,
-                                                                persistent_set=persistent_set,
-                                                                ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
-                                                                ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+        refine_meta = {"iters": 0}
+        if int(cfg_used.inner_refine_max_iters) > 0:
+            per_task_start, refine_meta = _refine_plan_local_search(L=L,
+                                                                    blocks=blocks,
+                                                                    layer_to_ds_ids=layer_to_ds_ids,
+                                                                    ds_id_to_size=ds_id_to_size,
+                                                                    cfg=cfg_used,
+                                                                    comm_model=comm_model,
+                                                                    keep_layers=keep_layers,
+                                                                    per_task_start=per_task_start,
+                                                                    persistent_set=persistent_set,
+                                                                    allow_fused_prefetch=allow_fused_prefetch,
+                                                                    ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                                                    ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
 
     tasks = _build_tasks_from_plan(L=L,
                                    layer_to_ds_ids=layer_to_ds_ids,
@@ -1810,7 +1997,11 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     if not _is_mem_feasible(tasks, blocks):
         return None
 
-    launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg_used)
+    launches, groups_by_start = _build_comm_groups(tasks,
+                                                   comm_model,
+                                                   ds_id_to_size,
+                                                   cfg_used,
+                                                   allow_fused_prefetch=allow_fused_prefetch)
     step_ms, stall_ms_per_block, stall_bwd_per_layer, _ = _simulate_schedule_in_graph_order(
         blocks,
         groups_by_start,
@@ -1819,9 +2010,12 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     )
     reserved_mem = _reserved_mem_by_block(tasks, K)
     total_prefetch_calls = int(sum(len(v) for v in launches.values()))
+    effective_lookahead_blocks = int(
+        milp_meta.get("local_lookahead_blocks", cfg_used.lookahead_blocks)
+        if global_scheduling_disabled else cfg_used.lookahead_blocks)
 
     trials: List[dict] = [{
-        "lookahead_blocks": int(lookahead_blocks),
+        "lookahead_blocks": int(effective_lookahead_blocks),
         "status": "ok",
         "predicted_step_ms": float(step_ms),
         "prefetch_calls": int(total_prefetch_calls),
@@ -1864,7 +2058,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "fixed_comm_ms": [float(b.fixed_comm_ms) for b in blocks],
         },
         "meta": {
-            "lookahead_blocks": int(cfg_used.lookahead_blocks),
+            "lookahead_blocks": int(effective_lookahead_blocks),
             "lookahead_trials": trials,
             "fuse_max_bytes": int(cfg_used.fuse_max_bytes),
             "fuse_deadline_window_blocks": int(used_fuse_window),
@@ -1873,6 +2067,10 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "inner_refine_max_iters": int(cfg_used.inner_refine_max_iters),
             "inner_refine_min_gain_ms": float(cfg_used.inner_refine_min_gain_ms),
             "inner_refine": best_refine_meta,
+            "global_scheduling_disabled": bool(global_scheduling_disabled),
+            "step_local_keep_disabled": bool(step_local_keep_disabled),
+            "fused_prefetch_disabled": bool(fused_prefetch_disabled),
+            "scheduler_policy": "local_layer_order" if global_scheduling_disabled else "global_milp",
             "total_mem_bytes": int(total_mem),
             "peak_mem_bytes": int(peak_mem),
             "mem_budget_bytes": int(mem_budget_bytes),
@@ -1977,7 +2175,7 @@ def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], pr
     if dist.get_rank() == 0:
         meta = schedule.get("meta", {})
         log_rank0(
-            f"[{NAME}] Planned schedule: L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} prefetch_calls={meta.get('prefetch_calls', None)} lookahead={meta.get('lookahead_blocks', None)} mem_budget_bytes={meta.get('mem_budget_bytes', None)}",
+            f"[{NAME}] Planned schedule: policy={meta.get('scheduler_policy', 'unknown')} step_local_keep_disabled={meta.get('step_local_keep_disabled', False)} fused_prefetch_disabled={meta.get('fused_prefetch_disabled', False)} L={schedule['L']} keep_layers={len(schedule['keep_layers'])} keep_ds_ids={len(schedule['keep_ds_ids'])} launches={len(schedule['launches'])} prefetch_calls={meta.get('prefetch_calls', None)} lookahead={meta.get('lookahead_blocks', None)} local_keep_max_layers={meta.get('milp', {}).get('local_keep_max_layers', None)} mem_budget_bytes={meta.get('mem_budget_bytes', None)}",
             enable=True,
         )
 
@@ -2223,7 +2421,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 profile_peak = int(meta.get("peak_mem_bytes", 0))
                 total_mem = int(meta.get("total_mem_bytes", _min_total_mem_bytes_across_ranks()))
                 safe_total = int(total_mem)
-                allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes()))
+                allocator_margin_bytes = int(meta.get("allocator_margin_bytes", _allocator_margin_bytes(total_mem)))
                 # run_opt_passes() calls empty_cache() before invoking this
                 # pass, so the current reserved-vs-alloc gap is a much better
                 # approximation of the allocator floor than the warmup-step
@@ -2301,6 +2499,16 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 ds_id_to_layer = {int(k): int(v) for k, v in meta.get("ds_id_to_layer", {}).items()}
                 persistent_ds_ids, persistent_mem_bytes, persistent_value_ms, persistent_select_meta = _select_persistent_ds_ids_block_safe(
                     candidates, ds_id_to_size, persistent_budget_bytes, sched, ds_id_to_layer, ds_id_to_value)
+                persistent_disabled = _disable_persistent()
+                if persistent_disabled:
+                    persistent_ds_ids = []
+                    persistent_mem_bytes = 0
+                    persistent_value_ms = 0.0
+                    persistent_budget_bytes = 0
+                    persistent_select_meta = {
+                        "method": "disabled",
+                        "status": "persistent_disabled",
+                    }
                 if dist.get_rank() == 0:
                     log_rank0(
                         f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
@@ -2339,6 +2547,7 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 meta["persistent_selection"] = {
                     str(k): (float(v) if isinstance(v, (int, float)) else str(v)) for k, v in persistent_select_meta.items()
                 }
+                meta["persistent_disabled"] = bool(persistent_disabled)
                 meta["persistent_deferred"] = False
                 sched["meta"] = meta
                 sched["schedule_hash"] = _schedule_hash(sched)
