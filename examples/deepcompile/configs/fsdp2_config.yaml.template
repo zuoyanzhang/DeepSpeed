@@ -1,0 +1,29 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+fsdp_config:
+  fsdp_version: 2
+  fsdp_reshard_after_forward: {{ fsdp2_reshard_after_forward }}
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  {%- if 'Qwen3' in model %}
+  fsdp_transformer_layer_cls_to_wrap: Qwen3DecoderLayer
+  {%- elif 'Baichuan' in model %}
+  fsdp_transformer_layer_cls_to_wrap: BaichuanLayer
+  {%- elif 'Llama' in model or 'llama' in model %}
+  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  {%- endif %}
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_offload_params: false
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_activation_checkpointing: false
+machine_rank: {{ machine_rank }}
+main_training_function: main
+mixed_precision: bf16
+num_machines: {{ num_machines }}
+num_processes: {{ num_processes }}
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

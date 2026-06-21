@@ -14,6 +14,9 @@ def get_args():
     parser.add_argument('--num_machines', type=int, help='num_machines')
     parser.add_argument('--num_processes', type=int, help='num_processes')
     parser.add_argument('--zero_stage', type=int, choices=[0, 1, 2, 3], help='ZeRO stage')
+    parser.add_argument('--model', type=str, default='', help='Model name for model-specific templates')
+    parser.add_argument('--fsdp2_reshard_after_forward', type=str, default='true',
+                        help='FSDP2 reshard_after_forward value for templates')
     parser.add_argument('--fp16', action='store_true', help='Use fp16')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--deepcompile', action='store_true', help='Use deepcompile')
@@ -38,6 +41,8 @@ def main(args):
                                 num_machines=args.num_machines,
                                 num_processes=args.num_processes,
                                 zero_stage=args.zero_stage,
+                                model=args.model,
+                                fsdp2_reshard_after_forward=args.fsdp2_reshard_after_forward,
                                 fp16=args.fp16,
                                 gradient_accumulation_steps=args.gradient_accumulation_steps,
                                 deepcompile=str(args.deepcompile).lower(),

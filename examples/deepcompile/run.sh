@@ -22,6 +22,7 @@ DEBUG_LOG=0
 SYNC_BEFORE_REDUCE=0
 SYNC_AFTER_REDUCE=0
 SYNC_BEFORE_ALLGATHER=0
+FSDP2_RESHARD_AFTER_FORWARD=${FSDP2_RESHARD_AFTER_FORWARD:-true}
 SYNC_AFTER_ALLGATHER=0
 
 echo "NUM_NODES: ${NUM_NODES} NGPUS_PER_NODE: ${NGPUS_PER_NODE} NUM_PROCESSES: ${NUM_PROCESSES}"
@@ -81,6 +82,14 @@ while [[ $# -gt 0 ]]; do
         --passes)
             PASSES="$2"
             EXTRA_OPTS="${EXTRA_OPTS} $1 $2"
+            shift 2
+            ;;
+        --fsdp2-fast|--fsdp2-no-reshard-after-forward)
+            FSDP2_RESHARD_AFTER_FORWARD=false
+            shift
+            ;;
+        --fsdp2-reshard-after-forward)
+            FSDP2_RESHARD_AFTER_FORWARD="$2"
             shift 2
             ;;
         --profile)
@@ -162,6 +171,10 @@ fi
 CONFIG_TEMPLATE=configs/ds_config.yaml.template
 if [ "${BACKEND}" == "fsdp" ]; then
     CONFIG_TEMPLATE=configs/fsdp_config.yaml.template
+elif [ "${BACKEND}" == "fsdp2" ]; then
+    CONFIG_TEMPLATE=configs/fsdp2_config.yaml.template
+elif [ "${BACKEND}" == "simplefsdp" ]; then
+    CONFIG_TEMPLATE=configs/simplefsdp_config.yaml.template
 elif [ "${BACKEND}" == "ddp" ]; then
     CONFIG_TEMPLATE=configs/ddp_config.yaml.template
 elif [ "${BACKEND}" == "singlegpu" ]; then
@@ -190,6 +203,8 @@ python generate_conf.py \
     --num_machines ${NUM_NODES} \
     --num_processes ${NUM_PROCESSES} \
     --zero_stage ${ZERO_STAGE} \
+    --model "${MODEL}" \
+    --fsdp2_reshard_after_forward ${FSDP2_RESHARD_AFTER_FORWARD} \
     --template_file ${CONFIG_TEMPLATE} \
     --output_file configs/config.yaml
 
@@ -231,6 +246,8 @@ if [ "${BACKEND}" == "deepspeed" ]; then
         --num_machines ${NUM_NODES} \
         --num_processes ${NUM_PROCESSES} \
         --zero_stage ${ZERO_STAGE} \
+        --model "${MODEL}" \
+        --fsdp2_reshard_after_forward ${FSDP2_RESHARD_AFTER_FORWARD} \
         --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
         ${DEEPCOMPILE_OPTS} ${DEBUG_LOG_OPTS} \
         ${SYNC_BEFORE_REDUCE_OPTS} ${SYNC_AFTER_REDUCE_OPTS} \
@@ -249,12 +266,13 @@ echo "Logging to ${LOG_FILE}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 
-${HOME}/.conda/envs/py310/bin/accelerate launch --main_process_ip ${HOST_IP} --main_process_port ${HOST_PORT} \
+accelerate launch --main_process_ip ${HOST_IP} --main_process_port ${HOST_PORT} \
 --num_machines ${NUM_NODES} --num_processes ${NUM_PROCESSES} --machine_rank ${MACHINE_RANK} \
 --config_file configs/config.yaml \
 run_bench_lm.py \
 --model_name "${MODEL}" \
 --zero_stage ${ZERO_STAGE} \
+--distributed_backend ${BACKEND} \
 ${GAS_OPTS} \
 ${EXTRA_OPTS} \
 2>&1 | tee ${LOG_FILE}
