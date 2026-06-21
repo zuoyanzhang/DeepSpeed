@@ -14,7 +14,7 @@ TORCH_LIBRARY(dc, m)
     m.def("allgather_param_chunk(Tensor a, int graph_id, int id, int offset, int length, int stride = 0, int chunk_count = 1, ScalarType? dtype = None) -> Tensor");
     m.def(
         "prefetch_params_fused(int graph_id, Tensor[] params, int[] ids,"
-        "                      ScalarType[]? dtypes = None) -> ()");
+        "                      ScalarType[]? dtypes = None, bool grouped = False) -> ()");
     m.def("wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)");
     m.def("wait_allgather_chunk(Tensor(a) a, int graph_id, int id, int offset, int length, int stride = 0, int chunk_count = 1) -> Tensor(a)");
     m.def("release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)");
@@ -92,6 +92,8 @@ TORCH_LIBRARY_IMPL(dc, Undefined, m) { m.impl("end_backward", &dc::end_backward)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("set_persistent", &dc::set_persistent, "Set persistent flag for a parameter");
+    m.def("set_chorus_persistent", &dc::set_chorus_persistent, "Set Chorus persistent flag for a parameter");
+    m.def("refresh_chorus_persistent", &dc::refresh_chorus_persistent, "Asynchronously refresh Chorus persistent parameters");
     m.def("enable_profiling", &dc::enable_profiling, "Enable profiling");
     m.def("is_profiling", &dc::is_profiling, "Check if profiling is enabled");
     m.def("init", &dc::init, "Set the process group");

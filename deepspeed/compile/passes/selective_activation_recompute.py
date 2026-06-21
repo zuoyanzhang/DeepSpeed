@@ -65,6 +65,7 @@ _CFG: Optional[_RecomputeConfig] = None
 _LAYER_MAPPING: Optional[_LayerMapping] = None
 _LAYER_MODULES: Dict[int, torch.nn.Module] = {}
 _NON_CANDIDATE_GC_MODULES: List[torch.nn.Module] = []
+_MODULE_ID_TO_LAYER: Dict[int, int] = {}
 _SELECTED_LAYERS: Set[int] = set()
 _LATEST_PLAN: Optional[dict] = None
 _APPLY_LOGGED: bool = False
@@ -110,6 +111,20 @@ def _contains_pass(schedule, suffix: str) -> bool:
 def _make_checkpoint_func():
     # Always use non-reentrant checkpointing.
     return functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+
+
+def _make_selective_checkpoint_func():
+    checkpoint_fn = _make_checkpoint_func()
+
+    def selective_checkpoint(function, *args, **kwargs):
+        raw_function = getattr(function, "func", function)
+        module = getattr(raw_function, "__self__", None)
+        layer_idx = _MODULE_ID_TO_LAYER.get(id(module)) if module is not None else None
+        if layer_idx is not None and int(layer_idx) not in _SELECTED_LAYERS:
+            return function(*args, **kwargs)
+        return checkpoint_fn(function, *args, **kwargs)
+
+    return selective_checkpoint
 
 
 def _max_int64_across_ranks(v: int) -> int:
@@ -182,15 +197,19 @@ def _set_layer_checkpoint_selection(selected_layers: Iterable[int]) -> None:
         return
 
     checkpoint_fn = _make_checkpoint_func()
+    selective_checkpoint_fn = _make_selective_checkpoint_func()
 
     for layer_idx, module in _LAYER_MODULES.items():
+        # Some HF models checkpoint in the parent model loop rather than inside
+        # each decoder layer. Setting these attrs is useful for layer-local
+        # implementations and harmless for parent-controlled implementations.
         module.gradient_checkpointing = int(layer_idx) in selected
         module._gradient_checkpointing_func = checkpoint_fn
 
     non_candidate_enabled = bool(selected)
     for module in _NON_CANDIDATE_GC_MODULES:
         module.gradient_checkpointing = non_candidate_enabled
-        module._gradient_checkpointing_func = checkpoint_fn
+        module._gradient_checkpointing_func = selective_checkpoint_fn
 
 
 def _refine_plan_with_runtime_peak(plan: dict) -> dict:
@@ -671,7 +690,7 @@ def _dump_plan_if_enabled(plan: dict) -> None:
 
 
 def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -> None:
-    global _CFG, _LAYER_MAPPING, _LAYER_MODULES, _NON_CANDIDATE_GC_MODULES, _LATEST_PLAN, _APPLY_LOGGED, _PRESSURE_RATIO
+    global _CFG, _LAYER_MAPPING, _LAYER_MODULES, _NON_CANDIDATE_GC_MODULES, _MODULE_ID_TO_LAYER, _LATEST_PLAN, _APPLY_LOGGED, _PRESSURE_RATIO
 
     should_enable = bool(getattr(compile_config, "selective_activation_recompute", False))
     if not should_enable:
@@ -728,8 +747,6 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
         layer_idx = _infer_layer_idx(name, module_regexes)
         if layer_idx is None:
             continue
-        if not hasattr(module, "gradient_checkpointing"):
-            continue
         prev_name = layer_to_name.get(int(layer_idx))
         if prev_name is not None and len(prev_name) <= len(name):
             continue
@@ -741,6 +758,7 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
         _LAYER_MAPPING = None
         _LAYER_MODULES = {}
         _NON_CANDIDATE_GC_MODULES = []
+        _MODULE_ID_TO_LAYER = {}
         return
 
     ds_id_to_layer: Dict[int, int] = {}
@@ -775,6 +793,7 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
         ds_id_to_layer=ds_id_to_layer,
     )
     _LAYER_MODULES = dict(sorted(layer_to_module.items()))
+    _MODULE_ID_TO_LAYER = {id(module): int(layer_idx) for layer_idx, module in _LAYER_MODULES.items()}
     candidate_modules = {id(m) for m in _LAYER_MODULES.values()}
     _NON_CANDIDATE_GC_MODULES = [m for m in gc_attr_modules if id(m) not in candidate_modules]
     _LATEST_PLAN = None
@@ -782,7 +801,7 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
     _set_layer_checkpoint_selection(_LAYER_MODULES.keys())
 
     log_rank0(
-        f"[{NAME}] Initialized layer mapping: layers={len(_LAYER_MODULES)} mapped_ds_ids={len(ds_id_to_layer)} budget_bytes={_budget_bytes()} bootstrap=full_checkpoint",
+        f"[{NAME}] Initialized layer mapping: layers={len(_LAYER_MODULES)} mapped_ds_ids={len(ds_id_to_layer)} checkpoint_controllers={len(_NON_CANDIDATE_GC_MODULES)} budget_bytes={_budget_bytes()} bootstrap=full_checkpoint",
         enable=True,
     )
 

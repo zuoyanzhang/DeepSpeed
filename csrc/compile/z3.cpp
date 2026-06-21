@@ -61,6 +61,8 @@ public:
                 std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
 
             param_use_count_[ds_id] = 0;
+            persistent_wait_ready_[ds_id] = false;
+            chorus_persistent_fast_path_[ds_id] = false;
         }
         // Shared event to order prefetch_params_fused launches against the current stream.
         // All ds_ids in a single fused prefetch share the same insertion point in the graph,
@@ -68,6 +70,33 @@ public:
         prefetch_comp_done_event_ = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
     }
     ~Z3CustomOpExecutor() {}
+
+    void enableChorusPersistentFastPath(long ds_id)
+    {
+        chorus_persistent_fast_path_[ds_id] = true;
+        persistent_wait_ready_[ds_id] = false;
+    }
+
+    bool useChorusPersistentFastPath(long ds_id) const
+    {
+        auto it = chorus_persistent_fast_path_.find(ds_id);
+        return it != chorus_persistent_fast_path_.end() && it->second;
+    }
+
+    void refreshChorusPersistent(c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
+    {
+        for (const auto& it : chorus_persistent_fast_path_) {
+            const long ds_id = it.first;
+            if (!it.second) { continue; }
+            if (!hasParam(ds_id)) { continue; }
+            const DSParam& param = param_registry_->getParam(ds_id);
+            if (!param.isPersistent()) { continue; }
+            param_registry_->setValid(ds_id, false);
+            persistent_wait_ready_[ds_id] = false;
+            auto dtype = param.getDtype();
+            allgatherParam(ds_id, dtype, symm_mem);
+        }
+    }
 
     void endBackward() override
     {
@@ -90,6 +119,7 @@ public:
                          long ds_id,
                          c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
     {
+        persistent_wait_ready_[ds_id] = false;
         const DSParam& param = param_registry_->getParam(ds_id);
         at::Tensor ds_tensor = param.getDSTensor();
         const int world_size = process_group_->getSize();
@@ -159,7 +189,14 @@ public:
 
         if (param_registry_->isValid(ds_id)) {
             auto base = param_registry_->getGatheredParam(ds_id);
-            if (base.defined() && base.scalar_type() == target_dtype) { return base; }
+            if (base.defined() && base.scalar_type() == target_dtype) {
+                if (param.isPersistent() && useChorusPersistentFastPath(ds_id) && !persistent_wait_ready_[ds_id]) {
+                    assert(hasKey(ag_comm_done_events_, ds_id));
+                    ag_comm_done_events_[ds_id]->block(at::cuda::getCurrentCUDAStream());
+                    persistent_wait_ready_[ds_id] = true;
+                }
+                return base;
+            }
             // If the cached gathered buffer dtype doesn't match the request, treat it as invalid so we
             // can refresh the buffer in the requested dtype (avoids per-use cast allocations that
             // cannot be freed by release_param()).
@@ -309,7 +346,8 @@ public:
 
     void prefetchParamsFused(const std::vector<long>& ds_ids,
                              const std::optional<std::vector<at::ScalarType>> dtypes,
-                             c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
+                             c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem,
+                             bool grouped_prefetch)
     {
         std::vector<std::tuple<long, std::optional<at::ScalarType>>> invalid_params;
         for (int i = 0; i < ds_ids.size(); i++) {
@@ -344,6 +382,71 @@ public:
         if (!invalid_params.empty()) {
             prefetch_comp_done_event_->record();
             prefetch_comp_done_event_->block(ag_stream_);
+        }
+
+        // On low-latency fabrics a fused prefetch is primarily a launch-amortization boundary.
+        // Use one NCCL group for the fused normal all-gather path so NVLink does not pay a host
+        // launch round trip for every ds_id in the group. Symmetric-memory gathers keep the
+        // original per-param path because they include barriers and explicit copies.
+        if (grouped_prefetch && symm_mem == nullptr && invalid_params.size() > 1) {
+            struct GroupedAllGather {
+                long ds_id;
+                int64_t shard_elems;
+                at::Tensor send_buf;
+                at::Tensor comm_buf;
+                at::Tensor output_buf;
+            };
+            std::vector<GroupedAllGather> grouped;
+            grouped.reserve(invalid_params.size());
+
+            {
+                at::cuda::CUDAStreamGuard guard(ag_stream_);
+                for (const auto& [ds_id, dtype] : invalid_params) {
+                    assert(hasKey(output_bufs, ds_id));
+                    const DSParam& param = param_registry_->getParam(ds_id);
+                    at::Tensor ds_tensor = param.getDSTensor();
+                    at::Tensor output_buf = output_bufs.at(ds_id);
+                    const int world_size = process_group_->getSize();
+                    const int64_t shard_elems = ds_tensor.numel();
+                    const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+                    at::ScalarType target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
+
+                    if (ds_tensor.scalar_type() != target_dtype) {
+                        ds_tensor = ds_tensor.to(target_dtype, true, true);
+                    }
+
+                    grouped.push_back(GroupedAllGather{
+                        ds_id,
+                        shard_elems,
+                        ds_tensor.contiguous(),
+                        output_buf.as_strided({padded_numel}, {1}, 0),
+                        output_buf,
+                    });
+                }
+
+                ncclGroupStart();
+                for (auto& item : grouped) {
+                    ncclResult_t result = ncclAllGather(item.send_buf.data_ptr(),
+                                                        item.comm_buf.data_ptr(),
+                                                        item.shard_elems,
+                                                        get_nccl_data_type(item.send_buf.scalar_type()),
+                                                        nccl_ag_comm_,
+                                                        ag_stream_);
+                    if (result != ncclSuccess) { throw std::runtime_error("NCCL AllGather failed"); }
+                }
+                ncclResult_t group_result = ncclGroupEnd();
+                if (group_result != ncclSuccess) { throw std::runtime_error("NCCL AllGather group failed"); }
+            }
+
+            for (auto& item : grouped) {
+                const DSParam& param = param_registry_->getParam(item.ds_id);
+                item.output_buf.resize_(param.getShape());
+                param_registry_->registerGatheredParam(item.ds_id, item.output_buf);
+                param_registry_->setValid(item.ds_id, true);
+                persistent_wait_ready_[item.ds_id] = false;
+                ag_comm_done_events_[item.ds_id]->record(ag_stream_);
+            }
+            return;
         }
 
         // Record per-ds_id completion events at the correct stream positions so each wait_allgather(ds_id)
@@ -381,7 +484,14 @@ public:
     at::Tensor waitAllgather(at::Tensor v, long ds_id)
     {
         assert(hasKey(ag_comm_done_events_, ds_id));
+        const DSParam& param = param_registry_->getParam(ds_id);
+        if (param.isPersistent() && useChorusPersistentFastPath(ds_id) && param_registry_->isValid(ds_id) && persistent_wait_ready_[ds_id]) {
+            return v;
+        }
         ag_comm_done_events_[ds_id]->block(at::cuda::getCurrentCUDAStream());
+        if (param.isPersistent() && useChorusPersistentFastPath(ds_id) && param_registry_->isValid(ds_id)) {
+            persistent_wait_ready_[ds_id] = true;
+        }
         return v;
     }
 
@@ -578,6 +688,8 @@ private:
     std::unordered_map<long, at::Tensor> reload_buffers_;
 
     std::unordered_map<long, long> param_use_count_;
+    std::unordered_map<long, bool> persistent_wait_ready_;
+    std::unordered_map<long, bool> chorus_persistent_fast_path_;
 };
 
 static at::cuda::CUDAStream ag_stream = at::cuda::getStreamFromPool(true);
@@ -693,19 +805,46 @@ void set_persistent(long ds_id)
     }
 }
 
+void set_chorus_persistent(long ds_id)
+{
+    param_registry->setPersistent(ds_id, true);
+
+    // Chorus owns the graph-level persistent-state eliminations. Keep the fast path
+    // behind a separate API so DeepCompile's selective_gather baseline keeps its
+    // original set_persistent() semantics.
+    for (auto& it : executors) {
+        if (it.second->hasParam(ds_id)) {
+            auto executor = getExecutor<Z3CustomOpExecutor>(it.first, executors);
+            executor->enableChorusPersistentFastPath(ds_id);
+            auto dtype = param_registry->getParam(ds_id).getDtype();
+            executor->allgatherParam(ds_id, dtype, symm_mem);
+        }
+    }
+}
+
+void refresh_chorus_persistent()
+{
+    for (auto& it : executors) {
+        auto executor = getExecutor<Z3CustomOpExecutor>(it.first, executors);
+        executor->refreshChorusPersistent(symm_mem);
+    }
+}
+
 void prefetch_params_fused(long graph_id,
                            const std::vector<at::Tensor>& params,
                            const std::vector<long>& ds_ids,
-                           const std::optional<std::vector<at::ScalarType>>& dtypes)
+                           const std::optional<std::vector<at::ScalarType>>& dtypes,
+                           bool grouped)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
-    executor->prefetchParamsFused(ds_ids, dtypes, symm_mem);
+    executor->prefetchParamsFused(ds_ids, dtypes, symm_mem, grouped);
 }
 
 void prefetch_params_fused_meta(long graph_id,
                                 const std::vector<at::Tensor>& params,
                                 const std::vector<long>& ds_ids,
-                                const std::optional<std::vector<at::ScalarType>>& dtypes)
+                                const std::optional<std::vector<at::ScalarType>>& dtypes,
+                                bool grouped)
 {
 }
 

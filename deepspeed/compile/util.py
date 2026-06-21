@@ -71,6 +71,24 @@ def deepcompile_backward_prologue(is_gradient_accumulation_boundary):
     dc.start_backward(is_gradient_accumulation_boundary)
 
 
+def deepcompile_post_optimizer_step(step_applied: bool):
+    if not step_applied:
+        return
+    try:
+        from deepspeed.compile.passes import global_layer_scheduler
+        if not bool(getattr(global_layer_scheduler, "_PERSISTENT_SET_DONE", False)):
+            return
+        cfg = getattr(global_layer_scheduler, "_CFG", None)
+        if not bool(getattr(cfg, "low_comm_post_step_refresh", False)):
+            return
+        dc = get_deepcompile_handle()
+        refresh = getattr(dc, "refresh_chorus_persistent", None)
+        if refresh is not None:
+            refresh()
+    except Exception:
+        return
+
+
 def log_rank0(msg: str, enable: bool = False):
     if dist.get_rank() == 0 and enable:
         print(msg)

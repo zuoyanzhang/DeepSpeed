@@ -111,6 +111,11 @@ def launch_compile_passes(global_steps: int):
             selective_activation_recompute.maybe_apply_before_recompile(next_passes)
         except Exception:
             pass
+        try:
+            from .passes import global_layer_scheduler
+            global_layer_scheduler.maybe_apply_before_recompile(next_passes)
+        except Exception:
+            pass
 
         torch._dynamo.reset()
         get_deepcompile_handle().reset()

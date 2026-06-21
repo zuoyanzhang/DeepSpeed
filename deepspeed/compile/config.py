@@ -45,6 +45,69 @@ class CompileConfig(DeepSpeedConfigModel):
     global_layer_scheduler_dump_dir: str = ""
     """ Directory to dump schedule JSON (defaults to CWD if empty) """
 
+    global_layer_scheduler_topology_policy: str = "auto"
+    """ Chorus topology policy: auto, generic, low_comm, or nvlink. """
+
+    global_layer_scheduler_low_comm_effective_bw_gib_per_s: float = 120.0
+    """ Effective all-gather bandwidth threshold for auto low-communication backend detection. """
+
+    global_layer_scheduler_low_comm_pressure_ratio: float = 0.35
+    """ Param-communication/compute ratio threshold for auto low-communication backend detection. """
+
+    global_layer_scheduler_low_comm_keep_opportunity_factor: float = 0.5
+    """ Opportunity-cost weight for long-lived keep decisions on low-communication backends. """
+
+    global_layer_scheduler_low_comm_keep_cap_fraction: float = 0.10
+    """ Max keep-layer fraction when low-communication backend persistent selection is starved. """
+
+    global_layer_scheduler_low_comm_persistent_budget_mode: str = "selective"
+    """ Persistent budget mode for low-communication backends: conservative, selective, or max. """
+
+    global_layer_scheduler_low_comm_persistent_usable_fraction: float = 0.90
+    """ Usable memory fraction for selective-style persistent budgeting on low-communication backends. """
+
+    global_layer_scheduler_low_comm_persistent_starvation_fraction: float = 0.75
+    """ Rebalance keep layers when persistent budget covers less than this fraction of candidates. """
+
+    global_layer_scheduler_low_comm_graph_rewrite_mode: str = "local_prefetch"
+    """ Graph rewrite mode on low-communication backends: local_prefetch or global. """
+
+    global_layer_scheduler_low_comm_prefetch_fuse_slack: float = 1.9
+    """ Aggressive local-prefetch fusion slack for low-communication backends. """
+
+    global_layer_scheduler_low_comm_prefetch_fuse_max_bytes: int = 1850000000
+    """ Max fused local-prefetch payload size for low-communication backends. """
+
+    global_layer_scheduler_low_comm_prefetch_buffer_max_bytes: int = 5300000000
+    """ Max buffered local-prefetch bytes for low-communication backends. """
+
+    global_layer_scheduler_low_comm_elide_persistent_releases: bool = True
+    """ Remove redundant release_param ops for persistent parameters on low-communication backends. """
+
+    global_layer_scheduler_low_comm_elide_persistent_waits: bool = True
+    """ Remove redundant wait_allgather ops for persistent parameters on low-communication backends. """
+
+    global_layer_scheduler_low_comm_elide_persistent_prefetches: bool = True
+    """ Remove persistent ds_ids from fused prefetch ops on low-communication backends. """
+
+    global_layer_scheduler_low_comm_persistent_value_mode: str = "event_density"
+    """ Persistent objective on low-communication backends: comm_state or event_density. """
+
+    global_layer_scheduler_low_comm_comm_value_weight: float = 0.25
+    """ Weight applied to all-gather latency value in event-density persistent mode. """
+
+    global_layer_scheduler_low_comm_state_op_ms: float = 0.02
+    """ Estimated per-op persistent state overhead on low-communication backends. """
+
+    global_layer_scheduler_low_comm_recompute_relief: bool = False
+    """ Let Chorus use low-communication memory slack to disable selected activation checkpointing layers. """
+
+    global_layer_scheduler_low_comm_recompute_pressure_ratio: float = 0.72
+    """ Memory pressure ratio for Chorus recompute-relief planning on low-communication backends. """
+
+    global_layer_scheduler_low_comm_post_step_refresh: bool = False
+    """ Experimentally refresh Chorus persistent parameters after optimizer.step() on a side stream. """
+
     selective_activation_recompute: bool = False
     """ Enable DeepCompile selective activation recompute planning """
 

@@ -34,14 +34,18 @@ at::Tensor allgather_param_chunk(at::Tensor param_tensor,
                                  long chunk_count,
                                  std::optional<at::ScalarType> dtype);
 void set_persistent(long ds_id);
+void set_chorus_persistent(long ds_id);
+void refresh_chorus_persistent();
 void prefetch_params_fused(long graph_id,
                            const std::vector<at::Tensor>& params,
                            const std::vector<long>& ds_ids,
-                           const std::optional<std::vector<at::ScalarType>>& dtypes);
+                           const std::optional<std::vector<at::ScalarType>>& dtypes,
+                           bool grouped);
 void prefetch_params_fused_meta(long graph_id,
                                 const std::vector<at::Tensor>& params,
                                 const std::vector<long>& ds_ids,
-                                const std::optional<std::vector<at::ScalarType>>& dtypes);
+                                const std::optional<std::vector<at::ScalarType>>& dtypes,
+                                bool grouped);
 // for profiling
 void invalidate_gathered_param(long ds_id);
 void clear_all_gathered_params();

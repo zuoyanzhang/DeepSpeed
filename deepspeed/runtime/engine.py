@@ -120,7 +120,7 @@ from deepspeed.accelerator import get_accelerator
 
 from deepspeed.runtime.config import DtypeEnum
 
-from deepspeed.compile.util import is_deepcompile_supported, get_deepcompile_handle, deepcompile_backward_prologue
+from deepspeed.compile.util import is_deepcompile_supported, get_deepcompile_handle, deepcompile_backward_prologue, deepcompile_post_optimizer_step
 from deepspeed.compile.backend import register_compile_pass, opt_passes
 from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states
 from deepspeed.compile.init_z1 import init_z1
@@ -2639,6 +2639,7 @@ class DeepSpeedEngine(Module):
         self.losses = None
         self.global_steps += 1
         self.global_samples += self.train_batch_size()
+        deepcompile_post_optimizer_step(self._step_applied)
 
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation

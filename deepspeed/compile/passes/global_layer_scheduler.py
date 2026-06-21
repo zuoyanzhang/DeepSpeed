@@ -11,6 +11,7 @@ import math
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -21,6 +22,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 
 from ..graph_param import DSGraphParamManager
+from ..profilers.comm_profile import create_predictor
 from ..util import (get_deepcompile_handle, get_tracked_step_peak_memory_bytes, get_tracked_step_peak_reserved_memory_bytes,
                     log_rank0)
 
@@ -49,6 +51,27 @@ class _SchedulerConfig:
     milp_rel_gap: float
     milp_presolve: bool
     separate_allgather_communicator: bool
+    topology_policy: str
+    low_comm_effective_bw_gib_per_s: float
+    low_comm_pressure_ratio: float
+    low_comm_keep_opportunity_factor: float
+    low_comm_keep_cap_fraction: float
+    low_comm_persistent_budget_mode: str
+    low_comm_persistent_usable_fraction: float
+    low_comm_persistent_starvation_fraction: float
+    low_comm_graph_rewrite_mode: str
+    low_comm_prefetch_fuse_slack: float
+    low_comm_prefetch_fuse_max_bytes: int
+    low_comm_prefetch_buffer_max_bytes: int
+    low_comm_elide_persistent_releases: bool
+    low_comm_elide_persistent_waits: bool
+    low_comm_elide_persistent_prefetches: bool
+    low_comm_persistent_value_mode: str
+    low_comm_comm_value_weight: float
+    low_comm_state_op_ms: float
+    low_comm_recompute_relief: bool
+    low_comm_recompute_pressure_ratio: float
+    low_comm_post_step_refresh: bool
 
 
 @dataclass(frozen=True)
@@ -102,6 +125,48 @@ def _infer_layer_idx(param_name: str, layer_regexes: Sequence[str]) -> Optional[
     return None
 
 
+
+def _has_checkpointing_enabled(model: torch.nn.Module) -> bool:
+    for module in model.modules():
+        if bool(getattr(module, "gradient_checkpointing", False)):
+            return True
+    return False
+
+
+def _maybe_init_recompute_relief(model: torch.nn.Module, compile_config, schedule) -> None:
+    if _CFG is None or not bool(_CFG.low_comm_recompute_relief):
+        return
+    if not _has_checkpointing_enabled(model):
+        log_rank0(f"[{NAME}] Recompute relief disabled: model checkpointing is not enabled.", enable=True)
+        return
+
+    class _ChorusRecomputeConfigProxy:
+        def __init__(self, base, pressure_ratio: float):
+            self._base = base
+            self._pressure_ratio = float(pressure_ratio)
+
+        def __getattr__(self, key):
+            if key == "selective_activation_recompute":
+                return True
+            if key == "global_layer_scheduler":
+                return False
+            if key == "selective_activation_recompute_pressure_ratio":
+                return self._pressure_ratio
+            return getattr(self._base, key)
+
+    try:
+        from . import selective_activation_recompute as recompute
+        proxy = _ChorusRecomputeConfigProxy(compile_config, float(_CFG.low_comm_recompute_pressure_ratio))
+        # Pass an empty schedule so the standalone pass does not see global_layer_scheduler;
+        # this initializes its planner for Chorus-internal use only.
+        recompute.maybe_init_layer_mapping(model, proxy, [])
+        log_rank0(
+            f"[{NAME}] Initialized Chorus recompute relief pressure_ratio={float(_CFG.low_comm_recompute_pressure_ratio)}",
+            enable=True,
+        )
+    except Exception as exc:
+        log_rank0(f"[{NAME}] Recompute relief initialization skipped: {exc}", enable=True)
+
 def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -> None:
     global _CFG, _LAYER_MAPPING
 
@@ -144,8 +209,48 @@ def maybe_init_layer_mapping(model: torch.nn.Module, compile_config, schedule) -
         milp_rel_gap=float(getattr(compile_config, "global_layer_scheduler_milp_rel_gap", 0.01)),
         milp_presolve=bool(getattr(compile_config, "global_layer_scheduler_milp_presolve", True)),
         separate_allgather_communicator=bool(getattr(compile_config, "separate_allgather_communicator", True)),
+        topology_policy=str(getattr(compile_config, "global_layer_scheduler_topology_policy", "auto")).strip().lower(),
+        low_comm_effective_bw_gib_per_s=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_effective_bw_gib_per_s", 120.0)),
+        low_comm_pressure_ratio=float(getattr(compile_config, "global_layer_scheduler_low_comm_pressure_ratio", 0.35)),
+        low_comm_keep_opportunity_factor=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_keep_opportunity_factor", 0.5)),
+        low_comm_keep_cap_fraction=float(getattr(compile_config, "global_layer_scheduler_low_comm_keep_cap_fraction", 0.10)),
+        low_comm_persistent_budget_mode=str(
+            getattr(compile_config, "global_layer_scheduler_low_comm_persistent_budget_mode", "selective")).strip().lower(),
+        low_comm_persistent_usable_fraction=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_persistent_usable_fraction", 0.90)),
+        low_comm_persistent_starvation_fraction=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_persistent_starvation_fraction", 0.75)),
+        low_comm_graph_rewrite_mode=str(
+            getattr(compile_config, "global_layer_scheduler_low_comm_graph_rewrite_mode", "local_prefetch")).strip().lower(),
+        low_comm_prefetch_fuse_slack=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_prefetch_fuse_slack", 1.9)),
+        low_comm_prefetch_fuse_max_bytes=int(
+            getattr(compile_config, "global_layer_scheduler_low_comm_prefetch_fuse_max_bytes", 1850000000)),
+        low_comm_prefetch_buffer_max_bytes=int(
+            getattr(compile_config, "global_layer_scheduler_low_comm_prefetch_buffer_max_bytes", 5300000000)),
+        low_comm_elide_persistent_releases=bool(
+            getattr(compile_config, "global_layer_scheduler_low_comm_elide_persistent_releases", True)),
+        low_comm_elide_persistent_waits=bool(
+            getattr(compile_config, "global_layer_scheduler_low_comm_elide_persistent_waits", True)),
+        low_comm_elide_persistent_prefetches=bool(
+            getattr(compile_config, "global_layer_scheduler_low_comm_elide_persistent_prefetches", True)),
+        low_comm_persistent_value_mode=str(
+            getattr(compile_config, "global_layer_scheduler_low_comm_persistent_value_mode", "event_density")).strip().lower(),
+        low_comm_comm_value_weight=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_comm_value_weight", 0.25)),
+        low_comm_state_op_ms=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_state_op_ms", 0.02)),
+        low_comm_recompute_relief=bool(
+            getattr(compile_config, "global_layer_scheduler_low_comm_recompute_relief", False)),
+        low_comm_recompute_pressure_ratio=float(
+            getattr(compile_config, "global_layer_scheduler_low_comm_recompute_pressure_ratio", 0.72)),
+        low_comm_post_step_refresh=bool(
+            getattr(compile_config, "global_layer_scheduler_low_comm_post_step_refresh", False)),
     )
     _CFG = cfg
+    _maybe_init_recompute_relief(model, compile_config, schedule)
 
     name_and_ds = []
     ds_id_to_layer: Dict[int, int] = {}
@@ -313,6 +418,22 @@ def _build_ds_id_to_allgather_ms(profiling_results) -> Dict[int, float]:
                     ds_id = int(n.args[2])
                     out[ds_id] = out.get(ds_id, 0.0) + float(n.meta["device_time"])
     return out
+
+
+def _build_ds_id_state_op_counts(profiling_results) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for prof in profiling_results.values():
+        for g in (getattr(prof, "fwd_graph", None), getattr(prof, "bwd_graph", None)):
+            if g is None:
+                continue
+            for n in g.nodes:
+                if n.target == torch.ops.dc.wait_allgather.default:
+                    ds_id = int(n.args[2])
+                    counts[ds_id] = counts.get(ds_id, 0) + 1
+                elif n.target == torch.ops.dc.release_param.default:
+                    ds_id = int(n.args[2])
+                    counts[ds_id] = counts.get(ds_id, 0) + 1
+    return counts
 
 
 def _rank_persistent_candidates(ds_id_to_size: Dict[int, int], ds_id_to_allgather_ms: Dict[int, float]) -> List[int]:
@@ -663,6 +784,143 @@ class _CommGroup:
     task_ready_offsets_ms: Tuple[Tuple[Tuple[int, str], float], ...]
     total_bytes: int
     comm_ms: float
+
+
+def _layer_size_and_ops(L: int, layer_to_ds_ids: Sequence[Sequence[int]],
+                        ds_id_to_size: Dict[int, int]) -> Tuple[List[int], List[int]]:
+    layer_sizes: List[int] = []
+    layer_ops: List[int] = []
+    for li in range(int(L)):
+        ids = [int(ds_id) for ds_id in layer_to_ds_ids[int(li)] if int(ds_id) in ds_id_to_size]
+        ids = sorted(set(ids))
+        layer_sizes.append(int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids)))
+        layer_ops.append(int(len(ids)))
+    return layer_sizes, layer_ops
+
+
+def _comm_coeffs_for_layers(layer_sizes: Sequence[int], layer_ops: Sequence[int], cfg: _SchedulerConfig,
+                            comm_model: _CommModel) -> List[float]:
+    alpha_ms = float(comm_model.alpha_ms)
+    alpha_per_op_fused = float(alpha_ms) * max(0.0, min(1.0, float(cfg.fuse_factor)))
+    beta = float(comm_model.beta_ms_per_byte)
+    coeffs: List[float] = []
+    for size, ops in zip(layer_sizes, layer_ops):
+        alpha_eff = float(alpha_per_op_fused) if int(ops) > 1 else float(alpha_ms)
+        coeffs.append(float(alpha_eff) * float(ops) + float(beta) * float(size))
+    return coeffs
+
+
+def _effective_bw_gib_per_s(comm_model: _CommModel) -> float:
+    beta = float(comm_model.beta_ms_per_byte)
+    if beta <= 0.0:
+        return float("inf")
+    bytes_per_ms = 1.0 / beta
+    return float(bytes_per_ms * 1000.0 / float(1024**3))
+
+
+def _resolve_comm_backend_policy(cfg: _SchedulerConfig, blocks: Sequence[_BlockProfile], layer_sizes: Sequence[int],
+                                 layer_ops: Sequence[int], comm_model: _CommModel) -> dict:
+    requested = str(getattr(cfg, "topology_policy", "auto") or "auto").strip().lower()
+    if requested in {"nvlink", "low_comm", "low-comm"}:
+        mode = "low_comm"
+    elif requested in {"generic", "default", "none", "off"}:
+        mode = "generic"
+    else:
+        comm_coeffs = _comm_coeffs_for_layers(layer_sizes, layer_ops, cfg, comm_model)
+        compute_ms = float(sum(float(b.compute_ms) for b in blocks))
+        # Count FWD and BWD param all-gathers. This is raw communication pressure, not exposed stall.
+        param_comm_ms = 2.0 * float(sum(comm_coeffs))
+        pressure = float(param_comm_ms / max(compute_ms, 1e-9))
+        bw_gib = _effective_bw_gib_per_s(comm_model)
+        low_by_bw = bool(math.isfinite(float(bw_gib)) and bw_gib >= float(cfg.low_comm_effective_bw_gib_per_s))
+        low_by_pressure = bool(pressure <= float(cfg.low_comm_pressure_ratio))
+        mode = "low_comm" if bool(cfg.separate_allgather_communicator) and (low_by_bw or low_by_pressure) else "generic"
+        return {
+            "requested": requested or "auto",
+            "mode": mode,
+            "effective_bw_gib_per_s": float(bw_gib),
+            "param_comm_ms": float(param_comm_ms),
+            "compute_ms": float(compute_ms),
+            "comm_pressure_ratio": float(pressure),
+            "low_by_bw": bool(low_by_bw),
+            "low_by_pressure": bool(low_by_pressure),
+            "separate_allgather_communicator": bool(cfg.separate_allgather_communicator),
+        }
+
+    comm_coeffs = _comm_coeffs_for_layers(layer_sizes, layer_ops, cfg, comm_model)
+    compute_ms = float(sum(float(b.compute_ms) for b in blocks))
+    param_comm_ms = 2.0 * float(sum(comm_coeffs))
+    pressure = float(param_comm_ms / max(compute_ms, 1e-9))
+    return {
+        "requested": requested or "auto",
+        "mode": mode,
+        "effective_bw_gib_per_s": float(_effective_bw_gib_per_s(comm_model)),
+        "param_comm_ms": float(param_comm_ms),
+        "compute_ms": float(compute_ms),
+        "comm_pressure_ratio": float(pressure),
+        "low_by_bw": bool(mode == "low_comm"),
+        "low_by_pressure": bool(mode == "low_comm"),
+        "separate_allgather_communicator": bool(cfg.separate_allgather_communicator),
+    }
+
+
+def _percentile(values: Sequence[float], q: float) -> float:
+    vals = sorted(float(v) for v in values if math.isfinite(float(v)) and float(v) > 0.0)
+    if not vals:
+        return 0.0
+    q = max(0.0, min(1.0, float(q)))
+    idx = int(round((len(vals) - 1) * q))
+    return float(vals[idx])
+
+
+def _build_keep_opportunity_penalties(*,
+                                      L: int,
+                                      layer_to_ds_ids: Sequence[Sequence[int]],
+                                      layer_sizes: Sequence[int],
+                                      ds_id_to_size: Dict[int, int],
+                                      ds_id_to_allgather_ms: Dict[int, float],
+                                      cfg: _SchedulerConfig,
+                                      backend_policy: dict) -> Dict[int, float]:
+    if str(backend_policy.get("mode", "generic")) != "low_comm":
+        return {}
+
+    factor = max(0.0, float(cfg.low_comm_keep_opportunity_factor))
+    if factor <= 0.0:
+        return {}
+
+    densities = []
+    for ds_id, size in ds_id_to_size.items():
+        size = int(size)
+        if size <= 0:
+            continue
+        value = max(0.0, float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)))
+        if value > 0.0:
+            densities.append(float(value) / float(size))
+    ref_density = _percentile(densities, 0.75)
+
+    pressure = max(1e-9, float(backend_policy.get("comm_pressure_ratio", 1.0)))
+    threshold = max(1e-9, float(cfg.low_comm_pressure_ratio))
+    pressure_scale = max(1.0, min(2.0, threshold / pressure))
+
+    penalties: Dict[int, float] = {}
+    K = max(1, 2 * int(L))
+    for li in range(int(L)):
+        size = int(layer_sizes[int(li)]) if int(li) < len(layer_sizes) else 0
+        if size <= 0:
+            continue
+        layer_value = 0.0
+        for ds_id in layer_to_ds_ids[int(li)]:
+            layer_value += max(0.0, float(ds_id_to_allgather_ms.get(int(ds_id), 0.0)))
+        ref_value = float(ref_density) * float(size) if ref_density > 0.0 else 0.0
+        opportunity_ms = max(float(layer_value), float(ref_value))
+        if opportunity_ms <= 0.0:
+            continue
+        f_deadline = int(li)
+        b_deadline = int(2 * int(L) - 1 - int(li))
+        live_span = max(0, int(b_deadline) - int(f_deadline))
+        live_span_scale = 0.5 + float(live_span) / float(K)
+        penalties[int(li)] = float(factor) * float(pressure_scale) * float(live_span_scale) * float(opportunity_ms)
+    return penalties
 
 
 def _is_param_comm_node(n: Node) -> bool:
@@ -1051,6 +1309,8 @@ def _solve_milp_schedule(
     cfg: _SchedulerConfig,
     comm_model: _CommModel,
     forced_keep_layers: Optional[Set[int]] = None,
+    keep_layer_penalty_ms: Optional[Dict[int, float]] = None,
+    max_keep_layers: Optional[int] = None,
 ) -> Tuple[Set[int], Dict[Tuple[int, str], int], dict]:
     # MILP model (HiGHS via SciPy) chooses:
     # - keep_layers (step-level keep-unshard)
@@ -1071,16 +1331,10 @@ def _solve_milp_schedule(
         raise ValueError(f"[{NAME}] internal error: expected K=2L blocks, got K={K} L={L}")
 
     # Per-layer param volume (bytes) and op count (ds_id count) used by the comm model.
-    layer_sizes: List[int] = []
-    layer_ops: List[int] = []
-    for li in range(L):
-        ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
-        ids = sorted(set(ids))
-        size_bytes = int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids))
-        layer_sizes.append(size_bytes)
-        layer_ops.append(int(len(ids)))
+    layer_sizes, layer_ops = _layer_size_and_ops(L, layer_to_ds_ids, ds_id_to_size)
 
     active_layers = [li for li in range(L) if layer_ops[li] > 0 and layer_sizes[li] > 0]
+    keep_penalties = {int(k): max(0.0, float(v)) for k, v in (keep_layer_penalty_ms or {}).items()}
 
     fuse_alpha_factor = max(0.0, min(1.0, float(cfg.fuse_factor)))
     # Fused prefetch only reduces launch/latency overhead when there are multiple ops in the call.
@@ -1175,9 +1429,14 @@ def _solve_milp_schedule(
             ub[readyF_idx[li]] = 0.0
             ub[readyB_idx[li]] = 0.0
 
-    # Objective: minimize end time now[K].
+    # Objective: minimize end time now[K]. Low-communication backends add an
+    # opportunity cost to long-lived keep decisions so small predicted gather
+    # savings do not consume memory that could be used by cheaper mechanisms.
     c = np.zeros(n_vars, dtype=float)
     c[now_idx[K]] = 1.0
+    for li, penalty in keep_penalties.items():
+        if 0 <= int(li) < int(L) and float(penalty) > 0.0:
+            c[keep_idx[int(li)]] += float(penalty)
 
     rows: List[int] = []
     cols: List[int] = []
@@ -1315,6 +1574,10 @@ def _solve_milp_schedule(
             add_row([(stall_idx[k], 1.0), (now_idx[k], 1.0), (readyB_idx[layer], -1.0), (keep_idx[layer], float(M))],
                     0.0, INF)
 
+    if max_keep_layers is not None:
+        max_keep = max(0, int(max_keep_layers))
+        add_row([(keep_idx[li], 1.0) for li in active_layers], -INF, float(max_keep))
+
     # Per-block launch and fuse constraints.
     for k in range(K):
         # max_tasks_per_block: count of layer-tasks launched at this boundary.
@@ -1388,7 +1651,13 @@ def _solve_milp_schedule(
     if int(cfg.milp_node_limit) > 0:
         options["node_limit"] = int(cfg.milp_node_limit)
 
+    milp_units = int(len(active_layers))
+    milp_blocks = int(K)
+    milp_binary_vars = int(np.count_nonzero(integrality == 1))
+    milp_constraints = int(row)
+    solve_start_s = time.perf_counter()
     res = milp(c, integrality=integrality, bounds=Bounds(lb, ub), constraints=constraint, options=options)
+    milp_solve_time_s = float(time.perf_counter() - solve_start_s)
     if res.status not in (0, 1) or res.x is None:
         raise RuntimeError(f"[{NAME}] MILP solver failed: status={res.status} message={res.message}")
 
@@ -1422,11 +1691,24 @@ def _solve_milp_schedule(
                 raise RuntimeError(f"[{NAME}] MILP produced no BWD start for layer={li}")
             per_task_start[(li, "BWD")] = int(best_k)
 
+    final_gap_raw = getattr(res, "mip_gap", float("nan"))
+    final_gap = float(final_gap_raw) if final_gap_raw is not None else float("nan")
     meta = {
         "status": int(res.status),
         "message": str(res.message),
         "objective": float(res.fun) if res.fun is not None else None,
-        "mip_gap": float(getattr(res, "mip_gap", float("nan"))) if hasattr(res, "mip_gap") else float("nan"),
+        "mip_gap": final_gap,
+        "final_gap": final_gap,
+        "units": int(milp_units),
+        "blocks": int(milp_blocks),
+        "binary_vars": int(milp_binary_vars),
+        "constraints": int(milp_constraints),
+        "solve_time_s": float(milp_solve_time_s),
+        "time_limit_s": float(cfg.milp_time_limit_s),
+        "rel_gap_target": float(cfg.milp_rel_gap),
+        "keep_penalty_layers": int(len(keep_penalties)),
+        "keep_penalty_total_ms": float(sum(float(v) for v in keep_penalties.values())),
+        "max_keep_layers": int(max_keep_layers) if max_keep_layers is not None else None,
     }
 
     return keep_layers, per_task_start, meta
@@ -1765,11 +2047,15 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     # Approximate fixed (non-prefetch) communication that runs on the comm stream, e.g., grad reduction.
     # We model it as bandwidth-dominated and proportional to per-layer parameter volume.
     beta_grad = float(comm_model.beta_ms_per_byte)
-    layer_sizes: List[int] = []
-    for li in range(L):
-        ids = [int(ds_id) for ds_id in layer_to_ds_ids[li] if int(ds_id) in ds_id_to_size]
-        ids = sorted(set(ids))
-        layer_sizes.append(int(sum(int(ds_id_to_size[int(ds_id)]) for ds_id in ids)))
+    layer_sizes, layer_ops = _layer_size_and_ops(L, layer_to_ds_ids, ds_id_to_size)
+    backend_policy = _resolve_comm_backend_policy(cfg, blocks, layer_sizes, layer_ops, comm_model)
+    keep_layer_penalty_ms = _build_keep_opportunity_penalties(L=L,
+                                                              layer_to_ds_ids=layer_to_ds_ids,
+                                                              layer_sizes=layer_sizes,
+                                                              ds_id_to_size=ds_id_to_size,
+                                                              ds_id_to_allgather_ms=ds_id_to_allgather_ms,
+                                                              cfg=cfg,
+                                                              backend_policy=backend_policy)
 
     grad_comm_ms_per_layer = [float(beta_grad) * float(layer_sizes[li]) for li in range(L)]
     blocks = [
@@ -1812,7 +2098,8 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
                                                                   ds_id_to_size=ds_id_to_size,
                                                                   cfg=cfg_used,
                                                                   comm_model=comm_model,
-                                                                  forced_keep_layers=forced_keep_layers)
+                                                                  forced_keep_layers=forced_keep_layers,
+                                                                  keep_layer_penalty_ms=keep_layer_penalty_ms)
 
     refine_meta: dict = {"iters": 0}
     if int(cfg_used.inner_refine_max_iters) > 0:
@@ -1869,7 +2156,7 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
     keep_ds_ids = sorted(set(keep_ds_ids))
 
     schedule = {
-        "version": 8,
+        "version": 9,
         "mapping_hash": mapping.mapping_hash,
         "L": L,
         "keep_layers": sorted(keep_layers),
@@ -1927,6 +2214,9 @@ def _build_schedule(graph_id: int, profiling_results, param_manager: Dict[int, D
             "milp_rel_gap": float(cfg_used.milp_rel_gap),
             "milp_presolve": bool(cfg_used.milp_presolve),
             "separate_allgather_communicator": bool(cfg_used.separate_allgather_communicator),
+            "comm_backend_policy": backend_policy,
+            "keep_opportunity_penalty_layers": int(len(keep_layer_penalty_ms)),
+            "keep_opportunity_penalty_total_ms": float(sum(float(v) for v in keep_layer_penalty_ms.values())),
         },
     }
     predicted_graph_peak_mem_bytes = _predicted_peak_mem_bytes_from_schedule(schedule)
@@ -1975,6 +2265,362 @@ def _dump_schedule_if_enabled(schedule: dict) -> None:
     log_rank0(f"[{NAME}] Wrote schedule JSON: {path}", enable=True)
 
 
+def _blocks_from_schedule(sched: dict) -> List[_BlockProfile]:
+    L = int(sched.get("L", 0))
+    K = 2 * L
+    block_profiles = sched.get("block_profiles", {}) or {}
+
+    def _arr(name: str, default):
+        vals = block_profiles.get(name, [])
+        if len(vals) < K:
+            vals = list(vals) + [default for _ in range(K - len(vals))]
+        return vals
+
+    compute_ms = _arr("compute_ms", 0.0)
+    cap_bytes = _arr("cap_bytes", 0)
+    explicit_temp = _arr("explicit_temp_reserve_bytes", 0)
+    non_param_floor = _arr("non_param_floor_bytes", 0)
+    fixed_offsets = _arr("fixed_comm_start_offset_ms", 0.0)
+    fixed_ms = _arr("fixed_comm_ms", 0.0)
+
+    blocks: List[_BlockProfile] = []
+    for k in range(K):
+        if k < L:
+            phase = "FWD"
+            layer_idx = int(k)
+        else:
+            phase = "BWD"
+            layer_idx = int(K - 1 - k)
+        blocks.append(
+            _BlockProfile(
+                k=int(k),
+                phase=phase,
+                layer_idx=int(layer_idx),
+                compute_ms=float(compute_ms[k]),
+                cap_bytes=int(cap_bytes[k]),
+                explicit_temp_reserve_bytes=int(explicit_temp[k]),
+                non_param_floor_bytes=int(non_param_floor[k]),
+                fixed_comm_start_offset_ms=float(fixed_offsets[k]),
+                fixed_comm_ms=float(fixed_ms[k]),
+            ))
+    return blocks
+
+
+def _parse_per_task_start(per_task_start_k: dict) -> Dict[Tuple[int, str], int]:
+    out: Dict[Tuple[int, str], int] = {}
+    for raw_key, raw_v in (per_task_start_k or {}).items():
+        parts = str(raw_key).split(".")
+        if len(parts) != 3 or parts[0] != "layer":
+            continue
+        kind = str(parts[2])
+        if kind not in {"FWD", "BWD"}:
+            continue
+        try:
+            out[(int(parts[1]), kind)] = int(raw_v)
+        except Exception:
+            continue
+    return out
+
+
+def _layer_to_ds_ids_from_mapping(L: int, ds_id_to_layer: Dict[int, int],
+                                  ds_id_to_size: Dict[int, int]) -> List[List[int]]:
+    layer_to_ds_ids: List[List[int]] = [[] for _ in range(int(L))]
+    for ds_id, layer in ds_id_to_layer.items():
+        layer = int(layer)
+        if 0 <= layer < int(L) and int(ds_id) in ds_id_to_size:
+            layer_to_ds_ids[layer].append(int(ds_id))
+    for li in range(int(L)):
+        layer_to_ds_ids[li] = sorted(set(layer_to_ds_ids[li]))
+    return layer_to_ds_ids
+
+
+def _schedule_with_keep_layers(sched: dict,
+                               keep_layers: Set[int],
+                               cfg: _SchedulerConfig,
+                               comm_model: _CommModel,
+                               ds_id_to_size: Dict[int, int],
+                               ds_id_to_layer: Dict[int, int],
+                               profiling_results,
+                               graph_id: int,
+                               persistent_set: Optional[Set[int]] = None) -> Optional[dict]:
+    L = int(sched.get("L", 0))
+    if L <= 0:
+        return None
+
+    blocks = _blocks_from_schedule(sched)
+    layer_to_ds_ids = _layer_to_ds_ids_from_mapping(L, ds_id_to_layer, ds_id_to_size)
+    if not any(layer_to_ds_ids):
+        return None
+
+    meta = sched.get("meta", {}) or {}
+    lookahead = int(meta.get("lookahead_blocks", cfg.lookahead_blocks))
+    cfg_used = replace(cfg,
+                       lookahead_blocks=int(lookahead),
+                       max_tasks_per_block=int(meta.get("max_tasks_per_block", cfg.max_tasks_per_block)))
+
+    per_task_start = _parse_per_task_start(sched.get("per_task_start_k", {}))
+    for li in range(L):
+        if not layer_to_ds_ids[li]:
+            continue
+        if (li, "FWD") not in per_task_start:
+            per_task_start[(li, "FWD")] = max(0, int(li) - int(cfg_used.lookahead_blocks))
+        if li not in keep_layers and (li, "BWD") not in per_task_start:
+            b_deadline = int(2 * L - 1 - li)
+            per_task_start[(li, "BWD")] = max(int(li) + 1, int(b_deadline) - int(cfg_used.lookahead_blocks))
+
+    prof = profiling_results.get(graph_id) if profiling_results is not None else None
+    ds_id_to_wait_pos_fwd = _build_ds_id_to_wait_pos(getattr(prof, "fwd_graph", None)) if prof is not None else {}
+    ds_id_to_wait_pos_bwd = _build_ds_id_to_wait_pos(getattr(prof, "bwd_graph", None)) if prof is not None else {}
+
+    persistent_set_used = set(int(x) for x in (persistent_set or set()))
+
+    refine_meta: dict = {"iters": 0, "skipped": "disabled"}
+    if int(cfg_used.inner_refine_max_iters) > 0:
+        per_task_start, refine_meta = _refine_plan_local_search(L=L,
+                                                                blocks=blocks,
+                                                                layer_to_ds_ids=layer_to_ds_ids,
+                                                                ds_id_to_size=ds_id_to_size,
+                                                                cfg=cfg_used,
+                                                                comm_model=comm_model,
+                                                                keep_layers=set(int(x) for x in keep_layers),
+                                                                per_task_start=per_task_start,
+                                                                persistent_set=persistent_set_used,
+                                                                ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                                                ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+
+    tasks = _build_tasks_from_plan(L=L,
+                                   layer_to_ds_ids=layer_to_ds_ids,
+                                   ds_id_to_size=ds_id_to_size,
+                                   keep_layers=set(int(x) for x in keep_layers),
+                                   per_task_start=per_task_start,
+                                   persistent_set=persistent_set_used,
+                                   ds_id_to_wait_pos_fwd=ds_id_to_wait_pos_fwd,
+                                   ds_id_to_wait_pos_bwd=ds_id_to_wait_pos_bwd)
+    if not _is_mem_feasible(tasks, blocks):
+        return None
+
+    launches, groups_by_start = _build_comm_groups(tasks, comm_model, ds_id_to_size, cfg_used)
+    step_ms, stall_ms_per_block, stall_bwd_per_layer, _ = _simulate_schedule_in_graph_order(
+        blocks,
+        groups_by_start,
+        set(int(x) for x in keep_layers),
+        separate_allgather_communicator=bool(cfg_used.separate_allgather_communicator),
+    )
+    reserved_mem = _reserved_mem_by_block(tasks, 2 * L)
+
+    keep_ds_ids: List[int] = []
+    for li in sorted(set(int(x) for x in keep_layers)):
+        keep_ds_ids.extend([int(ds_id) for ds_id in layer_to_ds_ids[int(li)] if int(ds_id) in ds_id_to_size])
+    keep_ds_ids = sorted(set(keep_ds_ids))
+
+    new_sched = dict(sched)
+    new_meta = dict(meta)
+    new_sched["keep_layers"] = sorted(set(int(x) for x in keep_layers))
+    new_sched["keep_ds_ids"] = keep_ds_ids
+    new_sched["persistent_ds_ids"] = sorted(persistent_set_used)
+    new_sched["launches"] = {int(k): v for k, v in sorted(launches.items())}
+    new_sched["per_task_start_k"] = {f"layer.{li}.{kind}": int(k) for (li, kind), k in sorted(per_task_start.items())}
+    new_sched["predicted_reserved_mem"] = [int(x) for x in reserved_mem]
+    new_sched["predicted_step_ms"] = float(step_ms)
+    new_sched["predicted_stall_ms"] = [float(x) for x in stall_ms_per_block]
+    new_sched["predicted_stall_bwd_per_layer"] = {int(li): float(v) for li, v in sorted(stall_bwd_per_layer.items())}
+    new_meta["prefetch_calls"] = int(sum(len(v) for v in launches.values()))
+    new_meta["inner_refine_after_rebalance"] = refine_meta
+    new_meta["predicted_peak_includes_persistent"] = False
+    new_meta["max_tasks_per_block"] = int(cfg_used.max_tasks_per_block)
+    new_sched["meta"] = new_meta
+
+    predicted_graph_peak_mem_bytes = _predicted_peak_mem_bytes_from_schedule(new_sched)
+    new_meta["predicted_graph_peak_mem_bytes"] = int(predicted_graph_peak_mem_bytes)
+    new_meta["predicted_graph_peak_mem_gb"] = float(predicted_graph_peak_mem_bytes) / float(1024**3)
+    new_meta["predicted_peak_mem_bytes"] = int(predicted_graph_peak_mem_bytes)
+    new_meta["predicted_peak_mem_gb"] = float(predicted_graph_peak_mem_bytes) / float(1024**3)
+    new_meta["predicted_peak_memory_scope"] = "graph_only_until_apply"
+    new_sched["meta"] = new_meta
+    new_sched["schedule_hash"] = _schedule_hash(new_sched)
+    return new_sched
+
+
+def _choose_low_comm_keep_subset(current_keep_layers: Set[int],
+                                 L: int,
+                                 ds_id_to_layer: Dict[int, int],
+                                 ds_id_to_size: Dict[int, int],
+                                 ds_id_to_value: Dict[int, float],
+                                 max_keep_layers: int) -> Set[int]:
+    if max_keep_layers <= 0:
+        return set()
+    layer_value: Dict[int, float] = {int(li): 0.0 for li in current_keep_layers}
+    layer_size: Dict[int, int] = {int(li): 0 for li in current_keep_layers}
+    for ds_id, layer in ds_id_to_layer.items():
+        layer = int(layer)
+        if layer not in current_keep_layers:
+            continue
+        layer_value[layer] = layer_value.get(layer, 0.0) + max(0.0, float(ds_id_to_value.get(int(ds_id), 0.0)))
+        layer_size[layer] = layer_size.get(layer, 0) + max(0, int(ds_id_to_size.get(int(ds_id), 0)))
+
+    ranked = sorted(
+        (int(li) for li in current_keep_layers if 0 <= int(li) < int(L)),
+        key=lambda li: (
+            float(layer_value.get(int(li), 0.0)),
+            float(layer_value.get(int(li), 0.0)) / float(max(1, int(layer_size.get(int(li), 0)))),
+            -int(li),
+        ),
+        reverse=True,
+    )
+    return set(int(x) for x in ranked[:max(0, int(max_keep_layers))])
+
+
+def _maybe_rebalance_low_comm_schedule(sched: dict,
+                                       cfg: _SchedulerConfig,
+                                       persistent_budget_bytes: int,
+                                       candidates: Sequence[int],
+                                       ds_id_to_size: Dict[int, int],
+                                       ds_id_to_value: Dict[int, float],
+                                       ds_id_to_layer: Dict[int, int],
+                                       profiling_results,
+                                       graph_id: int) -> Tuple[dict, dict]:
+    meta = sched.get("meta", {}) or {}
+    backend_policy = meta.get("comm_backend_policy", {}) or {}
+    if str(backend_policy.get("mode", "generic")) != "low_comm":
+        return sched, {"status": "skipped", "reason": "backend_not_low_comm"}
+
+    current_keep = set(map(int, sched.get("keep_layers", [])))
+    if not current_keep:
+        return sched, {"status": "skipped", "reason": "no_keep_layers"}
+
+    candidate_total = int(sum(max(0, int(ds_id_to_size.get(int(ds_id), 0))) for ds_id in candidates))
+    if candidate_total <= 0:
+        return sched, {"status": "skipped", "reason": "no_persistent_candidates"}
+
+    coverage = float(max(0, int(persistent_budget_bytes))) / float(candidate_total)
+    starvation_fraction = max(0.0, min(1.0, float(cfg.low_comm_persistent_starvation_fraction)))
+    if coverage >= starvation_fraction:
+        return sched, {
+            "status": "skipped",
+            "reason": "persistent_not_starved",
+            "persistent_budget_coverage": float(coverage),
+            "candidate_total_bytes": int(candidate_total),
+        }
+
+    cap_fraction = max(0.0, min(1.0, float(cfg.low_comm_keep_cap_fraction)))
+    max_keep_layers = int(math.floor(float(int(sched.get("L", 0))) * cap_fraction))
+    if cap_fraction > 0.0 and max_keep_layers <= 0:
+        max_keep_layers = 1
+    if len(current_keep) <= max_keep_layers:
+        return sched, {
+            "status": "skipped",
+            "reason": "already_within_keep_cap",
+            "persistent_budget_coverage": float(coverage),
+            "max_keep_layers": int(max_keep_layers),
+        }
+
+    L = int(sched.get("L", 0))
+    keep_subset = _choose_low_comm_keep_subset(current_keep,
+                                              L,
+                                              ds_id_to_layer,
+                                              ds_id_to_size,
+                                              ds_id_to_value,
+                                              max_keep_layers)
+    comm_meta = sched.get("comm_model", {}) or {}
+    comm_model = _CommModel(alpha_ms=float(comm_meta.get("alpha_ms", 0.0)),
+                            beta_ms_per_byte=float(comm_meta.get("beta_ms_per_byte", 0.0)))
+    candidate_sched = _schedule_with_keep_layers(sched,
+                                                 keep_subset,
+                                                 cfg,
+                                                 comm_model,
+                                                 ds_id_to_size,
+                                                 ds_id_to_layer,
+                                                 profiling_results,
+                                                 graph_id)
+    if candidate_sched is None:
+        return sched, {
+            "status": "skipped",
+            "reason": "candidate_infeasible",
+            "persistent_budget_coverage": float(coverage),
+            "max_keep_layers": int(max_keep_layers),
+        }
+
+    old_step = float(sched.get("predicted_step_ms", 0.0))
+    new_step = float(candidate_sched.get("predicted_step_ms", 0.0))
+    if old_step > 0.0 and new_step > old_step * 1.20:
+        return sched, {
+            "status": "skipped",
+            "reason": "predicted_regression_too_large",
+            "old_predicted_step_ms": float(old_step),
+            "new_predicted_step_ms": float(new_step),
+            "persistent_budget_coverage": float(coverage),
+            "max_keep_layers": int(max_keep_layers),
+        }
+
+    rebalance_meta = {
+        "status": "applied",
+        "reason": "low_comm_persistent_starved",
+        "persistent_budget_coverage": float(coverage),
+        "candidate_total_bytes": int(candidate_total),
+        "persistent_budget_bytes": int(persistent_budget_bytes),
+        "old_keep_layers": int(len(current_keep)),
+        "new_keep_layers": int(len(keep_subset)),
+        "max_keep_layers": int(max_keep_layers),
+        "old_predicted_step_ms": float(old_step),
+        "new_predicted_step_ms": float(new_step),
+    }
+    new_meta = dict(candidate_sched.get("meta", {}) or {})
+    new_meta["low_comm_rebalance"] = rebalance_meta
+    candidate_sched["meta"] = new_meta
+    candidate_sched["schedule_hash"] = _schedule_hash(candidate_sched)
+    return candidate_sched, rebalance_meta
+
+
+
+def _maybe_plan_recompute_relief(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
+                                 create_inputs_fn, mem_budget: float,
+                                 param_manager: Dict[int, DSGraphParamManager], bwd: bool) -> None:
+    if _CFG is None or not bool(_CFG.low_comm_recompute_relief):
+        return
+    try:
+        from . import selective_activation_recompute as recompute
+        recompute.plan(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd)
+    except Exception as exc:
+        log_rank0(f"[{NAME}] Recompute relief planning skipped: {exc}", enable=True)
+
+
+def _has_global_layer_scheduler_apply_pass(scheduled_passes: Optional[Sequence[object]]) -> bool:
+    if not scheduled_passes:
+        return False
+    for p in scheduled_passes:
+        if getattr(p, "__name__", "") != "apply":
+            continue
+        if getattr(p, "__module__", "").endswith(".global_layer_scheduler"):
+            return True
+    return False
+
+
+def maybe_apply_before_recompile(scheduled_passes: Optional[Sequence[object]]) -> None:
+    if _CFG is None or not bool(_CFG.low_comm_recompute_relief):
+        return
+    if not _has_global_layer_scheduler_apply_pass(scheduled_passes):
+        return
+    try:
+        from . import selective_activation_recompute as recompute
+        plan = getattr(recompute, "_LATEST_PLAN", None)
+        if plan is None or bool(getattr(recompute, "_APPLY_LOGGED", False)):
+            return
+        recompute._refine_plan_with_runtime_peak(plan)
+        recompute._APPLY_LOGGED = True
+        target_layers = {int(x) for x in plan.get("checkpointed_layers", plan.get("selected_layers", []))}
+        recompute._set_layer_checkpoint_selection(target_layers)
+        log_rank0(
+            f"[{NAME}] Applied Chorus recompute relief before recompile: "
+            f"checkpointed_layers={plan.get('checkpointed_layers', plan.get('selected_layers', []))} "
+            f"disabled_layers={plan.get('disabled_layers', [])} "
+            f"runtime_peak_alloc_bytes={plan.get('runtime_peak_alloc_bytes', 0)} "
+            f"effective_budget_bytes={plan.get('effective_budget_bytes', plan.get('budget_bytes', 0))} "
+            f"reserve_bytes={plan.get('pressure_reserve_bytes', 0)}",
+            enable=True,
+        )
+    except Exception as exc:
+        log_rank0(f"[{NAME}] Recompute relief apply skipped: {exc}", enable=True)
+
 def _maybe_set_persistent(persistent_ds_ids: Sequence[int]) -> None:
     ds_ids = [int(x) for x in (persistent_ds_ids or [])]
     if not ds_ids:
@@ -1984,20 +2630,19 @@ def _maybe_set_persistent(persistent_ds_ids: Sequence[int]) -> None:
     # calling into the Z3 custom op executor. When torch.compile is using
     # FakeTensorMode, executing this op can fail because NCCL/allgather needs
     # real data pointers. Temporarily disable fake tensor mode here.
+    set_chorus_persistent = getattr(nz3, "set_chorus_persistent", nz3.set_persistent)
     if unset_fake_temporarily is None:
         for ds_id in ds_ids:
-            nz3.set_persistent(int(ds_id))
+            set_chorus_persistent(int(ds_id))
     else:
         with unset_fake_temporarily():
             for ds_id in ds_ids:
-                nz3.set_persistent(int(ds_id))
-    log_rank0(f"[{NAME}] Set persistent buffers: {len(ds_ids)} ds_ids", enable=True)
+                set_chorus_persistent(int(ds_id))
+    log_rank0(f"[{NAME}] Set Chorus persistent buffers: {len(ds_ids)} ds_ids", enable=True)
 
 
 def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results, create_inputs_fn,
          mem_budget: float, param_manager: Dict[int, DSGraphParamManager], bwd: bool):
-    del create_inputs_fn, mem_budget, gm
-
     if not bwd:
         return None
     if _LAYER_MAPPING is None:
@@ -2019,7 +2664,8 @@ def plan(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], pr
         )
 
     schedule = _broadcast_and_store_schedule(schedule)
-    global _PERSISTENT_SET_DONE
+    _maybe_plan_recompute_relief(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd)
+    global _PERSISTENT_SET_DONE, _LATEST_SCHEDULE
     _PERSISTENT_SET_DONE = False
     if dist.get_rank() == 0:
         log_rank0(f"[{NAME}] Persistent buffers will be selected/allocated in apply() using observed warmup-step peak memory.", enable=True)
@@ -2123,6 +2769,8 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
             ds_ids_new: List[int] = []
             dtypes_new: List[torch.dtype] = []
             for ds_id in ds_ids:
+                if int(ds_id) in persistent_ds_ids:
+                    continue
                 pn_old = ds_id_to_param.get(int(ds_id))
                 if pn_old is None:
                     continue
@@ -2134,7 +2782,7 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
             name = f"gls_prefetch_{'bwd' if bwd else 'fwd'}_k{unified_k}_g{gi}"
             new_graph.create_node("call_function",
                                   torch.ops.dc.prefetch_params_fused.default,
-                                  args=(graph_id, params_new, ds_ids_new, dtypes_new),
+                                  args=(graph_id, params_new, ds_ids_new, dtypes_new, True),
                                   name=name)
             inserted = True
         return inserted
@@ -2205,9 +2853,291 @@ def _rewrite_graph_with_layer_comm(graph: Graph, graph_id: int, pm: DSGraphParam
     return new_graph
 
 
+def _collapse_persistent_state_nodes(gm: GraphModule, persistent_ds_ids: Sequence[int], *, elide_releases: bool,
+                                     elide_waits: bool) -> Tuple[GraphModule, int, int]:
+    persistent_set: Set[int] = set(int(x) for x in (persistent_ds_ids or ()))
+    if not persistent_set or (not elide_releases and not elide_waits):
+        return gm, 0, 0
+
+    new_graph = Graph()
+    env: Dict[Node, Node] = {}
+    elided_releases = 0
+    elided_waits = 0
+
+    for n in gm.graph.nodes:
+        if elide_waits and n.target == torch.ops.dc.wait_allgather.default:
+            ds_id = _get_ds_id_from_wait(n)
+            if int(ds_id) in persistent_set:
+                src = n.args[0]
+                if isinstance(src, Node) and src in env:
+                    env[n] = env[src]
+                    elided_waits += 1
+                    continue
+        if elide_releases and n.target == torch.ops.dc.release_param.default:
+            ds_id = _get_ds_id_from_release(n)
+            if int(ds_id) in persistent_set:
+                src = n.args[0]
+                if isinstance(src, Node) and src in env:
+                    env[n] = env[src]
+                    elided_releases += 1
+                    continue
+        new = new_graph.node_copy(n, lambda old: env[old])
+        env[n] = new
+
+    if elided_releases <= 0 and elided_waits <= 0:
+        return gm, 0, 0
+    new_graph.lint()
+    gm.graph = new_graph
+    return gm, int(elided_releases), int(elided_waits)
+
+
+def _prune_persistent_prefetch_nodes(gm: GraphModule, persistent_ds_ids: Sequence[int]) -> Tuple[GraphModule, int, int, int]:
+    persistent_set: Set[int] = set(int(x) for x in (persistent_ds_ids or ()))
+    if not persistent_set:
+        return gm, 0, 0, 0
+
+    new_graph = Graph()
+    env: Dict[Node, Node] = {}
+    dropped_ops = 0
+    filtered_ops = 0
+    dropped_ds_ids = 0
+
+    for n in gm.graph.nodes:
+        if n.target == torch.ops.dc.prefetch_params_fused.default and len(n.args) >= 3:
+            params = list(n.args[1])
+            ds_ids = [int(x) for x in list(n.args[2])]
+            if len(params) == len(ds_ids):
+                keep_indices = [i for i, ds_id in enumerate(ds_ids) if int(ds_id) not in persistent_set]
+                removed = len(ds_ids) - len(keep_indices)
+                if removed > 0 and not n.users:
+                    dropped_ds_ids += int(removed)
+                    if not keep_indices:
+                        dropped_ops += 1
+                        continue
+
+                    new_params = [env[p] if isinstance(p, Node) else p for i, p in enumerate(params) if i in keep_indices]
+                    new_ds_ids = [int(ds_ids[i]) for i in keep_indices]
+                    grouped_arg = bool(n.args[4]) if len(n.args) >= 5 else False
+                    if len(n.args) >= 4 and n.args[3] is not None:
+                        dtypes = list(n.args[3])
+                        if len(dtypes) == len(ds_ids):
+                            new_dtypes = [dtypes[i] for i in keep_indices]
+                            new_args = (n.args[0], new_params, new_ds_ids, new_dtypes, grouped_arg)
+                        else:
+                            new_args = (n.args[0], new_params, new_ds_ids, None, grouped_arg)
+                    elif len(n.args) >= 5:
+                        new_args = (n.args[0], new_params, new_ds_ids, None, grouped_arg)
+                    else:
+                        new_args = (n.args[0], new_params, new_ds_ids)
+                    new = new_graph.create_node(n.op, n.target, args=new_args, kwargs=dict(n.kwargs), name=n.name)
+                    env[n] = new
+                    filtered_ops += 1
+                    continue
+
+        new = new_graph.node_copy(n, lambda old: env[old])
+        env[n] = new
+
+    if dropped_ops <= 0 and filtered_ops <= 0:
+        return gm, 0, 0, 0
+    new_graph.lint()
+    gm.graph = new_graph
+    return gm, int(dropped_ops), int(filtered_ops), int(dropped_ds_ids)
+
+
+
+_CHORUS_PREFETCH_MARGIN = 0.1
+
+
+def _get_ds_id_from_allgather(node: Node) -> int:
+    assert node.target == torch.ops.dc.allgather_param.default
+    return int(node.args[2])
+
+
+def _schedule_chorus_local_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
+                                    create_inputs_fn, mem_budget: float, param_manager: Dict[int, DSGraphParamManager],
+                                    bwd: bool, *, fuse_slack: float, max_fuse_size: float,
+                                    max_buffered_size: float, grouped_prefetch: bool) -> GraphModule:
+    del graph_order, create_inputs_fn, mem_budget, param_manager
+
+    max_mem = get_accelerator().total_memory() * (1 - _CHORUS_PREFETCH_MARGIN)
+    vals_to_bcast = torch.tensor([max_mem], device=torch.device(get_accelerator().current_device()))
+    dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN)
+    max_mem = vals_to_bcast[0].item()
+
+    mem = profiling_results[graph_id].bwd_mem if bwd else profiling_results[graph_id].fwd_mem
+    op_time = profiling_results[graph_id].bwd_time if bwd else profiling_results[graph_id].fwd_time
+    tensor_sizes = profiling_results[graph_id].bwd_tensor_sizes if bwd else profiling_results[graph_id].fwd_tensor_sizes
+
+    mem_dict = {name: (alloc_mem, peak) for name, alloc_mem, _delta, peak in mem}
+    _time_dict = {name: (device_time, wall_time) for name, device_time, wall_time in op_time}
+    tensor_size_dict = {name: size for name, size in tensor_sizes}
+
+    def tensor_size_for_node(node: Node) -> int:
+        if node.name in tensor_size_dict:
+            return int(tensor_size_dict[node.name])
+        meta = getattr(node, "meta", {}) or {}
+        if "tensor_size" in meta:
+            return int(meta["tensor_size"])
+        if "alloc_mem" in meta:
+            return int(meta["alloc_mem"])
+        return 0
+
+    graph = gm.graph
+    total_param_size = sum(tensor_size_for_node(n) for n in graph.nodes
+                           if n.target == torch.ops.dc.allgather_param.default)
+    log_rank0(
+        f"[{NAME}] Chorus local_prefetch graph_id={graph_id} bwd={bwd} max_mem={max_mem} "
+        f"available_memory={get_accelerator().available_memory()} "
+        f"memory_allocated={get_accelerator().memory_allocated()} "
+        f"max_allocated={get_accelerator().max_memory_allocated()} total_param_size={total_param_size} "
+        f"margin={_CHORUS_PREFETCH_MARGIN}",
+        enable=True,
+    )
+
+    prev_mem = 0
+    prev_peak = 0
+    for node in graph.nodes:
+        if node.name in mem_dict:
+            prev_mem = mem_dict[node.name][0]
+            prev_peak = mem_dict[node.name][1]
+        else:
+            mem_dict[node.name] = (prev_mem, prev_peak)
+
+    comm_predictor = create_predictor()
+    order_rev = list(reversed(graph.nodes))
+    new_order_rev = []
+    prefetch_ags = []
+    prefetch_ag_groups = []
+    ag_tensor_size_sum = 0
+
+    for i, node in enumerate(order_rev):
+        if node.op != "placeholder":
+            assert i < len(order_rev) - 1
+            assert node.name in mem_dict
+            next_node = order_rev[i + 1]
+            _next_alloc_mem, next_peak = mem_dict[next_node.name]
+
+            while next_peak + ag_tensor_size_sum > max_mem or ag_tensor_size_sum > max_buffered_size:
+                if len(prefetch_ag_groups) > 0:
+                    fused_ag_nodes = prefetch_ag_groups.pop(0)
+                    total_ag_tensor_size = sum(tensor_size_for_node(ag_node) for ag_node in fused_ag_nodes)
+                    ag_tensor_size_sum -= total_ag_tensor_size
+                    new_order_rev.append(fused_ag_nodes)
+                    assert len(fused_ag_nodes) > 0
+                elif len(prefetch_ags) > 0:
+                    prefetch_ag_groups.append(prefetch_ags)
+                    prefetch_ags = []
+                else:
+                    break
+
+            if node.target == torch.ops.dc.allgather_param.default:
+                current_ag_size = sum(tensor_size_for_node(ag_node) for ag_node in prefetch_ags)
+                node_size = tensor_size_for_node(node)
+                pred_time_current = comm_predictor(current_ag_size)
+                pred_time_next = comm_predictor(node_size)
+                pred_time_fused = comm_predictor(current_ag_size + node_size)
+
+                do_fuse = max(pred_time_current, pred_time_next) * float(fuse_slack) > pred_time_fused and (
+                    current_ag_size + node_size) < float(max_fuse_size)
+
+                if len(prefetch_ags) > 0 and not do_fuse:
+                    prefetch_ag_groups.append(prefetch_ags)
+                    prefetch_ags = []
+                prefetch_ags.append(node)
+                ag_tensor_size_sum += node_size
+
+        new_order_rev.append(node)
+
+        if (node.op != "placeholder"
+                and node.target != torch.ops.dc.reload_parameter) and order_rev[i + 1].op == "placeholder":
+            for ag_group in prefetch_ag_groups:
+                assert len(ag_group) > 0
+                new_order_rev.append(ag_group)
+                total_ag_tensor_size = sum(tensor_size_for_node(ag_node) for ag_node in ag_group)
+                ag_tensor_size_sum -= total_ag_tensor_size
+            if len(prefetch_ags) > 0:
+                new_order_rev.append(prefetch_ags)
+                ag_tensor_size_sum -= sum(tensor_size_for_node(ag_node) for ag_node in prefetch_ags)
+            assert ag_tensor_size_sum == 0
+
+        assert ag_tensor_size_sum >= 0
+
+    new_graph = Graph()
+    env: Dict[str, Node] = {}
+    prefetch_groups_inserted = 0
+    prefetch_ds_ids_inserted = 0
+    for node in reversed(new_order_rev):
+        if isinstance(node, Node):
+            new_node = new_graph.node_copy(node, lambda n: env[n.name])
+            env[node.name] = new_node
+        else:
+            param_nodes = [ag_node.args[0] for ag_node in node]
+            param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
+            ds_ids = [_get_ds_id_from_allgather(ag_node) for ag_node in node]
+            prefetch_args = (graph_id, param_nodes_copy, ds_ids)
+            if bool(grouped_prefetch):
+                prefetch_args = (graph_id, param_nodes_copy, ds_ids, None, True)
+            new_graph.call_function(torch.ops.dc.prefetch_params_fused.default, args=prefetch_args)
+            prefetch_groups_inserted += 1
+            prefetch_ds_ids_inserted += len(ds_ids)
+
+    log_rank0(
+        f"[{NAME}] Chorus local_prefetch summary graph_id={graph_id} bwd={bwd} "
+        f"prefetch_calls={prefetch_groups_inserted} prefetch_ds_ids={prefetch_ds_ids_inserted} "
+        f"fuse_slack={float(fuse_slack)} max_fuse_size={float(max_fuse_size)} "
+        f"max_buffered_size={float(max_buffered_size)} grouped_prefetch={bool(grouped_prefetch)}",
+        enable=True,
+    )
+    new_graph.lint()
+    gm.graph = new_graph
+    return gm
+
+def _apply_low_comm_local_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
+                                   create_inputs_fn, mem_budget: float, param_manager: Dict[int, DSGraphParamManager],
+                                   bwd: bool, sched: dict, cfg: _SchedulerConfig) -> GraphModule:
+    gm = _schedule_chorus_local_prefetch(
+        gm,
+        graph_id,
+        graph_order,
+        profiling_results,
+        create_inputs_fn,
+        mem_budget,
+        param_manager,
+        bwd,
+        fuse_slack=float(cfg.low_comm_prefetch_fuse_slack),
+        max_fuse_size=float(cfg.low_comm_prefetch_fuse_max_bytes),
+        max_buffered_size=float(cfg.low_comm_prefetch_buffer_max_bytes),
+        grouped_prefetch=True,
+    )
+    if bool(cfg.low_comm_elide_persistent_prefetches) and bool(bwd):
+        # Forward prefetch refreshes persistent buffers after optimizer updates.
+        # Backward can reuse the forward-refreshed persistent buffers, so only
+        # backward persistent-prefetch calls are redundant in training.
+        gm, dropped_prefetch_ops, filtered_prefetch_ops, dropped_prefetch_ds_ids = _prune_persistent_prefetch_nodes(
+            gm, sched.get("persistent_ds_ids", []))
+        log_rank0(
+            f"[{NAME}] Low-comm persistent-prefetch pruning graph_id={graph_id} bwd={bwd} "
+            f"dropped_prefetch_ops={dropped_prefetch_ops} filtered_prefetch_ops={filtered_prefetch_ops} "
+            f"dropped_prefetch_ds_ids={dropped_prefetch_ds_ids}",
+            enable=True,
+        )
+    if bool(cfg.low_comm_elide_persistent_releases) or bool(cfg.low_comm_elide_persistent_waits):
+        gm, elided_releases, elided_waits = _collapse_persistent_state_nodes(
+            gm,
+            sched.get("persistent_ds_ids", []),
+            elide_releases=bool(cfg.low_comm_elide_persistent_releases),
+            elide_waits=bool(cfg.low_comm_elide_persistent_waits),
+        )
+        log_rank0(
+            f"[{NAME}] Low-comm persistent-state collapse graph_id={graph_id} bwd={bwd} "
+            f"elided_release_ops={elided_releases} elided_wait_ops={elided_waits}",
+            enable=True,
+        )
+    return gm
+
 def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results, create_inputs_fn,
           mem_budget: float, param_manager: Dict[int, DSGraphParamManager], bwd: bool) -> GraphModule:
-    del create_inputs_fn, mem_budget
+    global _PERSISTENT_SET_DONE, _LATEST_SCHEDULE
 
     if _LATEST_SCHEDULE is None or _LAYER_MAPPING is None or _CFG is None:
         return None
@@ -2228,7 +3158,6 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
 
     # If enabled, select + allocate persistent buffers using observed runtime
     # peak memory (warmup steps), not compile-time peak memory.
-    global _PERSISTENT_SET_DONE
     if not _PERSISTENT_SET_DONE:
         # This codepath runs inside the torch.compile backend and can be reached
         # by multiple graphs (and potentially multiple threads). Ensure the
@@ -2310,8 +3239,26 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                             non_torch_bytes = int(vals[0].item())
 
                 safe_total_for_torch = max(0, int(safe_total) - int(non_torch_bytes))
-                persistent_budget_bytes = max(
+                conservative_persistent_budget_bytes = max(
                     0, int(safe_total_for_torch) - int(baseline_peak) - int(allocator_margin_bytes))
+
+                backend_policy = meta.get("comm_backend_policy", {}) or {}
+                persistent_budget_mode = str(getattr(_CFG, "low_comm_persistent_budget_mode", "selective")).strip().lower()
+                selective_persistent_budget_bytes = 0
+                if str(backend_policy.get("mode", "generic")) == "low_comm" and persistent_budget_mode != "conservative":
+                    usable_fraction = max(0.0, min(1.0, float(getattr(_CFG, "low_comm_persistent_usable_fraction", 0.90))))
+                    selective_persistent_budget_bytes = max(
+                        0, int(float(total_mem) * float(usable_fraction)) - int(baseline_live_peak))
+                    if persistent_budget_mode == "max":
+                        max_persistent_budget_bytes = max(0, int(safe_total) - int(baseline_live_peak))
+                        persistent_budget_bytes = max(int(conservative_persistent_budget_bytes),
+                                                      int(selective_persistent_budget_bytes),
+                                                      int(max_persistent_budget_bytes))
+                    else:
+                        persistent_budget_bytes = max(int(conservative_persistent_budget_bytes),
+                                                      int(selective_persistent_budget_bytes))
+                else:
+                    persistent_budget_bytes = int(conservative_persistent_budget_bytes)
 
                 # Load candidate ranking and sizes from the planned schedule when available.
                 cand_list = meta.get("persistent_candidates", [])
@@ -2335,9 +3282,87 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                     ds_id_to_value = {int(k): max(0.0, float(v)) for k, v in ds_id_to_allgather_ms.items()}
                     candidates = _rank_persistent_candidates(ds_id_to_size, ds_id_to_allgather_ms)
 
+                state_utility_meta = {"status": "skipped", "reason": "backend_not_low_comm"}
+                if str(backend_policy.get("mode", "generic")) == "low_comm":
+                    state_op_ms = max(0.0, float(getattr(_CFG, "low_comm_state_op_ms", 0.0)))
+                    value_mode = str(getattr(_CFG, "low_comm_persistent_value_mode", "comm_state")).strip().lower()
+                    comm_value_weight = max(0.0, float(getattr(_CFG, "low_comm_comm_value_weight", 1.0)))
+                    if state_op_ms > 0.0:
+                        state_counts = _build_ds_id_state_op_counts(profiling_results)
+                        state_value_total = 0.0
+                        comm_value_total_before = float(sum(float(ds_id_to_value.get(int(ds_id), 0.0)) for ds_id in candidates))
+                        touched = 0
+                        for ds_id in candidates:
+                            ds_id = int(ds_id)
+                            added = float(state_op_ms) * float(state_counts.get(ds_id, 0))
+                            old_value = max(0.0, float(ds_id_to_value.get(ds_id, 0.0)))
+                            if value_mode in {"event_density", "state_density", "events"}:
+                                ds_id_to_value[ds_id] = float(comm_value_weight) * old_value + max(0.0, added)
+                            elif added > 0.0:
+                                ds_id_to_value[ds_id] = old_value + added
+                            if added > 0.0 or value_mode in {"event_density", "state_density", "events"}:
+                                state_value_total += float(added)
+                                touched += 1
+                        comm_value_total_after = float(sum(float(ds_id_to_value.get(int(ds_id), 0.0)) for ds_id in candidates))
+                        state_utility_meta = {
+                            "status": "applied",
+                            "value_mode": str(value_mode),
+                            "comm_value_weight": float(comm_value_weight),
+                            "state_op_ms": float(state_op_ms),
+                            "candidate_ds_ids": int(touched),
+                            "added_value_ms": float(state_value_total),
+                            "comm_value_before_ms": float(comm_value_total_before),
+                            "objective_value_after_ms": float(comm_value_total_after),
+                        }
+                    else:
+                        state_utility_meta = {"status": "skipped", "reason": "zero_state_op_ms"}
+
                 ds_id_to_layer = {int(k): int(v) for k, v in meta.get("ds_id_to_layer", {}).items()}
+                rebalance_meta = {"status": "skipped", "reason": "not_attempted"}
+                if _CFG is not None:
+                    sched, rebalance_meta = _maybe_rebalance_low_comm_schedule(sched,
+                                                                               _CFG,
+                                                                               persistent_budget_bytes,
+                                                                               candidates,
+                                                                               ds_id_to_size,
+                                                                               ds_id_to_value,
+                                                                               ds_id_to_layer,
+                                                                               profiling_results,
+                                                                               graph_id)
+                    _LATEST_SCHEDULE = sched
+                    meta = sched.get("meta", {})
+                    ds_id_to_layer = {int(k): int(v) for k, v in meta.get("ds_id_to_layer", {}).items()}
+
                 persistent_ds_ids, persistent_mem_bytes, persistent_value_ms, persistent_select_meta = _select_persistent_ds_ids_block_safe(
                     candidates, ds_id_to_size, persistent_budget_bytes, sched, ds_id_to_layer, ds_id_to_value)
+
+                post_persistent_schedule_meta = {"status": "skipped", "reason": "no_persistent_ids"}
+                if persistent_ds_ids and _CFG is not None:
+                    comm_meta = sched.get("comm_model", {}) or {}
+                    comm_model = _CommModel(alpha_ms=float(comm_meta.get("alpha_ms", 0.0)),
+                                            beta_ms_per_byte=float(comm_meta.get("beta_ms_per_byte", 0.0)))
+                    old_prefetch_calls = int((sched.get("meta", {}) or {}).get("prefetch_calls", 0))
+                    post_sched = _schedule_with_keep_layers(sched,
+                                                            set(map(int, sched.get("keep_layers", []))),
+                                                            _CFG,
+                                                            comm_model,
+                                                            ds_id_to_size,
+                                                            ds_id_to_layer,
+                                                            profiling_results,
+                                                            graph_id,
+                                                            persistent_set=set(map(int, persistent_ds_ids)))
+                    if post_sched is not None:
+                        sched = post_sched
+                        _LATEST_SCHEDULE = sched
+                        meta = sched.get("meta", {})
+                        new_prefetch_calls = int(meta.get("prefetch_calls", 0))
+                        post_persistent_schedule_meta = {
+                            "status": "applied",
+                            "old_prefetch_calls": int(old_prefetch_calls),
+                            "new_prefetch_calls": int(new_prefetch_calls),
+                        }
+                    else:
+                        post_persistent_schedule_meta = {"status": "skipped", "reason": "candidate_infeasible"}
                 if dist.get_rank() == 0:
                     log_rank0(
                         f"[{NAME}] Deferred persistent selection: observed_peak_alloc_bytes={int(observed_peak_alloc)} "
@@ -2349,7 +3374,18 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                         f"profile_peak_bytes={int(profile_peak)} baseline_live_peak_bytes={int(baseline_live_peak)} "
                         f"baseline_peak_bytes={int(baseline_peak)} "
                         f"allocator_margin_bytes={int(allocator_margin_bytes)} "
-                        f"persistent_budget_bytes={int(persistent_budget_bytes)} selected_ds_ids={len(persistent_ds_ids)} "
+                        f"persistent_budget_mode={persistent_budget_mode} "
+                        f"conservative_persistent_budget_bytes={int(conservative_persistent_budget_bytes)} "
+                        f"selective_persistent_budget_bytes={int(selective_persistent_budget_bytes)} "
+                        f"persistent_budget_bytes={int(persistent_budget_bytes)} "
+                        f"rebalance_status={rebalance_meta.get('status', 'unknown')} "
+                        f"rebalance_reason={rebalance_meta.get('reason', '')} "
+                        f"post_persistent_schedule_status={post_persistent_schedule_meta.get('status', 'unknown')} "
+                        f"state_utility_status={state_utility_meta.get('status', 'unknown')} "
+                        f"state_value_mode={state_utility_meta.get('value_mode', 'none')} "
+                        f"state_utility_added_ms={float(state_utility_meta.get('added_value_ms', 0.0)):.4f} "
+                        f"state_objective_after_ms={float(state_utility_meta.get('objective_value_after_ms', 0.0)):.4f} "
+                        f"selected_ds_ids={len(persistent_ds_ids)} "
                         f"persistent_mem_bytes={int(persistent_mem_bytes)} selected_value_ms={float(persistent_value_ms):.4f} "
                         f"selection_method={persistent_select_meta.get('method', 'unknown')} "
                         f"selection_status={persistent_select_meta.get('status', 'unknown')}",
@@ -2370,7 +3406,13 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 meta["allocator_margin_bytes"] = int(allocator_margin_bytes)
                 meta["baseline_live_peak_bytes"] = int(baseline_live_peak)
                 meta["baseline_peak_bytes"] = int(baseline_peak)
+                meta["persistent_budget_mode"] = str(persistent_budget_mode)
+                meta["conservative_persistent_budget_bytes"] = int(conservative_persistent_budget_bytes)
+                meta["selective_persistent_budget_bytes"] = int(selective_persistent_budget_bytes)
                 meta["persistent_budget_bytes"] = int(persistent_budget_bytes)
+                meta["low_comm_rebalance"] = rebalance_meta
+                meta["low_comm_state_utility"] = state_utility_meta
+                meta["post_persistent_schedule"] = post_persistent_schedule_meta
                 meta["persistent_mem_bytes"] = int(persistent_mem_bytes)
                 meta["persistent_value_ms"] = float(persistent_value_ms)
                 meta["persistent_selection"] = {
@@ -2399,8 +3441,35 @@ def apply(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], p
                 _maybe_set_persistent(persistent_ds_ids)
                 _PERSISTENT_SET_DONE = True
 
+    meta = sched.get("meta", {}) or {}
+    backend_policy = meta.get("comm_backend_policy", {}) or {}
+    use_local_prefetch = (
+        str(backend_policy.get("mode", "generic")) == "low_comm"
+        and str(_CFG.low_comm_graph_rewrite_mode) in {"local_prefetch", "prefetch"}
+        and not sched.get("keep_layers")
+        and not sched.get("keep_ds_ids")
+    )
+    if use_local_prefetch:
+        log_rank0(
+            f"[{NAME}] Using low-comm graph rewrite mode: {str(_CFG.low_comm_graph_rewrite_mode)} graph_id={graph_id} bwd={bwd}",
+            enable=True)
+        return _apply_low_comm_local_prefetch(gm, graph_id, graph_order, profiling_results, create_inputs_fn,
+                                             mem_budget, param_manager, bwd, sched, _CFG)
+
     new_graph = _rewrite_graph_with_layer_comm(gm.graph, graph_id, pm, mapping, sched, bwd=bwd)
     if new_graph is None:
         return None
     gm.graph = new_graph
+    if bool(_CFG.low_comm_elide_persistent_releases) or bool(_CFG.low_comm_elide_persistent_waits):
+        gm, elided_releases, elided_waits = _collapse_persistent_state_nodes(
+            gm,
+            sched.get("persistent_ds_ids", []),
+            elide_releases=bool(_CFG.low_comm_elide_persistent_releases),
+            elide_waits=bool(_CFG.low_comm_elide_persistent_waits),
+        )
+        log_rank0(
+            f"[{NAME}] Persistent-state collapse graph_id={graph_id} bwd={bwd} "
+            f"elided_release_ops={elided_releases} elided_wait_ops={elided_waits}",
+            enable=True,
+        )
     return gm

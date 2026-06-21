@@ -175,12 +175,10 @@ def register_custom_ops():
                     self.codegen_comment(wrapper)
                     args = [*self.codegen_args(), *self.codegen_kwargs()]
 
-                    # this need to be seted 2.7, otherwise it has the error message:
-                    # TypeError: PythonWrapperCodegen.generate_fallback_kernel() takes 2 positional arguments but 3 were given
                     if required_torch_version(min_version=2.7):
-                        V.graph.wrapper_code.generate_fallback_kernel(self)
-                    else:
                         V.graph.wrapper_code.generate_fallback_kernel(self, args)
+                    else:
+                        V.graph.wrapper_code.generate_fallback_kernel(self)
 
                     if isinstance(self.layout, Layout):
                         self.codegen_size_asserts(wrapper)
