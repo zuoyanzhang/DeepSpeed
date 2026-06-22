@@ -23,8 +23,8 @@ SIMPLEFSDP_FAST_OPTS=${SIMPLEFSDP_FAST_OPTS:-"--simplefsdp_enable_compiled_autog
 if [ -z "${FSDP2_FAST_OPTS+x}" ]; then
         FSDP2_FAST_OPTS="--fsdp2-fast"
 fi
-MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/LLM-Research/"}
-# MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/baichuan-inc/"}
+# MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/LLM-Research/"}
+MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/baichuan-inc/"}
 # MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/Qwen/"}
 
 
@@ -32,14 +32,14 @@ MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/LLM-Research/"}
 # MODEL=${MODEL_NAME:-"Llama-3.2-1B-Instruct"}
 # MODEL=${MODEL_NAME:-"Llama-3.2-3B-Instruct"}
 # MODEL=${MODEL_NAME:-"llama-2-7b"}
-MODEL=${MODEL_NAME:-"Meta-Llama-3-8B"}
+# MODEL=${MODEL_NAME:-"Meta-Llama-3-8B"}
 # MODEL=${MODEL_NAME:-"Qwen2.5-7B-Instruct"}
 # MODEL=${MODEL_NAME:-"Qwen3-8B"}
 # MODEL=${MODEL_NAME:-"Qwen3-4B"}
 # MODEL=${MODEL_NAME:-"Qwen3-14B"}
-# MODEL=${MODEL_NAME:-"Baichuan2-13B-Base"}
+MODEL=${MODEL_NAME:-"Baichuan2-13B-Base"}
 BATCH_SIZE_OPTS=(1)
-SEQ_LENGTH_OPTS=(512)
+SEQ_LENGTH_OPTS=(2048)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
         # 如果要预加载权重, 加上${LOAD_OPTS}， 固定种子--deterministic

@@ -126,6 +126,36 @@ def get_args():
     parser.add_argument("--simplefsdp_coalesce_bucket_mb", "--simplefsdp-coalesce-bucket-mb",
                         type=int, default=128,
                         help="Native SimpleFSDP c10d coalescing bucket size in MiB. 0 disables local graph bucketing.")
+    parser.add_argument("--simplefsdp_enable_chorus", "--simplefsdp-enable-chorus",
+                        action="store_true",
+                        help="Enable Chorus-style graph scheduling for SimpleFSDP all-gather collectives.")
+    parser.add_argument("--simplefsdp_chorus_prefetch_groups", "--simplefsdp-chorus-prefetch-groups",
+                        type=int, default=-1,
+                        help="Number of SimpleFSDP all-gather buckets Chorus may raise before earlier consumer buckets. -1 auto-selects a workload-aware window; non-negative values are manual ablations.")
+    parser.add_argument("--simplefsdp_chorus_live_mb", "--simplefsdp-chorus-live-mb",
+                        type=int, default=-1,
+                        help="Approximate extra live all-gather budget for SimpleFSDP-Chorus graph scheduling in MiB. -1 reuses the automatic persistent-retention budget; 0 disables the cap; positive values are manual ablations.")
+    parser.add_argument("--simplefsdp_chorus_global_retention_mb", "--simplefsdp-chorus-global-retention-mb",
+                        type=int, default=-1,
+                        help="Runtime-footprint budget for SimpleFSDP-Chorus global retention in MiB. -1 auto-selects from actual GPU memory with a safety margin; 0 disables persistent retention; positive values are manual ablations.")
+    parser.add_argument("--simplefsdp_chorus_persistent_usable_fraction", "--simplefsdp-chorus-persistent-usable-fraction",
+                        type=float, default=0.90,
+                        help="Safety margin for automatic SimpleFSDP-Chorus persistent retention. The auto budget targets at most this fraction of total GPU memory.")
+    parser.add_argument("--simplefsdp_chorus_persistent_baseline_param_multiplier", "--simplefsdp-chorus-persistent-baseline-param-multiplier",
+                        type=float, default=1.45,
+                        help="Conservative multiplier from loaded fp32 model parameter bytes to estimated non-persistent nvidia-smi peak for automatic SimpleFSDP-Chorus budgeting.")
+    parser.add_argument("--simplefsdp_chorus_persistent_cost_multiplier", "--simplefsdp-chorus-persistent-cost-multiplier",
+                        type=float, default=20.00,
+                        help="Runtime footprint multiplier for each extra persistent parameter byte, covering grads, optimizer state, foreach temporaries, and allocator slack.")
+    parser.add_argument("--simplefsdp_chorus_persistent_static_margin_mb", "--simplefsdp-chorus-persistent-static-margin-mb",
+                        type=int, default=1024,
+                        help="Additional fixed safety margin in MiB for automatic SimpleFSDP-Chorus persistent retention budgeting.")
+    parser.add_argument("--simplefsdp_chorus_global_retention_max_layers", "--simplefsdp-chorus-global-retention-max-layers",
+                        type=int, default=0,
+                        help="Optional max number of transformer layers selected for SimpleFSDP-Chorus global retention. 0 means budget-only.")
+    parser.add_argument("--simplefsdp_chorus_milp_time_limit_s", "--simplefsdp-chorus-milp-time-limit-s",
+                        type=float, default=2.0,
+                        help="Time limit for the SimpleFSDP-Chorus global-retention MILP planner.")
     parser.add_argument("--simplefsdp_replicate_small_param_numel", "--simplefsdp-replicate-small-param-numel",
                         type=int, default=16384,
                         help="Replicate SimpleFSDP parameters with at most this many elements to remove tiny all-gathers. 0 disables this memory-for-latency policy.")
@@ -162,6 +192,10 @@ def get_args():
     parser.add_argument("--fsdp2_backward_prefetch_distance", "--fsdp2-backward-prefetch-distance",
                         type=int, default=1,
                         help="Number of preceding FSDP2 layers to prefetch in backward.")
+    parser.add_argument("--fsdp2_enable_chorus", "--fsdp2-enable-chorus", action="store_true",
+                        help="Enable Chorus-style nonuniform FSDP2 prefetch lists using per-layer parameter-byte budgets.")
+    parser.add_argument("--fsdp2_chorus_live_mb", "--fsdp2-chorus-live-mb", type=int, default=4096,
+                        help="Approximate extra live full-parameter budget for FSDP2-Chorus prefetching in MiB. 0 disables the cap.")
 
     return parser.parse_args()
 
@@ -253,7 +287,14 @@ def configure_fsdp2_explicit_prefetch(
 ) -> dict:
     fsdp_layers = [module for module in model.modules() if _is_fsdp2_transformer_layer(module)]
     if not fsdp_layers:
-        return {"enabled": False, "layers": 0, "forward_distance": 0, "backward_distance": 0}
+        return {
+            "enabled": False,
+            "layers": 0,
+            "forward_distance": 0,
+            "backward_distance": 0,
+            "chorus_enabled": False,
+            "chorus_live_mb": 0,
+        }
 
     forward_distance = max(0, int(forward_distance))
     backward_distance = max(0, int(backward_distance))
@@ -268,6 +309,84 @@ def configure_fsdp2_explicit_prefetch(
         "layers": len(fsdp_layers),
         "forward_distance": forward_distance,
         "backward_distance": backward_distance,
+        "chorus_enabled": False,
+        "chorus_live_mb": 0,
+    }
+
+
+def _module_param_nbytes(module: torch.nn.Module) -> int:
+    nbytes = 0
+    for param in module.parameters(recurse=True):
+        try:
+            nbytes += int(param.numel()) * int(param.element_size())
+        except Exception:
+            continue
+    return int(nbytes)
+
+
+def _budgeted_prefetch_list(layers, sizes, start_idx: int, step: int, max_distance: int, budget_bytes: int):
+    selected = []
+    live_bytes = 0
+    idx = int(start_idx)
+    for _ in range(max(0, int(max_distance))):
+        if idx < 0 or idx >= len(layers):
+            break
+        size = max(1, int(sizes[idx]))
+        if budget_bytes > 0 and selected and live_bytes + size > budget_bytes:
+            break
+        selected.append(layers[idx])
+        live_bytes += size
+        idx += int(step)
+    return selected
+
+
+def configure_fsdp2_chorus_prefetch(
+    model: torch.nn.Module,
+    forward_max_distance: int,
+    backward_max_distance: int,
+    live_budget_mb: int,
+) -> dict:
+    fsdp_layers = [module for module in model.modules() if _is_fsdp2_transformer_layer(module)]
+    if not fsdp_layers:
+        return {
+            "enabled": False,
+            "layers": 0,
+            "forward_distance": 0,
+            "backward_distance": 0,
+            "chorus_enabled": False,
+            "chorus_live_mb": 0,
+        }
+
+    forward_max_distance = max(0, int(forward_max_distance))
+    backward_max_distance = max(0, int(backward_max_distance))
+    budget_bytes = max(0, int(live_budget_mb)) * 1024 * 1024
+    layer_sizes = [_module_param_nbytes(layer) for layer in fsdp_layers]
+
+    total_forward_prefetches = 0
+    total_backward_prefetches = 0
+    for idx, layer in enumerate(fsdp_layers):
+        forward_modules = _budgeted_prefetch_list(
+            fsdp_layers, layer_sizes, idx + 1, 1, forward_max_distance, budget_bytes
+        )
+        backward_modules = _budgeted_prefetch_list(
+            fsdp_layers, layer_sizes, idx - 1, -1, backward_max_distance, budget_bytes
+        )
+        if forward_modules:
+            layer.set_modules_to_forward_prefetch(forward_modules)
+        if backward_modules:
+            layer.set_modules_to_backward_prefetch(backward_modules)
+        total_forward_prefetches += len(forward_modules)
+        total_backward_prefetches += len(backward_modules)
+
+    return {
+        "enabled": True,
+        "layers": len(fsdp_layers),
+        "forward_distance": forward_max_distance,
+        "backward_distance": backward_max_distance,
+        "chorus_enabled": True,
+        "chorus_live_mb": int(live_budget_mb),
+        "chorus_forward_prefetches": int(total_forward_prefetches),
+        "chorus_backward_prefetches": int(total_backward_prefetches),
     }
 
 
@@ -281,10 +400,298 @@ def make_adamw_optimizer(params, lr: float, fused: bool = False):
 
 
 
+def _module_tree_param_nbytes(module: torch.nn.Module) -> int:
+    seen = set()
+    nbytes = 0
+    for param in module.parameters(recurse=True):
+        if param is None:
+            continue
+        ident = id(param)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            nbytes += int(param.numel()) * int(param.element_size())
+        except Exception:
+            continue
+    return int(nbytes)
+
+
+def _mark_module_tree(module: torch.nn.Module, attr: str, value: bool) -> None:
+    for submodule in module.modules():
+        setattr(submodule, attr, bool(value))
+
+
+def estimate_simplefsdp_chorus_auto_persistent_budget(
+    model: torch.nn.Module,
+    usable_fraction: float,
+    baseline_param_multiplier: float,
+    runtime_cost_multiplier: float,
+    static_margin_mb: int,
+) -> dict:
+    total_mem = 0
+    current_alloc = 0
+    current_reserved = 0
+    if torch.cuda.is_available():
+        try:
+            total_mem = int(torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory)
+            current_alloc = int(torch.cuda.memory_allocated())
+            current_reserved = int(torch.cuda.memory_reserved())
+        except Exception:
+            total_mem = 0
+    usable_fraction = max(0.0, min(1.0, float(usable_fraction)))
+    baseline_param_multiplier = max(0.0, float(baseline_param_multiplier))
+    runtime_cost_multiplier = max(1.0, float(runtime_cost_multiplier))
+    static_margin_bytes = max(0, int(static_margin_mb)) * 1024 * 1024
+    model_param_bytes = _module_tree_param_nbytes(model)
+    safe_total = int(float(total_mem) * usable_fraction)
+    estimated_from_params = int(float(model_param_bytes) * baseline_param_multiplier) + static_margin_bytes
+    observed_floor = max(int(current_alloc), int(current_reserved))
+    estimated_baseline = max(estimated_from_params, observed_floor)
+    runtime_budget = max(0, safe_total - estimated_baseline)
+    return {
+        "enabled": True,
+        "total_mem_bytes": int(total_mem),
+        "usable_fraction": float(usable_fraction),
+        "safe_total_bytes": int(safe_total),
+        "model_param_bytes": int(model_param_bytes),
+        "baseline_param_multiplier": float(baseline_param_multiplier),
+        "runtime_cost_multiplier": float(runtime_cost_multiplier),
+        "static_margin_bytes": int(static_margin_bytes),
+        "current_alloc_bytes": int(current_alloc),
+        "current_reserved_bytes": int(current_reserved),
+        "estimated_baseline_bytes": int(estimated_baseline),
+        "runtime_budget_bytes": int(runtime_budget),
+        "runtime_budget_mb": int(runtime_budget // (1024 * 1024)),
+    }
+
+
+def _collect_layer_param_retention_entries(layer_entries, replicate_small_param_numel: int):
+    entries = []
+    seen = set()
+    min_numel = max(0, int(replicate_small_param_numel))
+    for layer_idx, (_, _, child) in enumerate(layer_entries):
+        for module_path, module in child.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                if param is None:
+                    continue
+                ident = id(param)
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                try:
+                    numel = int(param.numel())
+                    nbytes = int(numel * param.element_size())
+                except Exception:
+                    continue
+                if numel <= min_numel or nbytes <= 0:
+                    continue
+                # Persistent retention is only useful for real matrix/vector
+                # parameters. Tiny tensors are already covered by the small-param
+                # replication policy and should not consume MILP budget.
+                if getattr(param, "ndim", 0) < 1:
+                    continue
+                qualified = f"{layer_idx}:{module_path}.{param_name}" if module_path else f"{layer_idx}:{param_name}"
+                entries.append({
+                    "layer_idx": int(layer_idx),
+                    "module": module,
+                    "param_name": param_name,
+                    "qualified": qualified,
+                    "nbytes": int(nbytes),
+                    "numel": int(numel),
+                })
+    return entries
+
+
+def plan_simplefsdp_chorus_global_retention(
+    layer_entries,
+    world_size: int,
+    retention_budget_mb: int,
+    max_layers: int,
+    activation_checkpointing: bool,
+    milp_time_limit_s: float,
+    replicate_small_param_numel: int = 0,
+    runtime_cost_multiplier: float = 1.0,
+) -> dict:
+    import math
+
+    param_entries = _collect_layer_param_retention_entries(layer_entries, replicate_small_param_numel)
+    num_items = len(param_entries)
+    budget_bytes = max(0, int(retention_budget_mb)) * 1024 * 1024
+    world_size = max(1, int(world_size))
+    if num_items <= 0 or budget_bytes <= 0 or world_size <= 1:
+        return {
+            "enabled": False,
+            "method": "none",
+            "selected_layers": [],
+            "selected_layers_csv": "",
+            "selected_params": [],
+            "selected_param_names_csv": "",
+            "selected_count": 0,
+            "selected_param_count": 0,
+            "budget_mb": int(retention_budget_mb),
+            "extra_bytes": 0,
+            "runtime_extra_bytes": 0,
+            "global_bytes": 0,
+            "binary_vars": 0,
+            "constraints": 0,
+            "solve_time_s": 0.0,
+            "final_gap": 0.0,
+            "status": -1,
+            "status_msg": "disabled",
+        }
+
+    sizes = [int(entry["nbytes"]) for entry in param_entries]
+    extra = [max(0, int(math.ceil(float(size) * (1.0 - 1.0 / float(world_size))))) for size in sizes]
+    runtime_cost_multiplier = max(1.0, float(runtime_cost_multiplier))
+    # Python-level persistent full-param caching has a fixed per-parameter cost
+    # (cache lookup, version check, tensor lifetime, allocator pressure) in
+    # addition to bytes. Accounting for that fixed cost keeps Chorus from using
+    # the whole memory budget on many small attention matrices and instead
+    # favors fewer high-byte all-gathers such as MLP projections.
+    per_param_runtime_overhead = 64 * 1024 * 1024 if activation_checkpointing else 32 * 1024 * 1024
+    runtime_costs = [
+        max(0, int(math.ceil(float(cost) * runtime_cost_multiplier)) + int(per_param_runtime_overhead))
+        for cost in extra
+    ]
+    reuse_factor = 3.0 if activation_checkpointing else 2.0
+    max_layer_idx = max(1, max(int(entry["layer_idx"]) for entry in param_entries))
+    values = []
+    for entry, size in zip(param_entries, sizes):
+        layer_bias = 1.0 + 0.03 * float(entry["layer_idx"]) / float(max_layer_idx)
+        name = str(entry["qualified"])
+        role_bias = 1.0
+        if "down_proj" in name or "gate_proj" in name or "up_proj" in name:
+            role_bias = 1.35
+        elif "W_pack" in name:
+            role_bias = 1.15
+        elif "q_proj" in name or "o_proj" in name:
+            role_bias = 1.02
+        elif "k_proj" in name or "v_proj" in name:
+            role_bias = 0.90
+        values.append(float(size) * reuse_factor * layer_bias * role_bias)
+    # Topology-aware admission: persistent retention is only useful when saved
+    # communication exceeds the added live-state/runtime pressure. This prevents
+    # NVLink runs from filling all spare memory with persistent full params when
+    # the communication is already cheap. Lower runtime_cost_multiplier values on
+    # slower fabrics naturally admit more parameters.
+    min_value_per_runtime_cost = 0.35 if activation_checkpointing else 0.25
+    net_values = [
+        float(value) - min_value_per_runtime_cost * float(cost)
+        for value, cost in zip(values, runtime_costs)
+    ]
+
+    selected = []
+    method = "greedy"
+    status = -1
+    status_msg = "greedy_fallback"
+    final_gap = 0.0
+    solve_time_s = 0.0
+    constraints = 1 + (1 if int(max_layers) > 0 else 0)
+    try:
+        import numpy as np
+        from scipy.optimize import Bounds, LinearConstraint, milp
+        from scipy.sparse import coo_matrix
+
+        rows = []
+        cols = []
+        data = []
+        lb = []
+        ub = []
+        row = 0
+        for idx, cost in enumerate(runtime_costs):
+            rows.append(row)
+            cols.append(idx)
+            data.append(float(cost))
+        lb.append(0.0)
+        ub.append(float(budget_bytes))
+        row += 1
+        if int(max_layers) > 0:
+            for idx in range(num_items):
+                rows.append(row)
+                cols.append(idx)
+                data.append(1.0)
+            lb.append(0.0)
+            ub.append(float(max(0, int(max_layers))))
+            row += 1
+        A = coo_matrix((np.array(data, dtype=float), (np.array(rows, dtype=int), np.array(cols, dtype=int))),
+                       shape=(row, num_items)).tocsr()
+        c = -np.array(net_values, dtype=float)
+        import time as _time
+        start = _time.perf_counter()
+        res = milp(
+            c,
+            integrality=np.ones(num_items, dtype=int),
+            bounds=Bounds(np.zeros(num_items, dtype=float), np.ones(num_items, dtype=float)),
+            constraints=LinearConstraint(A, np.array(lb, dtype=float), np.array(ub, dtype=float)),
+            options={"time_limit": float(milp_time_limit_s), "mip_rel_gap": 0.001, "presolve": True},
+        )
+        solve_time_s = float(_time.perf_counter() - start)
+        if res.x is not None and int(getattr(res, "status", -1)) in (0, 1):
+            selected = [idx for idx, value in enumerate(res.x) if float(value) >= 0.5 and net_values[idx] > 0.0]
+            method = "milp_param"
+            status = int(getattr(res, "status", -1))
+            status_msg = str(getattr(res, "message", ""))
+            raw_gap = getattr(res, "mip_gap", 0.0)
+            final_gap = float(raw_gap) if raw_gap is not None else 0.0
+    except Exception as exc:
+        status_msg = f"greedy_fallback: {exc}"
+
+    if not selected:
+        order = sorted(range(num_items), key=lambda idx: (net_values[idx] / max(1, runtime_costs[idx]), net_values[idx]), reverse=True)
+        used = 0
+        for idx in order:
+            if runtime_costs[idx] <= 0 or net_values[idx] <= 0.0:
+                continue
+            if int(max_layers) > 0 and len(selected) >= int(max_layers):
+                break
+            if used + runtime_costs[idx] > budget_bytes:
+                continue
+            selected.append(idx)
+            used += int(runtime_costs[idx])
+
+    selected = sorted(selected)
+    used_extra = int(sum(extra[idx] for idx in selected))
+    used_runtime_extra = int(sum(runtime_costs[idx] for idx in selected))
+    selected_global = int(sum(sizes[idx] for idx in selected))
+    selected_layers = sorted({int(param_entries[idx]["layer_idx"]) for idx in selected})
+    selected_refs = [(param_entries[idx]["module"], str(param_entries[idx]["param_name"])) for idx in selected]
+    selected_names = [str(param_entries[idx]["qualified"]) for idx in selected]
+    return {
+        "enabled": bool(selected),
+        "method": method,
+        "selected_layers": selected_layers,
+        "selected_layers_csv": ",".join(str(idx) for idx in selected_layers),
+        "selected_params": selected_refs,
+        "selected_param_names_csv": ",".join(selected_names[:32]),
+        "selected_count": int(len(selected_layers)),
+        "selected_param_count": int(len(selected)),
+        "budget_mb": int(retention_budget_mb),
+        "extra_bytes": used_extra,
+        "runtime_extra_bytes": used_runtime_extra,
+        "global_bytes": selected_global,
+        "binary_vars": int(num_items),
+        "constraints": int(constraints),
+        "solve_time_s": float(solve_time_s),
+        "final_gap": float(final_gap),
+        "status": int(status),
+        "status_msg": status_msg,
+    }
+
+
 def configure_native_simplefsdp(
     model: torch.nn.Module,
     accelerator: Accelerator,
     replicate_small_param_numel: int = 0,
+    enable_chorus: bool = False,
+    chorus_global_retention_mb: int = -1,
+    chorus_global_retention_max_layers: int = 0,
+    chorus_milp_time_limit_s: float = 2.0,
+    activation_checkpointing: bool = False,
+    chorus_persistent_usable_fraction: float = 0.90,
+    chorus_persistent_baseline_param_multiplier: float = 1.45,
+    chorus_persistent_cost_multiplier: float = 20.00,
+    chorus_persistent_static_margin_mb: int = 1024,
 ) -> dict:
     from torch.distributed.device_mesh import init_device_mesh
     from native_simplefsdp import (
@@ -307,6 +714,46 @@ def configure_native_simplefsdp(
         reduce_dtype=torch.float32,
     )
     layer_entries = _collect_transformer_layer_children(model)
+    auto_budget_meta = {
+        "enabled": False,
+        "total_mem_bytes": 0,
+        "usable_fraction": float(chorus_persistent_usable_fraction),
+        "safe_total_bytes": 0,
+        "model_param_bytes": 0,
+        "baseline_param_multiplier": float(chorus_persistent_baseline_param_multiplier),
+        "runtime_cost_multiplier": float(chorus_persistent_cost_multiplier),
+        "static_margin_bytes": int(chorus_persistent_static_margin_mb) * 1024 * 1024,
+        "current_alloc_bytes": 0,
+        "current_reserved_bytes": 0,
+        "estimated_baseline_bytes": 0,
+        "runtime_budget_bytes": 0,
+        "runtime_budget_mb": 0,
+    }
+    requested_retention_mb = int(chorus_global_retention_mb) if enable_chorus else 0
+    effective_retention_mb = requested_retention_mb
+    if enable_chorus and requested_retention_mb < 0:
+        auto_budget_meta = estimate_simplefsdp_chorus_auto_persistent_budget(
+            model,
+            usable_fraction=float(chorus_persistent_usable_fraction),
+            baseline_param_multiplier=float(chorus_persistent_baseline_param_multiplier),
+            runtime_cost_multiplier=float(chorus_persistent_cost_multiplier),
+            static_margin_mb=int(chorus_persistent_static_margin_mb),
+        )
+        effective_retention_mb = int(auto_budget_meta.get("runtime_budget_mb", 0))
+    chorus_plan = plan_simplefsdp_chorus_global_retention(
+        layer_entries,
+        world_size=accelerator.num_processes,
+        retention_budget_mb=max(0, int(effective_retention_mb)) if enable_chorus else 0,
+        max_layers=int(chorus_global_retention_max_layers),
+        activation_checkpointing=bool(activation_checkpointing),
+        milp_time_limit_s=float(chorus_milp_time_limit_s),
+        replicate_small_param_numel=int(replicate_small_param_numel),
+        runtime_cost_multiplier=float(chorus_persistent_cost_multiplier),
+    )
+    for module, param_name in chorus_plan.get("selected_params", []):
+        retained = set(getattr(module, "_simplefsdp_chorus_persistent_params", set()))
+        retained.add(str(param_name))
+        setattr(module, "_simplefsdp_chorus_persistent_params", retained)
     data_parallel(
         model,
         mesh,
@@ -315,6 +762,9 @@ def configure_native_simplefsdp(
         shard_dim=0,
         full_dtensor=False,
         replicate_numel_threshold=int(replicate_small_param_numel),
+        replicate_module_attr="_simplefsdp_chorus_global_retain",
+        replicate_param_names_attr="_simplefsdp_chorus_global_retain_params",
+        persistent_param_names_attr="_simplefsdp_chorus_persistent_params",
     )
     param_stats = summarize_simplefsdp_parameters(model)
     return {
@@ -342,6 +792,31 @@ def configure_native_simplefsdp(
         "dtensor_params": int(param_stats["dtensor_params"]),
         "dtensor_local_numel": int(param_stats["local_numel"]),
         "dtensor_global_numel": int(param_stats["global_numel"]),
+        "chorus_global_retention_enabled": bool(chorus_plan.get("enabled", False)),
+        "chorus_global_retention_method": str(chorus_plan.get("method", "none")),
+        "chorus_global_retention_layers": int(chorus_plan.get("selected_count", 0)),
+        "chorus_global_retention_layer_ids": str(chorus_plan.get("selected_layers_csv", "")),
+        "chorus_global_retention_params": int(chorus_plan.get("selected_param_count", 0)),
+        "chorus_global_retention_param_names": str(chorus_plan.get("selected_param_names_csv", "")),
+        "chorus_global_retention_budget_mode": "auto" if int(chorus_global_retention_mb) < 0 and enable_chorus else ("manual" if int(chorus_global_retention_mb) > 0 and enable_chorus else "disabled"),
+        "chorus_global_retention_requested_mb": int(chorus_global_retention_mb) if enable_chorus else 0,
+        "chorus_global_retention_budget_mb": int(chorus_plan.get("budget_mb", 0)),
+        "chorus_global_retention_extra_bytes": int(chorus_plan.get("extra_bytes", 0)),
+        "chorus_global_retention_runtime_extra_bytes": int(chorus_plan.get("runtime_extra_bytes", 0)),
+        "chorus_global_retention_global_bytes": int(chorus_plan.get("global_bytes", 0)),
+        "chorus_auto_budget_total_mem_bytes": int(auto_budget_meta.get("total_mem_bytes", 0)),
+        "chorus_auto_budget_usable_fraction": float(auto_budget_meta.get("usable_fraction", 0.0)),
+        "chorus_auto_budget_safe_total_bytes": int(auto_budget_meta.get("safe_total_bytes", 0)),
+        "chorus_auto_budget_model_param_bytes": int(auto_budget_meta.get("model_param_bytes", 0)),
+        "chorus_auto_budget_estimated_baseline_bytes": int(auto_budget_meta.get("estimated_baseline_bytes", 0)),
+        "chorus_auto_budget_runtime_budget_bytes": int(auto_budget_meta.get("runtime_budget_bytes", 0)),
+        "chorus_auto_budget_runtime_cost_multiplier": float(auto_budget_meta.get("runtime_cost_multiplier", chorus_persistent_cost_multiplier)),
+        "chorus_milp_binary_vars": int(chorus_plan.get("binary_vars", 0)),
+        "chorus_milp_constraints": int(chorus_plan.get("constraints", 0)),
+        "chorus_milp_solve_time_s": float(chorus_plan.get("solve_time_s", 0.0)),
+        "chorus_milp_final_gap": float(chorus_plan.get("final_gap", 0.0)),
+        "chorus_milp_status": int(chorus_plan.get("status", -1)),
+        "chorus_milp_status_msg": str(chorus_plan.get("status_msg", "")),
     }
 
 
@@ -434,7 +909,11 @@ def main():
             config.reorder_for_compute_comm_overlap_passes = list(
                 simplefsdp_overlap_policy_passes[args.simplefsdp_comm_overlap_policy]
             )
-        if int(args.simplefsdp_coalesce_bucket_mb) > 0:
+        if args.simplefsdp_enable_chorus:
+            # Installed after SimpleFSDP wrapping, once the automatic Chorus memory
+            # budget has been computed from the actual model and GPU.
+            pass
+        elif int(args.simplefsdp_coalesce_bucket_mb) > 0:
             from native_simplefsdp import simplefsdp_coalesce_collectives_graph_pass
 
             bucket_bytes = int(args.simplefsdp_coalesce_bucket_mb) * 1024 * 1024
@@ -561,6 +1040,34 @@ def main():
         "compiled_autograd": False,
         "comm_overlap_policy": "off",
         "comm_overlap_passes": "",
+        "chorus_enabled": False,
+        "chorus_prefetch_groups": 0,
+        "chorus_live_mb": 0,
+        "chorus_global_retention_enabled": False,
+        "chorus_global_retention_method": "none",
+        "chorus_global_retention_layers": 0,
+        "chorus_global_retention_layer_ids": "",
+        "chorus_global_retention_params": 0,
+        "chorus_global_retention_param_names": "",
+        "chorus_global_retention_budget_mode": "disabled",
+        "chorus_global_retention_requested_mb": 0,
+        "chorus_global_retention_budget_mb": 0,
+        "chorus_global_retention_extra_bytes": 0,
+        "chorus_global_retention_runtime_extra_bytes": 0,
+        "chorus_global_retention_global_bytes": 0,
+        "chorus_auto_budget_total_mem_bytes": 0,
+        "chorus_auto_budget_usable_fraction": 0.0,
+        "chorus_auto_budget_safe_total_bytes": 0,
+        "chorus_auto_budget_model_param_bytes": 0,
+        "chorus_auto_budget_estimated_baseline_bytes": 0,
+        "chorus_auto_budget_runtime_budget_bytes": 0,
+        "chorus_auto_budget_runtime_cost_multiplier": 0.0,
+        "chorus_milp_binary_vars": 0,
+        "chorus_milp_constraints": 0,
+        "chorus_milp_solve_time_s": 0.0,
+        "chorus_milp_final_gap": 0.0,
+        "chorus_milp_status": -1,
+        "chorus_milp_status_msg": "",
         "replicate_small_param_numel": 0,
         "replicated_params": 0,
         "replicated_global_numel": 0,
@@ -575,6 +1082,17 @@ def main():
             model,
             accelerator,
             replicate_small_param_numel=args.simplefsdp_replicate_small_param_numel,
+            enable_chorus=args.simplefsdp_enable_chorus,
+            chorus_global_retention_mb=args.simplefsdp_chorus_global_retention_mb,
+            chorus_global_retention_max_layers=args.simplefsdp_chorus_global_retention_max_layers,
+            chorus_milp_time_limit_s=args.simplefsdp_chorus_milp_time_limit_s,
+            activation_checkpointing=bool(
+                activation_checkpointing_enabled or simplefsdp_selective_checkpoint_stats.get("enabled", False)
+            ),
+            chorus_persistent_usable_fraction=args.simplefsdp_chorus_persistent_usable_fraction,
+            chorus_persistent_baseline_param_multiplier=args.simplefsdp_chorus_persistent_baseline_param_multiplier,
+            chorus_persistent_cost_multiplier=args.simplefsdp_chorus_persistent_cost_multiplier,
+            chorus_persistent_static_margin_mb=args.simplefsdp_chorus_persistent_static_margin_mb,
         )
         optimizer, optimizer_name = make_adamw_optimizer(
             model.parameters(),
@@ -590,8 +1108,49 @@ def main():
         simplefsdp_stats["comm_overlap_passes"] = ",".join(
             getattr(config, "reorder_for_compute_comm_overlap_passes", [])
         ) if simplefsdp_inductor_comm_overlap else ""
+        effective_chorus_live_mb = int(args.simplefsdp_chorus_live_mb)
+        if simplefsdp_inductor_comm_overlap and args.simplefsdp_enable_chorus:
+            if effective_chorus_live_mb < 0:
+                auto_live_mb = int(simplefsdp_stats.get("chorus_global_retention_budget_mb", 0))
+                # Use the measured/estimated runtime budget as the Chorus live
+                # retention envelope. A fixed 4 GiB cap left most recompute
+                # all-gathers in the graph on 80 GB NVLink GPUs; use half of the
+                # safe budget, capped at 16 GiB, while keeping a 4 GiB floor for
+                # smaller models. Users can still override this for ablations.
+                if auto_live_mb > 0:
+                    effective_chorus_live_mb = max(4096, min(auto_live_mb // 2, 16384))
+                else:
+                    effective_chorus_live_mb = 4096
+            from native_simplefsdp import simplefsdp_chorus_collectives_graph_pass
+
+            bucket_bytes = int(args.simplefsdp_coalesce_bucket_mb) * 1024 * 1024
+            live_bytes = max(0, int(effective_chorus_live_mb)) * 1024 * 1024
+            effective_chorus_prefetch_groups = int(args.simplefsdp_chorus_prefetch_groups)
+            if effective_chorus_prefetch_groups < 0:
+                # Long-sequence NVLink runs are usually compute-bound; avoid moving
+                # all-gathers unless the user explicitly asks for the ablation.
+                effective_chorus_prefetch_groups = 0 if int(args.seq_length) >= 2048 else 2
+            prefetch_groups = effective_chorus_prefetch_groups
+            config.post_grad_custom_pre_pass = (
+                lambda graph, bucket_bytes=bucket_bytes, live_bytes=live_bytes, prefetch_groups=prefetch_groups: simplefsdp_chorus_collectives_graph_pass(
+                    graph,
+                    max_bucket_bytes=bucket_bytes,
+                    prefetch_groups=prefetch_groups,
+                    max_live_bytes=live_bytes,
+                    milp_time_limit_s=float(args.simplefsdp_chorus_milp_time_limit_s),
+                )
+            )
         simplefsdp_stats["coalesce_bucket_mb"] = (
             int(args.simplefsdp_coalesce_bucket_mb) if simplefsdp_inductor_comm_overlap else 0
+        )
+        simplefsdp_stats["chorus_enabled"] = bool(
+            simplefsdp_inductor_comm_overlap and args.simplefsdp_enable_chorus
+        )
+        simplefsdp_stats["chorus_prefetch_groups"] = (
+            int(effective_chorus_prefetch_groups) if simplefsdp_stats["chorus_enabled"] else 0
+        )
+        simplefsdp_stats["chorus_live_mb"] = (
+            int(effective_chorus_live_mb) if simplefsdp_stats["chorus_enabled"] else 0
         )
         simplefsdp_stats["activation_checkpointing"] = bool(
             activation_checkpointing_enabled or simplefsdp_selective_checkpoint_stats.get("enabled", False)
@@ -626,6 +1185,33 @@ def main():
                 f"comm_overlap_policy={simplefsdp_stats['comm_overlap_policy']} "
                 f"comm_overlap_passes={simplefsdp_stats['comm_overlap_passes']} "
                 f"coalesce_bucket_mb={simplefsdp_stats['coalesce_bucket_mb']} "
+                f"chorus_enabled={simplefsdp_stats['chorus_enabled']} "
+                f"chorus_prefetch_groups={simplefsdp_stats['chorus_prefetch_groups']} "
+                f"chorus_live_mb={simplefsdp_stats['chorus_live_mb']} "
+                f"chorus_global_retention_enabled={simplefsdp_stats['chorus_global_retention_enabled']} "
+                f"chorus_global_retention_method={simplefsdp_stats['chorus_global_retention_method']} "
+                f"chorus_global_retention_layers={simplefsdp_stats['chorus_global_retention_layers']} "
+                f"chorus_global_retention_layer_ids={simplefsdp_stats['chorus_global_retention_layer_ids']} "
+                f"chorus_global_retention_params={simplefsdp_stats['chorus_global_retention_params']} "
+                f"chorus_global_retention_param_names={simplefsdp_stats['chorus_global_retention_param_names']} "
+                f"chorus_global_retention_budget_mode={simplefsdp_stats['chorus_global_retention_budget_mode']} "
+                f"chorus_global_retention_requested_mb={simplefsdp_stats['chorus_global_retention_requested_mb']} "
+                f"chorus_global_retention_budget_mb={simplefsdp_stats['chorus_global_retention_budget_mb']} "
+                f"chorus_global_retention_extra_bytes={simplefsdp_stats['chorus_global_retention_extra_bytes']} "
+                f"chorus_global_retention_runtime_extra_bytes={simplefsdp_stats['chorus_global_retention_runtime_extra_bytes']} "
+                f"chorus_global_retention_global_bytes={simplefsdp_stats['chorus_global_retention_global_bytes']} "
+                f"chorus_auto_budget_total_mem_bytes={simplefsdp_stats['chorus_auto_budget_total_mem_bytes']} "
+                f"chorus_auto_budget_usable_fraction={simplefsdp_stats['chorus_auto_budget_usable_fraction']:.4f} "
+                f"chorus_auto_budget_safe_total_bytes={simplefsdp_stats['chorus_auto_budget_safe_total_bytes']} "
+                f"chorus_auto_budget_model_param_bytes={simplefsdp_stats['chorus_auto_budget_model_param_bytes']} "
+                f"chorus_auto_budget_estimated_baseline_bytes={simplefsdp_stats['chorus_auto_budget_estimated_baseline_bytes']} "
+                f"chorus_auto_budget_runtime_budget_bytes={simplefsdp_stats['chorus_auto_budget_runtime_budget_bytes']} "
+                f"chorus_auto_budget_runtime_cost_multiplier={simplefsdp_stats['chorus_auto_budget_runtime_cost_multiplier']:.4f} "
+                f"chorus_milp_binary_vars={simplefsdp_stats['chorus_milp_binary_vars']} "
+                f"chorus_milp_constraints={simplefsdp_stats['chorus_milp_constraints']} "
+                f"chorus_milp_solve_time_s={simplefsdp_stats['chorus_milp_solve_time_s']:.6f} "
+                f"chorus_milp_final_gap={simplefsdp_stats['chorus_milp_final_gap']:.6g} "
+                f"chorus_milp_status={simplefsdp_stats['chorus_milp_status']} "
                 f"replicate_small_param_numel={simplefsdp_stats['replicate_small_param_numel']} "
                 f"replicated_params={simplefsdp_stats['replicated_params']} "
                 f"replicated_global_numel={simplefsdp_stats['replicated_global_numel']} "
@@ -646,20 +1232,41 @@ def main():
         model, optimizer, data_loader = accelerator.prepare(model, optimizer, data_loader)
         print(f"Model prepared: {model.__class__} optimizer: {optimizer.__class__}")
 
-    fsdp2_prefetch_stats = {"enabled": False, "layers": 0, "forward_distance": 0, "backward_distance": 0}
+    fsdp2_prefetch_stats = {
+        "enabled": False,
+        "layers": 0,
+        "forward_distance": 0,
+        "backward_distance": 0,
+        "chorus_enabled": False,
+        "chorus_live_mb": 0,
+        "chorus_forward_prefetches": 0,
+        "chorus_backward_prefetches": 0,
+    }
     if (not is_simplefsdp) and _is_accelerate_fsdp2(accelerator) and not args.disable_fsdp2_prefetch:
-        fsdp2_prefetch_stats = configure_fsdp2_explicit_prefetch(
-            model,
-            forward_distance=args.fsdp2_forward_prefetch_distance,
-            backward_distance=args.fsdp2_backward_prefetch_distance,
-        )
+        if args.fsdp2_enable_chorus:
+            fsdp2_prefetch_stats = configure_fsdp2_chorus_prefetch(
+                model,
+                forward_max_distance=args.fsdp2_forward_prefetch_distance,
+                backward_max_distance=args.fsdp2_backward_prefetch_distance,
+                live_budget_mb=args.fsdp2_chorus_live_mb,
+            )
+        else:
+            fsdp2_prefetch_stats = configure_fsdp2_explicit_prefetch(
+                model,
+                forward_distance=args.fsdp2_forward_prefetch_distance,
+                backward_distance=args.fsdp2_backward_prefetch_distance,
+            )
         if accelerator.is_main_process:
             print(
                 "[fsdp2] explicit prefetch "
                 f"enabled={fsdp2_prefetch_stats['enabled']} "
                 f"layers={fsdp2_prefetch_stats['layers']} "
                 f"forward_distance={fsdp2_prefetch_stats['forward_distance']} "
-                f"backward_distance={fsdp2_prefetch_stats['backward_distance']}"
+                f"backward_distance={fsdp2_prefetch_stats['backward_distance']} "
+                f"chorus_enabled={fsdp2_prefetch_stats.get('chorus_enabled', False)} "
+                f"chorus_live_mb={fsdp2_prefetch_stats.get('chorus_live_mb', 0)} "
+                f"chorus_forward_prefetches={fsdp2_prefetch_stats.get('chorus_forward_prefetches', 0)} "
+                f"chorus_backward_prefetches={fsdp2_prefetch_stats.get('chorus_backward_prefetches', 0)}"
             )
 
     if "Mixtral" in model_name or "MoE" in model_name:
@@ -685,6 +1292,11 @@ def main():
                f"pass_{'none' if args.passes is None else args.passes.replace(',', '_')}_" \
                f"os{1 if args.offload_opt_states else 0}" \
                f"T{timestamp}"
+    clear_simplefsdp_cache = None
+    if is_simplefsdp and simplefsdp_stats.get("chorus_global_retention_enabled", False):
+        from native_simplefsdp import clear_simplefsdp_chorus_persistent_cache
+        clear_simplefsdp_cache = clear_simplefsdp_chorus_persistent_cache
+
     if args.profile_dir:
         if accelerator.is_main_process and args.profile_dir:
             os.makedirs(args.profile_dir, exist_ok=True)
@@ -726,6 +1338,10 @@ def main():
             for step, batch in enumerate(data_loader):
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
+                # Keep Chorus persistent full-parameter buffers live across
+                # microsteps. Version checks in the parametrization invalidate
+                # entries after optimizer updates, while preserving reuse inside
+                # activation recompute and gradient accumulation windows.
 
                 # Time only the training compute segment (exclude dataloader/epoch-boundary overhead).
                 # Start timing after the batch is already moved to device.
@@ -865,11 +1481,88 @@ def main():
         except Exception:
             predicted_peak = ""
 
+        simplefsdp_chorus_diag = {
+            "cache_trace_hits": 0,
+            "cache_trace_misses": 0,
+            "cache_eager_hits": 0,
+            "cache_eager_misses": 0,
+            "cache_no_grad_bypass": 0,
+            "cache_entries": 0,
+            "cache_persistent_params": 0,
+            "graph_ag_before": 0,
+            "graph_ag_buckets": 0,
+            "graph_ag_retained": 0,
+            "graph_ag_coalesced_or_moved": 0,
+            "graph_rs_before": 0,
+            "graph_rs_coalesced": 0,
+            "graph_method": "none",
+            "graph_status": -1,
+            "graph_history_len": 0,
+            "graph_history_ag_before": "",
+            "graph_history_rs_before": "",
+            "graph_history_ag_retained": "",
+            "graph_history_cross_graph_puts": "",
+            "graph_history_cross_graph_gets": "",
+            "graph_cross_graph_puts": 0,
+            "graph_cross_graph_gets": 0,
+            "graph_cross_graph_selected": 0,
+            "graph_cross_graph_selected_bytes": 0,
+            "graph_cross_graph_get_bytes": 0,
+            "graph_cross_graph_budget_bytes": 0,
+            "graph_cross_graph_method": "none",
+            "graph_cross_graph_status": -1,
+            "graph_cross_graph_solve_time_s": 0.0,
+        }
+        if simplefsdp_stats.get("enabled", False):
+            try:
+                import native_simplefsdp as _native_simplefsdp
+                cache_diag = _native_simplefsdp.summarize_simplefsdp_chorus_persistent_cache(model)
+                graph_diag = dict(getattr(_native_simplefsdp, "_LATEST_CHORUS_GRAPH_STATS", {}) or {})
+                graph_history = list(getattr(_native_simplefsdp, "_CHORUS_GRAPH_HISTORY", []) or [])
+                simplefsdp_chorus_diag.update({
+                    "cache_trace_hits": int(cache_diag.get("trace_hits", 0)),
+                    "cache_trace_misses": int(cache_diag.get("trace_misses", 0)),
+                    "cache_eager_hits": int(cache_diag.get("eager_hits", 0)),
+                    "cache_eager_misses": int(cache_diag.get("eager_misses", 0)),
+                    "cache_no_grad_bypass": int(cache_diag.get("no_grad_bypass", 0)),
+                    "cache_entries": int(cache_diag.get("cache_entries", 0)),
+                    "cache_persistent_params": int(cache_diag.get("persistent_params", 0)),
+                    "graph_ag_before": int(graph_diag.get("ag_before", 0)),
+                    "graph_ag_buckets": int(graph_diag.get("ag_buckets", 0)),
+                    "graph_ag_retained": int(graph_diag.get("ag_retained", 0)),
+                    "graph_ag_coalesced_or_moved": int(graph_diag.get("ag_coalesced_or_moved", 0)),
+                    "graph_rs_before": int(graph_diag.get("rs_before", 0)),
+                    "graph_rs_coalesced": int(graph_diag.get("rs_coalesced", 0)),
+                    "graph_method": str(graph_diag.get("method", "none")),
+                    "graph_status": int(graph_diag.get("status", -1)),
+                    "graph_history_len": int(len(graph_history)),
+                    "graph_history_ag_before": ",".join(str(int(item.get("ag_before", 0))) for item in graph_history[-8:]),
+                    "graph_history_rs_before": ",".join(str(int(item.get("rs_before", 0))) for item in graph_history[-8:]),
+                    "graph_history_ag_retained": ",".join(str(int(item.get("ag_retained", 0))) for item in graph_history[-8:]),
+                    "graph_history_cross_graph_puts": ",".join(str(int(item.get("cross_graph_puts", 0))) for item in graph_history[-8:]),
+                    "graph_history_cross_graph_gets": ",".join(str(int(item.get("cross_graph_gets", 0))) for item in graph_history[-8:]),
+                    "graph_cross_graph_puts": int(graph_diag.get("cross_graph_puts", 0)),
+                    "graph_cross_graph_gets": int(graph_diag.get("cross_graph_gets", 0)),
+                    "graph_cross_graph_selected": int(graph_diag.get("cross_graph_selected", 0)),
+                    "graph_cross_graph_selected_bytes": int(graph_diag.get("cross_graph_selected_bytes", 0)),
+                    "graph_cross_graph_get_bytes": int(graph_diag.get("cross_graph_get_bytes", 0)),
+                    "graph_cross_graph_budget_bytes": int(graph_diag.get("cross_graph_budget_bytes", 0)),
+                    "graph_cross_graph_method": str(graph_diag.get("cross_graph_method", "none")),
+                    "graph_cross_graph_status": int(graph_diag.get("cross_graph_status", -1)),
+                    "graph_cross_graph_solve_time_s": float(graph_diag.get("cross_graph_solve_time_s", 0.0)),
+                })
+            except Exception:
+                pass
+
         fsdp2_stats = (
             f" fsdp2_prefetch_enabled: {fsdp2_prefetch_stats['enabled']}"
             f" fsdp2_prefetch_layers: {fsdp2_prefetch_stats['layers']}"
             f" fsdp2_forward_prefetch_distance: {fsdp2_prefetch_stats['forward_distance']}"
             f" fsdp2_backward_prefetch_distance: {fsdp2_prefetch_stats['backward_distance']}"
+            f" fsdp2_chorus_enabled: {fsdp2_prefetch_stats.get('chorus_enabled', False)}"
+            f" fsdp2_chorus_live_mb: {fsdp2_prefetch_stats.get('chorus_live_mb', 0)}"
+            f" fsdp2_chorus_forward_prefetches: {fsdp2_prefetch_stats.get('chorus_forward_prefetches', 0)}"
+            f" fsdp2_chorus_backward_prefetches: {fsdp2_prefetch_stats.get('chorus_backward_prefetches', 0)}"
         ) if fsdp2_prefetch_stats.get("enabled", False) else ""
         simplefsdp_msg = (
             f" simplefsdp_enabled: {simplefsdp_stats['enabled']}"
@@ -895,6 +1588,33 @@ def main():
             f" simplefsdp_comm_overlap_policy: {simplefsdp_stats['comm_overlap_policy']}"
             f" simplefsdp_comm_overlap_passes: {simplefsdp_stats['comm_overlap_passes']}"
             f" simplefsdp_coalesce_bucket_mb: {simplefsdp_stats['coalesce_bucket_mb']}"
+            f" simplefsdp_chorus_enabled: {simplefsdp_stats['chorus_enabled']}"
+            f" simplefsdp_chorus_prefetch_groups: {simplefsdp_stats['chorus_prefetch_groups']}"
+            f" simplefsdp_chorus_live_mb: {simplefsdp_stats['chorus_live_mb']}"
+            f" simplefsdp_chorus_global_retention_enabled: {simplefsdp_stats['chorus_global_retention_enabled']}"
+            f" simplefsdp_chorus_global_retention_method: {simplefsdp_stats['chorus_global_retention_method']}"
+            f" simplefsdp_chorus_global_retention_layers: {simplefsdp_stats['chorus_global_retention_layers']}"
+            f" simplefsdp_chorus_global_retention_layer_ids: {simplefsdp_stats['chorus_global_retention_layer_ids']}"
+            f" simplefsdp_chorus_global_retention_params: {simplefsdp_stats['chorus_global_retention_params']}"
+            f" simplefsdp_chorus_global_retention_param_names: {simplefsdp_stats['chorus_global_retention_param_names']}"
+            f" simplefsdp_chorus_global_retention_budget_mode: {simplefsdp_stats['chorus_global_retention_budget_mode']}"
+            f" simplefsdp_chorus_global_retention_requested_mb: {simplefsdp_stats['chorus_global_retention_requested_mb']}"
+            f" simplefsdp_chorus_global_retention_budget_mb: {simplefsdp_stats['chorus_global_retention_budget_mb']}"
+            f" simplefsdp_chorus_global_retention_extra_bytes: {simplefsdp_stats['chorus_global_retention_extra_bytes']}"
+            f" simplefsdp_chorus_global_retention_runtime_extra_bytes: {simplefsdp_stats['chorus_global_retention_runtime_extra_bytes']}"
+            f" simplefsdp_chorus_global_retention_global_bytes: {simplefsdp_stats['chorus_global_retention_global_bytes']}"
+            f" simplefsdp_chorus_auto_budget_total_mem_bytes: {simplefsdp_stats['chorus_auto_budget_total_mem_bytes']}"
+            f" simplefsdp_chorus_auto_budget_usable_fraction: {simplefsdp_stats['chorus_auto_budget_usable_fraction']:.4f}"
+            f" simplefsdp_chorus_auto_budget_safe_total_bytes: {simplefsdp_stats['chorus_auto_budget_safe_total_bytes']}"
+            f" simplefsdp_chorus_auto_budget_model_param_bytes: {simplefsdp_stats['chorus_auto_budget_model_param_bytes']}"
+            f" simplefsdp_chorus_auto_budget_estimated_baseline_bytes: {simplefsdp_stats['chorus_auto_budget_estimated_baseline_bytes']}"
+            f" simplefsdp_chorus_auto_budget_runtime_budget_bytes: {simplefsdp_stats['chorus_auto_budget_runtime_budget_bytes']}"
+            f" simplefsdp_chorus_auto_budget_runtime_cost_multiplier: {simplefsdp_stats['chorus_auto_budget_runtime_cost_multiplier']:.4f}"
+            f" simplefsdp_chorus_milp_binary_vars: {simplefsdp_stats['chorus_milp_binary_vars']}"
+            f" simplefsdp_chorus_milp_constraints: {simplefsdp_stats['chorus_milp_constraints']}"
+            f" simplefsdp_chorus_milp_solve_time_s: {simplefsdp_stats['chorus_milp_solve_time_s']:.6f}"
+            f" simplefsdp_chorus_milp_final_gap: {simplefsdp_stats['chorus_milp_final_gap']:.6g}"
+            f" simplefsdp_chorus_milp_status: {simplefsdp_stats['chorus_milp_status']}"
             f" simplefsdp_replicate_small_param_numel: {simplefsdp_stats['replicate_small_param_numel']}"
             f" simplefsdp_replicated_params: {simplefsdp_stats['replicated_params']}"
             f" simplefsdp_replicated_global_numel: {simplefsdp_stats['replicated_global_numel']}"
@@ -906,25 +1626,59 @@ def main():
             f" simplefsdp_dtensor_params: {simplefsdp_stats['dtensor_params']}"
             f" simplefsdp_dtensor_local_numel: {simplefsdp_stats['dtensor_local_numel']}"
             f" simplefsdp_dtensor_global_numel: {simplefsdp_stats['dtensor_global_numel']}"
+            f" simplefsdp_chorus_cache_trace_hits: {simplefsdp_chorus_diag['cache_trace_hits']}"
+            f" simplefsdp_chorus_cache_trace_misses: {simplefsdp_chorus_diag['cache_trace_misses']}"
+            f" simplefsdp_chorus_cache_eager_hits: {simplefsdp_chorus_diag['cache_eager_hits']}"
+            f" simplefsdp_chorus_cache_eager_misses: {simplefsdp_chorus_diag['cache_eager_misses']}"
+            f" simplefsdp_chorus_cache_no_grad_bypass: {simplefsdp_chorus_diag['cache_no_grad_bypass']}"
+            f" simplefsdp_chorus_cache_entries: {simplefsdp_chorus_diag['cache_entries']}"
+            f" simplefsdp_chorus_cache_persistent_params: {simplefsdp_chorus_diag['cache_persistent_params']}"
+            f" simplefsdp_chorus_graph_ag_before: {simplefsdp_chorus_diag['graph_ag_before']}"
+            f" simplefsdp_chorus_graph_ag_buckets: {simplefsdp_chorus_diag['graph_ag_buckets']}"
+            f" simplefsdp_chorus_graph_ag_retained: {simplefsdp_chorus_diag['graph_ag_retained']}"
+            f" simplefsdp_chorus_graph_ag_coalesced_or_moved: {simplefsdp_chorus_diag['graph_ag_coalesced_or_moved']}"
+            f" simplefsdp_chorus_graph_rs_before: {simplefsdp_chorus_diag['graph_rs_before']}"
+            f" simplefsdp_chorus_graph_rs_coalesced: {simplefsdp_chorus_diag['graph_rs_coalesced']}"
+            f" simplefsdp_chorus_graph_method: {simplefsdp_chorus_diag['graph_method']}"
+            f" simplefsdp_chorus_graph_status: {simplefsdp_chorus_diag['graph_status']}"
+            f" simplefsdp_chorus_graph_history_len: {simplefsdp_chorus_diag['graph_history_len']}"
+            f" simplefsdp_chorus_graph_history_ag_before: {simplefsdp_chorus_diag['graph_history_ag_before']}"
+            f" simplefsdp_chorus_graph_history_rs_before: {simplefsdp_chorus_diag['graph_history_rs_before']}"
+            f" simplefsdp_chorus_graph_history_ag_retained: {simplefsdp_chorus_diag['graph_history_ag_retained']}"
+            f" simplefsdp_chorus_graph_history_cross_graph_puts: {simplefsdp_chorus_diag['graph_history_cross_graph_puts']}"
+            f" simplefsdp_chorus_graph_history_cross_graph_gets: {simplefsdp_chorus_diag['graph_history_cross_graph_gets']}"
+            f" simplefsdp_chorus_graph_cross_graph_puts: {simplefsdp_chorus_diag['graph_cross_graph_puts']}"
+            f" simplefsdp_chorus_graph_cross_graph_gets: {simplefsdp_chorus_diag['graph_cross_graph_gets']}"
+            f" simplefsdp_chorus_graph_cross_graph_selected: {simplefsdp_chorus_diag['graph_cross_graph_selected']}"
+            f" simplefsdp_chorus_graph_cross_graph_selected_bytes: {simplefsdp_chorus_diag['graph_cross_graph_selected_bytes']}"
+            f" simplefsdp_chorus_graph_cross_graph_get_bytes: {simplefsdp_chorus_diag['graph_cross_graph_get_bytes']}"
+            f" simplefsdp_chorus_graph_cross_graph_budget_bytes: {simplefsdp_chorus_diag['graph_cross_graph_budget_bytes']}"
+            f" simplefsdp_chorus_graph_cross_graph_method: {simplefsdp_chorus_diag['graph_cross_graph_method']}"
+            f" simplefsdp_chorus_graph_cross_graph_status: {simplefsdp_chorus_diag['graph_cross_graph_status']}"
+            f" simplefsdp_chorus_graph_cross_graph_solve_time_s: {simplefsdp_chorus_diag['graph_cross_graph_solve_time_s']:.6f}"
         ) if simplefsdp_stats.get("enabled", False) else ""
         activation_checkpointing_report = bool(
             activation_checkpointing_enabled or simplefsdp_stats.get("selective_checkpoint_layers", 0) > 0
         )
+        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={activation_checkpointing_report} requested_ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} distributed_backend={args.distributed_backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(report_times) / len(report_times):.4f}{fsdp2_stats}{simplefsdp_msg}{milp_stats}"
         nvidia_smi_peak_gb = float(nvidia_smi_peak_global_bytes) / (1024**3)
-        msg = f"Pred. {predicted_total_peak_gb:.2f} GB Meas. {nvidia_smi_peak_gb:.2f} GB"
+        pred_meas_msg = f"Pred. {predicted_total_peak_gb:.2f} GB Meas. {nvidia_smi_peak_gb:.2f} GB"
         print(msg)
+        print(pred_meas_msg)
 
-        if args.profile_dir:
+
+    if args.profile_dir:
             from pathlib import Path
             filepath = Path(args.profile_dir) / f"result.txt"
             with open(filepath, "a") as f:
                 f.write(f"{timestamp} {msg}" + "\n")
+                f.write(f"{timestamp} {pred_meas_msg}" + "\n")
 
             if args.compile:
                 filepath = Path(args.profile_dir) / f"compile_time.txt"
                 with open(filepath, "a") as f:
-                    msg =  f"{msg} compile_time={compile_time_sum} {compile_time}"
-                    f.write(f"{timestamp} {msg}" + "\n")
+                    compile_msg =  f"{msg} compile_time={compile_time_sum} {compile_time}"
+                    f.write(f"{timestamp} {compile_msg}" + "\n")
 
     # # Save the model
     # if accelerator.is_main_process:
