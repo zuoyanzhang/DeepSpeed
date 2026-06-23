@@ -26,9 +26,16 @@ _active_parametrization = True
 _LATEST_CHORUS_GRAPH_STATS: dict[str, int | float | str] = {}
 _CHORUS_GRAPH_HISTORY: list[dict[str, int | float | str]] = []
 _CHORUS_RETAINED_TENSORS: dict[int, torch.Tensor] = {}
+_CHORUS_RETAINED_BYTES_BY_KEY: dict[int, int] = {}
 _CHORUS_FORWARD_RETAIN_SIGNATURE_TO_KEY: dict[tuple, int] = {}
 _CHORUS_FORWARD_RETAIN_BYTES: dict[tuple, int] = {}
 _CHORUS_NEXT_RETAIN_KEY = 1
+_CHORUS_RUNTIME_MAX_LIVE_BYTES = 0
+_CHORUS_RUNTIME_USABLE_FRACTION = 0.90
+_CHORUS_RUNTIME_STATIC_MARGIN_BYTES = 1024 * 1024 * 1024
+_CHORUS_RUNTIME_RETAINED_BYTES = 0
+_CHORUS_RUNTIME_RETAIN_CLONE = True
+_CHORUS_RUNTIME_STATS: dict[str, int | float] = {}
 
 
 _chorus_lib = torch.library.Library("simplefsdp_chorus", "DEF")
@@ -36,16 +43,247 @@ _chorus_lib.define("retain_put(Tensor x, int key) -> Tensor")
 _chorus_lib.define("retain_get(Tensor local_shard, int key, int group_size, str group_name) -> Tensor")
 
 
+def _new_chorus_runtime_stats() -> dict[str, int | float]:
+    return {
+        "configured": 0,
+        "max_live_bytes": 0,
+        "usable_fraction": 0.0,
+        "static_margin_bytes": 0,
+        "safe_total_bytes": 0,
+        "total_mem_bytes": 0,
+        "attempted_puts": 0,
+        "admitted_puts": 0,
+        "admitted_bytes": 0,
+        "retain_aliases": 0,
+        "retain_clones": 0,
+        "clone_mode": 0,
+        "skipped_disabled": 0,
+        "skipped_live_budget": 0,
+        "skipped_memory_pressure": 0,
+        "skipped_oom": 0,
+        "hit_gets": 0,
+        "fallback_gets": 0,
+        "evicted_keys": 0,
+        "current_retained_bytes": 0,
+        "current_retained_tensors": 0,
+        "peak_retained_bytes": 0,
+        "peak_allocated_bytes": 0,
+        "peak_reserved_bytes": 0,
+        "peak_driver_used_bytes": 0,
+        "last_required_bytes": 0,
+        "last_available_live_budget_bytes": 0,
+        "last_driver_used_bytes": 0,
+        "last_reusable_cache_bytes": 0,
+        "last_driver_growth_bytes": 0,
+        "last_projected_used_bytes": 0,
+    }
+
+
+_CHORUS_RUNTIME_STATS = _new_chorus_runtime_stats()
+
+
+def _chorus_tensor_nbytes(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.numel()) * int(tensor.element_size())
+    except Exception:
+        return 0
+
+
+def _drop_chorus_retained_key(key: int) -> None:
+    global _CHORUS_RUNTIME_RETAINED_BYTES
+    key = int(key)
+    old = _CHORUS_RETAINED_TENSORS.pop(key, None)
+    old_bytes = int(_CHORUS_RETAINED_BYTES_BY_KEY.pop(key, 0))
+    if old is not None:
+        _CHORUS_RUNTIME_STATS["evicted_keys"] = int(_CHORUS_RUNTIME_STATS.get("evicted_keys", 0)) + 1
+    if old_bytes > 0:
+        _CHORUS_RUNTIME_RETAINED_BYTES = max(0, int(_CHORUS_RUNTIME_RETAINED_BYTES) - old_bytes)
+
+
+def clear_simplefsdp_chorus_cross_graph_cache() -> None:
+    global _CHORUS_RUNTIME_RETAINED_BYTES
+    _CHORUS_RETAINED_TENSORS.clear()
+    _CHORUS_RETAINED_BYTES_BY_KEY.clear()
+    _CHORUS_RUNTIME_RETAINED_BYTES = 0
+    _CHORUS_RUNTIME_STATS["current_retained_bytes"] = 0
+    _CHORUS_RUNTIME_STATS["current_retained_tensors"] = 0
+
+
+def configure_simplefsdp_chorus_runtime_memory_budget(
+    max_live_bytes: int,
+    usable_fraction: float = 0.90,
+    static_margin_mb: int = 1024,
+) -> dict[str, int | float]:
+    """Configure runtime admission for cross-graph retained all-gathers.
+
+    The graph-level MILP decides which all-gathers are worth retaining, but this
+    guard is the runtime safety loop: each retain_put is admitted only if the
+    real CUDA allocator/driver state still has enough room. If not, retain_get
+    falls back to the original all-gather, preserving correctness.
+    """
+    global _CHORUS_RUNTIME_MAX_LIVE_BYTES
+    global _CHORUS_RUNTIME_USABLE_FRACTION
+    global _CHORUS_RUNTIME_STATIC_MARGIN_BYTES
+    global _CHORUS_RUNTIME_RETAINED_BYTES
+    global _CHORUS_RUNTIME_RETAIN_CLONE
+    global _CHORUS_RUNTIME_STATS
+    global _CHORUS_NEXT_RETAIN_KEY
+
+    _CHORUS_RUNTIME_MAX_LIVE_BYTES = max(0, int(max_live_bytes))
+    _CHORUS_RUNTIME_USABLE_FRACTION = max(0.0, min(1.0, float(usable_fraction)))
+    _CHORUS_RUNTIME_STATIC_MARGIN_BYTES = max(0, int(static_margin_mb)) * 1024 * 1024
+    _CHORUS_RUNTIME_RETAIN_CLONE = os.getenv("SIMPLEFSDP_CHORUS_RETAIN_CLONE", "1") == "1"
+    _CHORUS_RUNTIME_RETAINED_BYTES = 0
+    _CHORUS_RUNTIME_STATS = _new_chorus_runtime_stats()
+    _CHORUS_RUNTIME_STATS.update({
+        "configured": 1,
+        "max_live_bytes": int(_CHORUS_RUNTIME_MAX_LIVE_BYTES),
+        "usable_fraction": float(_CHORUS_RUNTIME_USABLE_FRACTION),
+        "static_margin_bytes": int(_CHORUS_RUNTIME_STATIC_MARGIN_BYTES),
+        "clone_mode": int(bool(_CHORUS_RUNTIME_RETAIN_CLONE)),
+    })
+    _CHORUS_RETAINED_TENSORS.clear()
+    _CHORUS_RETAINED_BYTES_BY_KEY.clear()
+    _CHORUS_FORWARD_RETAIN_SIGNATURE_TO_KEY.clear()
+    _CHORUS_FORWARD_RETAIN_BYTES.clear()
+    _CHORUS_NEXT_RETAIN_KEY = 1
+    _CHORUS_GRAPH_HISTORY.clear()
+
+    if torch.cuda.is_available():
+        try:
+            total_mem = int(torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory)
+            _CHORUS_RUNTIME_STATS["total_mem_bytes"] = int(total_mem)
+            _CHORUS_RUNTIME_STATS["safe_total_bytes"] = int(float(total_mem) * _CHORUS_RUNTIME_USABLE_FRACTION)
+        except Exception:
+            pass
+    return dict(_CHORUS_RUNTIME_STATS)
+
+
+def summarize_simplefsdp_chorus_runtime_retention() -> dict[str, int | float]:
+    stats = dict(_CHORUS_RUNTIME_STATS)
+    stats["current_retained_bytes"] = int(_CHORUS_RUNTIME_RETAINED_BYTES)
+    stats["current_retained_tensors"] = int(len(_CHORUS_RETAINED_TENSORS))
+    return stats
+
+
+def _chorus_runtime_memory_snapshot(tensor: torch.Tensor | None = None) -> tuple[int, int, int, int, int]:
+    total_mem = int(_CHORUS_RUNTIME_STATS.get("total_mem_bytes", 0))
+    allocated = 0
+    reserved = 0
+    driver_used = 0
+    safe_total = int(_CHORUS_RUNTIME_STATS.get("safe_total_bytes", 0))
+    if not torch.cuda.is_available():
+        return total_mem, safe_total, allocated, reserved, driver_used
+    try:
+        device = tensor.device if tensor is not None and tensor.is_cuda else torch.cuda.current_device()
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        if total_mem <= 0:
+            total_mem = int(torch.cuda.get_device_properties(device).total_memory)
+        try:
+            free_mem, mem_total = torch.cuda.mem_get_info(device)
+        except TypeError:
+            with torch.cuda.device(device):
+                free_mem, mem_total = torch.cuda.mem_get_info()
+        total_mem = int(mem_total or total_mem)
+        driver_used = max(0, int(total_mem) - int(free_mem))
+        if safe_total <= 0 and total_mem > 0:
+            safe_total = int(float(total_mem) * _CHORUS_RUNTIME_USABLE_FRACTION)
+    except Exception:
+        pass
+    _CHORUS_RUNTIME_STATS["total_mem_bytes"] = int(total_mem)
+    _CHORUS_RUNTIME_STATS["safe_total_bytes"] = int(safe_total)
+    _CHORUS_RUNTIME_STATS["peak_allocated_bytes"] = max(
+        int(_CHORUS_RUNTIME_STATS.get("peak_allocated_bytes", 0)), int(allocated)
+    )
+    _CHORUS_RUNTIME_STATS["peak_reserved_bytes"] = max(
+        int(_CHORUS_RUNTIME_STATS.get("peak_reserved_bytes", 0)), int(reserved)
+    )
+    _CHORUS_RUNTIME_STATS["peak_driver_used_bytes"] = max(
+        int(_CHORUS_RUNTIME_STATS.get("peak_driver_used_bytes", 0)), int(driver_used)
+    )
+    return int(total_mem), int(safe_total), int(allocated), int(reserved), int(driver_used)
+
+
+def _chorus_can_admit_retain(required_bytes: int, tensor: torch.Tensor, *, will_allocate: bool) -> bool:
+    required_bytes = max(0, int(required_bytes))
+    _CHORUS_RUNTIME_STATS["last_required_bytes"] = int(required_bytes)
+    if _CHORUS_RUNTIME_MAX_LIVE_BYTES <= 0:
+        _CHORUS_RUNTIME_STATS["skipped_disabled"] = int(_CHORUS_RUNTIME_STATS.get("skipped_disabled", 0)) + 1
+        return False
+    live_remaining = int(_CHORUS_RUNTIME_MAX_LIVE_BYTES) - int(_CHORUS_RUNTIME_RETAINED_BYTES)
+    _CHORUS_RUNTIME_STATS["last_available_live_budget_bytes"] = int(live_remaining)
+    if required_bytes <= 0 or required_bytes > live_remaining:
+        _CHORUS_RUNTIME_STATS["skipped_live_budget"] = int(_CHORUS_RUNTIME_STATS.get("skipped_live_budget", 0)) + 1
+        return False
+
+    _, safe_total, allocated, reserved, driver_used = _chorus_runtime_memory_snapshot(tensor)
+    _CHORUS_RUNTIME_STATS["last_driver_used_bytes"] = int(driver_used)
+    if safe_total > 0:
+        margin = int(_CHORUS_RUNTIME_STATIC_MARGIN_BYTES)
+        allocator_floor = max(int(allocated), int(reserved))
+        extra_allocation = int(required_bytes) if bool(will_allocate) else 0
+        _CHORUS_RUNTIME_STATS["last_reusable_cache_bytes"] = max(0, int(reserved) - int(allocated))
+        _CHORUS_RUNTIME_STATS["last_driver_growth_bytes"] = int(extra_allocation)
+        _CHORUS_RUNTIME_STATS["last_projected_used_bytes"] = int(driver_used) + int(extra_allocation)
+        # Clone-retention is the safe default for Inductor-compiled graphs.
+        # Alias-retention can be enabled for experiments with
+        # SIMPLEFSDP_CHORUS_RETAIN_CLONE=0; in that mode the already materialized
+        # all-gather output is kept alive instead of allocating another copy.
+        if driver_used + extra_allocation + margin > safe_total:
+            _CHORUS_RUNTIME_STATS["skipped_memory_pressure"] = int(
+                _CHORUS_RUNTIME_STATS.get("skipped_memory_pressure", 0)
+            ) + 1
+            return False
+        if allocator_floor + extra_allocation + margin > safe_total:
+            _CHORUS_RUNTIME_STATS["skipped_memory_pressure"] = int(
+                _CHORUS_RUNTIME_STATS.get("skipped_memory_pressure", 0)
+            ) + 1
+            return False
+    return True
+
+
 @torch.library.impl(_chorus_lib, "retain_put", "CUDA")
 def _chorus_retain_put_cuda(x: torch.Tensor, key: int) -> torch.Tensor:
     waited = torch.ops._c10d_functional.wait_tensor.default(x)
-    _CHORUS_RETAINED_TENSORS[int(key)] = waited.detach().clone()
+    key = int(key)
+    nbytes = _chorus_tensor_nbytes(waited)
+    _CHORUS_RUNTIME_STATS["attempted_puts"] = int(_CHORUS_RUNTIME_STATS.get("attempted_puts", 0)) + 1
+    _drop_chorus_retained_key(key)
+    retain_clone = bool(_CHORUS_RUNTIME_RETAIN_CLONE)
+    if not _chorus_can_admit_retain(nbytes, waited, will_allocate=retain_clone):
+        return waited
+    try:
+        retained = waited.detach().clone() if retain_clone else waited.detach()
+    except torch.OutOfMemoryError:
+        _CHORUS_RUNTIME_STATS["skipped_oom"] = int(_CHORUS_RUNTIME_STATS.get("skipped_oom", 0)) + 1
+        _drop_chorus_retained_key(key)
+        return waited
+    _CHORUS_RETAINED_TENSORS[key] = retained
+    _CHORUS_RETAINED_BYTES_BY_KEY[key] = int(nbytes)
+    global _CHORUS_RUNTIME_RETAINED_BYTES
+    _CHORUS_RUNTIME_RETAINED_BYTES += int(nbytes)
+    _CHORUS_RUNTIME_STATS["admitted_puts"] = int(_CHORUS_RUNTIME_STATS.get("admitted_puts", 0)) + 1
+    _CHORUS_RUNTIME_STATS["admitted_bytes"] = int(_CHORUS_RUNTIME_STATS.get("admitted_bytes", 0)) + int(nbytes)
+    if retain_clone:
+        _CHORUS_RUNTIME_STATS["retain_clones"] = int(_CHORUS_RUNTIME_STATS.get("retain_clones", 0)) + 1
+    else:
+        _CHORUS_RUNTIME_STATS["retain_aliases"] = int(_CHORUS_RUNTIME_STATS.get("retain_aliases", 0)) + 1
+    _CHORUS_RUNTIME_STATS["current_retained_bytes"] = int(_CHORUS_RUNTIME_RETAINED_BYTES)
+    _CHORUS_RUNTIME_STATS["current_retained_tensors"] = int(len(_CHORUS_RETAINED_TENSORS))
+    _CHORUS_RUNTIME_STATS["peak_retained_bytes"] = max(
+        int(_CHORUS_RUNTIME_STATS.get("peak_retained_bytes", 0)),
+        int(_CHORUS_RUNTIME_RETAINED_BYTES),
+    )
     return waited
 
 
 @torch.library.impl(_chorus_lib, "retain_put", "CPU")
 def _chorus_retain_put_cpu(x: torch.Tensor, key: int) -> torch.Tensor:
-    _CHORUS_RETAINED_TENSORS[int(key)] = x.detach().clone()
+    key = int(key)
+    _drop_chorus_retained_key(key)
+    _CHORUS_RETAINED_TENSORS[key] = x.detach().clone()
+    _CHORUS_RETAINED_BYTES_BY_KEY[key] = _chorus_tensor_nbytes(x)
     return x
 
 
@@ -72,7 +310,9 @@ def _chorus_retain_get_cuda(
 ) -> torch.Tensor:
     retained = _CHORUS_RETAINED_TENSORS.get(int(key))
     if retained is None:
+        _CHORUS_RUNTIME_STATS["fallback_gets"] = int(_CHORUS_RUNTIME_STATS.get("fallback_gets", 0)) + 1
         return _chorus_all_gather_fallback(local_shard, int(group_size), str(group_name))
+    _CHORUS_RUNTIME_STATS["hit_gets"] = int(_CHORUS_RUNTIME_STATS.get("hit_gets", 0)) + 1
     if os.getenv("SIMPLEFSDP_CHORUS_VALIDATE_RETAIN", "0") == "1":
         expected = _chorus_all_gather_fallback(local_shard, int(group_size), str(group_name))
         try:
@@ -93,7 +333,9 @@ def _chorus_retain_get_cpu(
 ) -> torch.Tensor:
     retained = _CHORUS_RETAINED_TENSORS.get(int(key))
     if retained is None:
+        _CHORUS_RUNTIME_STATS["fallback_gets"] = int(_CHORUS_RUNTIME_STATS.get("fallback_gets", 0)) + 1
         return _chorus_all_gather_fallback(local_shard, int(group_size), str(group_name))
+    _CHORUS_RUNTIME_STATS["hit_gets"] = int(_CHORUS_RUNTIME_STATS.get("hit_gets", 0)) + 1
     return retained
 
 
@@ -712,9 +954,14 @@ def _plan_cross_graph_retention(
         return set(), {"method": "empty", "status": 0, "solve_time_s": 0.0, "selected_bytes": 0, "selected": 0}
     budget = int(max_live_bytes)
     if budget <= 0:
-        budget = int(sum(nbytes for _, _, nbytes in candidates))
-    if budget <= 0:
-        return set(), {"method": "disabled", "status": -1, "solve_time_s": 0.0, "selected_bytes": 0, "selected": 0}
+        return set(), {
+            "method": "disabled_no_live_budget",
+            "status": -1,
+            "solve_time_s": 0.0,
+            "selected_bytes": 0,
+            "selected": 0,
+            "budget_bytes": 0,
+        }
 
     selected: list[int] = []
     method = "greedy_cross_graph"
@@ -932,6 +1179,15 @@ def _plan_chorus_bucket_schedule(
     max_live_bytes = max(0, int(max_live_bytes))
     if num_buckets <= 0:
         return _ChorusBucketSchedule([], {}, "empty", 0.0, 0.0, 0)
+    if max_live_bytes <= 0:
+        return _ChorusBucketSchedule(
+            anchors=list(range(num_buckets)),
+            retained_parent={},
+            method="disabled_no_live_budget",
+            objective=0.0,
+            solve_time_s=0.0,
+            status=-1,
+        )
 
     # Build a bounded-window MILP over graph-visible FSDP collectives.
     # x(i,j)=1 means all-gather bucket i is materialized at anchor bucket j.
@@ -1261,6 +1517,8 @@ def simplefsdp_chorus_collectives_graph_pass(
     max_bucket_bytes = int(max_bucket_bytes)
     prefetch_groups = max(0, int(prefetch_groups))
     max_live_bytes = max(0, int(max_live_bytes))
+    if max_live_bytes <= 0:
+        prefetch_groups = 0
     global _LATEST_CHORUS_GRAPH_STATS
     _LATEST_CHORUS_GRAPH_STATS = {
         "enabled": 1,

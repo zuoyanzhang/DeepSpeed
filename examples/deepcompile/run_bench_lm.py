@@ -134,7 +134,7 @@ def get_args():
                         help="Number of SimpleFSDP all-gather buckets Chorus may raise before earlier consumer buckets. -1 auto-selects a workload-aware window; non-negative values are manual ablations.")
     parser.add_argument("--simplefsdp_chorus_live_mb", "--simplefsdp-chorus-live-mb",
                         type=int, default=-1,
-                        help="Approximate extra live all-gather budget for SimpleFSDP-Chorus graph scheduling in MiB. -1 reuses the automatic persistent-retention budget; 0 disables the cap; positive values are manual ablations.")
+                        help="Approximate extra live all-gather budget for SimpleFSDP-Chorus graph scheduling in MiB. -1 uses the automatic safety budget; 0 disables graph-retained all-gather buffers; positive values are manual ablations.")
     parser.add_argument("--simplefsdp_chorus_global_retention_mb", "--simplefsdp-chorus-global-retention-mb",
                         type=int, default=-1,
                         help="Runtime-footprint budget for SimpleFSDP-Chorus global retention in MiB. -1 auto-selects from actual GPU memory with a safety margin; 0 disables persistent retention; positive values are manual ablations.")
@@ -1068,6 +1068,9 @@ def main():
         "chorus_milp_final_gap": 0.0,
         "chorus_milp_status": -1,
         "chorus_milp_status_msg": "",
+        "chorus_runtime_max_live_bytes": 0,
+        "chorus_runtime_safe_total_bytes": 0,
+        "chorus_runtime_static_margin_bytes": 0,
         "replicate_small_param_numel": 0,
         "replicated_params": 0,
         "replicated_global_numel": 0,
@@ -1077,6 +1080,7 @@ def main():
         "dtensor_global_numel": 0,
         "coalesce_bucket_mb": 0,
     }
+    clear_simplefsdp_cross_graph_cache = None
     if is_simplefsdp:
         simplefsdp_stats = configure_native_simplefsdp(
             model,
@@ -1094,6 +1098,9 @@ def main():
             chorus_persistent_cost_multiplier=args.simplefsdp_chorus_persistent_cost_multiplier,
             chorus_persistent_static_margin_mb=args.simplefsdp_chorus_persistent_static_margin_mb,
         )
+        simplefsdp_stats.setdefault("chorus_runtime_max_live_bytes", 0)
+        simplefsdp_stats.setdefault("chorus_runtime_safe_total_bytes", 0)
+        simplefsdp_stats.setdefault("chorus_runtime_static_margin_bytes", 0)
         optimizer, optimizer_name = make_adamw_optimizer(
             model.parameters(),
             lr=args.learning_rate,
@@ -1115,16 +1122,39 @@ def main():
                 # Use the measured/estimated runtime budget as the Chorus live
                 # retention envelope. A fixed 4 GiB cap left most recompute
                 # all-gathers in the graph on 80 GB NVLink GPUs; use half of the
-                # safe budget, capped at 16 GiB, while keeping a 4 GiB floor for
-                # smaller models. Users can still override this for ablations.
+                # safe budget, capped at 16 GiB, while keeping a 1 GiB floor
+                # only when the auto budget is positive. Users can still
+                # override this for ablations.
                 if auto_live_mb > 0:
-                    effective_chorus_live_mb = max(4096, min(auto_live_mb // 2, 16384))
+                    if int(args.seq_length) >= 2048:
+                        # Long-sequence runs already have high activation and optimizer
+                        # pressure. Use a small, high-confidence cross-graph budget so
+                        # selected retain_get nodes hit without carrying too many
+                        # long-lived full parameters through high-activation regions.
+                        effective_chorus_live_mb = max(512, min(auto_live_mb // 8, 2048))
+                    else:
+                        effective_chorus_live_mb = max(1024, min(auto_live_mb // 2, 16384))
                 else:
-                    effective_chorus_live_mb = 4096
-            from native_simplefsdp import simplefsdp_chorus_collectives_graph_pass
+                    # No measured/estimated safe budget means no graph-retained
+                    # full-parameter buffers. Retain_get falls back to all-gather.
+                    effective_chorus_live_mb = 0
+            from native_simplefsdp import (
+                clear_simplefsdp_chorus_cross_graph_cache,
+                configure_simplefsdp_chorus_runtime_memory_budget,
+                simplefsdp_chorus_collectives_graph_pass,
+            )
 
             bucket_bytes = int(args.simplefsdp_coalesce_bucket_mb) * 1024 * 1024
             live_bytes = max(0, int(effective_chorus_live_mb)) * 1024 * 1024
+            runtime_budget_stats = configure_simplefsdp_chorus_runtime_memory_budget(
+                live_bytes,
+                usable_fraction=float(args.simplefsdp_chorus_persistent_usable_fraction),
+                static_margin_mb=int(args.simplefsdp_chorus_persistent_static_margin_mb),
+            )
+            clear_simplefsdp_cross_graph_cache = clear_simplefsdp_chorus_cross_graph_cache
+            simplefsdp_stats["chorus_runtime_max_live_bytes"] = int(runtime_budget_stats.get("max_live_bytes", 0))
+            simplefsdp_stats["chorus_runtime_safe_total_bytes"] = int(runtime_budget_stats.get("safe_total_bytes", 0))
+            simplefsdp_stats["chorus_runtime_static_margin_bytes"] = int(runtime_budget_stats.get("static_margin_bytes", 0))
             effective_chorus_prefetch_groups = int(args.simplefsdp_chorus_prefetch_groups)
             if effective_chorus_prefetch_groups < 0:
                 # Long-sequence NVLink runs are usually compute-bound; avoid moving
@@ -1365,6 +1395,8 @@ def main():
                     update_step = (is_deepspeed and model.is_gradient_accumulation_boundary()) \
                         or (not is_deepspeed and accelerator.sync_gradients)
                     accelerator.backward(loss)
+                    if clear_simplefsdp_cross_graph_cache is not None:
+                        clear_simplefsdp_cross_graph_cache()
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -1410,12 +1442,25 @@ def main():
     peak_bytes = int(torch.cuda.max_memory_allocated())
     peak_global_bytes = distributed_max_int(peak_bytes)
 
+    steady_iteration_time = float(sum(report_times) / len(report_times)) if report_times else 0.0
+    first_step_time = float(iter_times_by_step.get(1, 0.0))
+
     if accelerator.is_main_process:
-        compile_time_sum = 0
+        compile_time_sum = 0.0
         compile_time = 0
+        compile_time_source = "none"
         if args.compile and hasattr(model, "get_compile_time"):
             compile_time = model.get_compile_time()
-            compile_time_sum = sum(t for _, _, _, t in compile_time)
+            compile_time_sum = float(sum(t for _, _, _, t in compile_time))
+            compile_time_source = "model.get_compile_time"
+        if args.compile and compile_time_sum <= 0.0 and first_step_time > 0.0 and steady_iteration_time > 0.0:
+            # Plain torch.compile/Inductor paths, including SimpleFSDP, compile
+            # lazily during the first training step. Estimate compile overhead as
+            # first-step wall time minus the steady-state iteration time reported
+            # from steps 7..11. This keeps compile cost visible without changing
+            # the timed steady-state metric.
+            compile_time_sum = max(0.0, first_step_time - steady_iteration_time)
+            compile_time_source = "first_step_minus_steady"
 
         is_deepcompile = is_deepspeed and model._config.compile_config.deepcompile
         alloc_gb = float(alloc_bytes) / (1024**3)
@@ -1512,11 +1557,28 @@ def main():
             "graph_cross_graph_method": "none",
             "graph_cross_graph_status": -1,
             "graph_cross_graph_solve_time_s": 0.0,
+            "runtime_attempted_puts": 0,
+            "runtime_admitted_puts": 0,
+            "runtime_admitted_bytes": 0,
+            "runtime_retain_aliases": 0,
+            "runtime_retain_clones": 0,
+            "runtime_clone_mode": 0,
+            "runtime_skipped_disabled": 0,
+            "runtime_skipped_live_budget": 0,
+            "runtime_skipped_memory_pressure": 0,
+            "runtime_skipped_oom": 0,
+            "runtime_hit_gets": 0,
+            "runtime_fallback_gets": 0,
+            "runtime_peak_retained_bytes": 0,
+            "runtime_peak_driver_used_bytes": 0,
+            "runtime_peak_allocated_bytes": 0,
+            "runtime_peak_reserved_bytes": 0,
         }
         if simplefsdp_stats.get("enabled", False):
             try:
                 import native_simplefsdp as _native_simplefsdp
                 cache_diag = _native_simplefsdp.summarize_simplefsdp_chorus_persistent_cache(model)
+                runtime_diag = _native_simplefsdp.summarize_simplefsdp_chorus_runtime_retention()
                 graph_diag = dict(getattr(_native_simplefsdp, "_LATEST_CHORUS_GRAPH_STATS", {}) or {})
                 graph_history = list(getattr(_native_simplefsdp, "_CHORUS_GRAPH_HISTORY", []) or [])
                 simplefsdp_chorus_diag.update({
@@ -1550,6 +1612,22 @@ def main():
                     "graph_cross_graph_method": str(graph_diag.get("cross_graph_method", "none")),
                     "graph_cross_graph_status": int(graph_diag.get("cross_graph_status", -1)),
                     "graph_cross_graph_solve_time_s": float(graph_diag.get("cross_graph_solve_time_s", 0.0)),
+                    "runtime_attempted_puts": int(runtime_diag.get("attempted_puts", 0)),
+                    "runtime_admitted_puts": int(runtime_diag.get("admitted_puts", 0)),
+                    "runtime_admitted_bytes": int(runtime_diag.get("admitted_bytes", 0)),
+                    "runtime_retain_aliases": int(runtime_diag.get("retain_aliases", 0)),
+                    "runtime_retain_clones": int(runtime_diag.get("retain_clones", 0)),
+                    "runtime_clone_mode": int(runtime_diag.get("clone_mode", 0)),
+                    "runtime_skipped_disabled": int(runtime_diag.get("skipped_disabled", 0)),
+                    "runtime_skipped_live_budget": int(runtime_diag.get("skipped_live_budget", 0)),
+                    "runtime_skipped_memory_pressure": int(runtime_diag.get("skipped_memory_pressure", 0)),
+                    "runtime_skipped_oom": int(runtime_diag.get("skipped_oom", 0)),
+                    "runtime_hit_gets": int(runtime_diag.get("hit_gets", 0)),
+                    "runtime_fallback_gets": int(runtime_diag.get("fallback_gets", 0)),
+                    "runtime_peak_retained_bytes": int(runtime_diag.get("peak_retained_bytes", 0)),
+                    "runtime_peak_driver_used_bytes": int(runtime_diag.get("peak_driver_used_bytes", 0)),
+                    "runtime_peak_allocated_bytes": int(runtime_diag.get("peak_allocated_bytes", 0)),
+                    "runtime_peak_reserved_bytes": int(runtime_diag.get("peak_reserved_bytes", 0)),
                 })
             except Exception:
                 pass
@@ -1615,6 +1693,9 @@ def main():
             f" simplefsdp_chorus_milp_solve_time_s: {simplefsdp_stats['chorus_milp_solve_time_s']:.6f}"
             f" simplefsdp_chorus_milp_final_gap: {simplefsdp_stats['chorus_milp_final_gap']:.6g}"
             f" simplefsdp_chorus_milp_status: {simplefsdp_stats['chorus_milp_status']}"
+            f" simplefsdp_chorus_runtime_max_live_bytes: {simplefsdp_stats['chorus_runtime_max_live_bytes']}"
+            f" simplefsdp_chorus_runtime_safe_total_bytes: {simplefsdp_stats['chorus_runtime_safe_total_bytes']}"
+            f" simplefsdp_chorus_runtime_static_margin_bytes: {simplefsdp_stats['chorus_runtime_static_margin_bytes']}"
             f" simplefsdp_replicate_small_param_numel: {simplefsdp_stats['replicate_small_param_numel']}"
             f" simplefsdp_replicated_params: {simplefsdp_stats['replicated_params']}"
             f" simplefsdp_replicated_global_numel: {simplefsdp_stats['replicated_global_numel']}"
@@ -1656,12 +1737,43 @@ def main():
             f" simplefsdp_chorus_graph_cross_graph_method: {simplefsdp_chorus_diag['graph_cross_graph_method']}"
             f" simplefsdp_chorus_graph_cross_graph_status: {simplefsdp_chorus_diag['graph_cross_graph_status']}"
             f" simplefsdp_chorus_graph_cross_graph_solve_time_s: {simplefsdp_chorus_diag['graph_cross_graph_solve_time_s']:.6f}"
+            f" simplefsdp_chorus_runtime_attempted_puts: {simplefsdp_chorus_diag['runtime_attempted_puts']}"
+            f" simplefsdp_chorus_runtime_admitted_puts: {simplefsdp_chorus_diag['runtime_admitted_puts']}"
+            f" simplefsdp_chorus_runtime_admitted_bytes: {simplefsdp_chorus_diag['runtime_admitted_bytes']}"
+            f" simplefsdp_chorus_runtime_retain_aliases: {simplefsdp_chorus_diag['runtime_retain_aliases']}"
+            f" simplefsdp_chorus_runtime_retain_clones: {simplefsdp_chorus_diag['runtime_retain_clones']}"
+            f" simplefsdp_chorus_runtime_clone_mode: {simplefsdp_chorus_diag['runtime_clone_mode']}"
+            f" simplefsdp_chorus_runtime_skipped_disabled: {simplefsdp_chorus_diag['runtime_skipped_disabled']}"
+            f" simplefsdp_chorus_runtime_skipped_live_budget: {simplefsdp_chorus_diag['runtime_skipped_live_budget']}"
+            f" simplefsdp_chorus_runtime_skipped_memory_pressure: {simplefsdp_chorus_diag['runtime_skipped_memory_pressure']}"
+            f" simplefsdp_chorus_runtime_skipped_oom: {simplefsdp_chorus_diag['runtime_skipped_oom']}"
+            f" simplefsdp_chorus_runtime_hit_gets: {simplefsdp_chorus_diag['runtime_hit_gets']}"
+            f" simplefsdp_chorus_runtime_fallback_gets: {simplefsdp_chorus_diag['runtime_fallback_gets']}"
+            f" simplefsdp_chorus_runtime_peak_retained_bytes: {simplefsdp_chorus_diag['runtime_peak_retained_bytes']}"
+            f" simplefsdp_chorus_runtime_peak_driver_used_bytes: {simplefsdp_chorus_diag['runtime_peak_driver_used_bytes']}"
+            f" simplefsdp_chorus_runtime_peak_allocated_bytes: {simplefsdp_chorus_diag['runtime_peak_allocated_bytes']}"
+            f" simplefsdp_chorus_runtime_peak_reserved_bytes: {simplefsdp_chorus_diag['runtime_peak_reserved_bytes']}"
         ) if simplefsdp_stats.get("enabled", False) else ""
         activation_checkpointing_report = bool(
             activation_checkpointing_enabled or simplefsdp_stats.get("selective_checkpoint_layers", 0) > 0
         )
-        msg = f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes} batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage} acc={args.gradient_accumulation_steps} ac={activation_checkpointing_report} requested_ac={args.activation_checkpointing} compile={args.compile} backend={args.backend} distributed_backend={args.distributed_backend} deepcompile={is_deepcompile} passes={args.passes} compile_time={compile_time_sum} iteration time: {sum(report_times) / len(report_times):.4f}{fsdp2_stats}{simplefsdp_msg}{milp_stats}"
         nvidia_smi_peak_gb = float(nvidia_smi_peak_global_bytes) / (1024**3)
+        msg = (
+            f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes}"
+            f" batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage}"
+            f" acc={args.gradient_accumulation_steps} ac={activation_checkpointing_report}"
+            f" requested_ac={args.activation_checkpointing} compile={args.compile} backend={args.backend}"
+            f" distributed_backend={args.distributed_backend} deepcompile={is_deepcompile}"
+            f" passes={args.passes} compile_time={compile_time_sum:.4f}"
+            f" compile_time_source={compile_time_source}"
+            f" first_step_time={first_step_time:.4f}"
+            f" iteration time: {steady_iteration_time:.4f}"
+            f" alloc_mem_gb: {alloc_gb:.2f}"
+            f" peak_mem_gb: {peak_gb:.2f}"
+            f" peak_mem_global_gb: {peak_global_gb:.2f}"
+            f" nvidia_smi_peak_gb: {nvidia_smi_peak_gb:.2f}"
+            f"{fsdp2_stats}{simplefsdp_msg}{milp_stats}"
+        )
         pred_meas_msg = f"Pred. {predicted_total_peak_gb:.2f} GB Meas. {nvidia_smi_peak_gb:.2f} GB"
         print(msg)
         print(pred_meas_msg)
@@ -1677,7 +1789,7 @@ def main():
             if args.compile:
                 filepath = Path(args.profile_dir) / f"compile_time.txt"
                 with open(filepath, "a") as f:
-                    compile_msg =  f"{msg} compile_time={compile_time_sum} {compile_time}"
+                    compile_msg =  f"{msg} compile_time_detail={compile_time}"
                     f.write(f"{timestamp} {compile_msg}" + "\n")
 
     # # Save the model

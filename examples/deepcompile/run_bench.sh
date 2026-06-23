@@ -24,8 +24,8 @@ if [ -z "${FSDP2_FAST_OPTS+x}" ]; then
         FSDP2_FAST_OPTS="--fsdp2-fast"
 fi
 # MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/LLM-Research/"}
-MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/baichuan-inc/"}
-# MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/Qwen/"}
+# MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/baichuan-inc/"}
+MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/Qwen/"}
 
 
 # MODEL=${MODEL_NAME:-"Mistral-7B-Instruct-v0.3"}
@@ -36,8 +36,8 @@ MODEL_PATH=${MODEL_PATH:-"/home/dev/.cache/modelscope/hub/models/baichuan-inc/"}
 # MODEL=${MODEL_NAME:-"Qwen2.5-7B-Instruct"}
 # MODEL=${MODEL_NAME:-"Qwen3-8B"}
 # MODEL=${MODEL_NAME:-"Qwen3-4B"}
-# MODEL=${MODEL_NAME:-"Qwen3-14B"}
-MODEL=${MODEL_NAME:-"Baichuan2-13B-Base"}
+MODEL=${MODEL_NAME:-"Qwen3-14B"}
+# MODEL=${MODEL_NAME:-"Baichuan2-13B-Base"}
 BATCH_SIZE_OPTS=(1)
 SEQ_LENGTH_OPTS=(2048)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
@@ -52,8 +52,9 @@ for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
         # bash ./run_multinode.sh --backend fsdp2 ${ARGS} ${FSDP2_PREFETCH_OPTS} ${FSDP2_FAST_OPTS}
         # bash ./run_multinode.sh --backend fsdp2 ${ARGS} ${COMPILE_OPTS} ${FSDP2_PREFETCH_OPTS} ${FSDP2_FAST_OPTS}
         # bash ./run_multinode.sh --backend simplefsdp ${ARGS} ${COMPILE_OPTS} ${SIMPLEFSDP_FAST_OPTS} ${SIMPLEFSDP_PREFETCH_OPTS}
+        bash ./run_multinode.sh --backend simplefsdp ${ARGS} ${COMPILE_OPTS} ${SIMPLEFSDP_FAST_OPTS} --simplefsdp_enable_chorus
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch,selective_gather
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes global_layer_scheduler
+        # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes global_layer_scheduler
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS}
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes selective_activation_recompute
         # bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS} --passes prefetch
