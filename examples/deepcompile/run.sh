@@ -258,7 +258,7 @@ fi
 
 #replace , with _ in PASSES
 PASSES=$(echo $PASSES | tr ',' '_')
-LOG_DIR=logs
+LOG_DIR=${LOG_DIR:-logs}
 mkdir -p ${LOG_DIR}
 LOG_FILE=${LOG_DIR}/debug_n${MACHINE_RANK}_${MODEL##*/}_${BACKEND}_np${NUM_PROCESSES}z${ZERO_STAGE}c${COMPILE}dc${DEEPCOMPILE}E${EAGER}b${BATCH_SIZE}seq${SEQ_LENGTH}g${GRADIENT_ACCUMULATION_STEPS}a${ACTIVATION_CHECKPOINTING}p${PASSES}.log
 echo "Logging to ${LOG_FILE}"
@@ -275,4 +275,4 @@ run_bench_lm.py \
 --distributed_backend ${BACKEND} \
 ${GAS_OPTS} \
 ${EXTRA_OPTS} \
-2>&1 | tee ${LOG_FILE}
+2>&1 | tee -a "${LOG_FILE}"

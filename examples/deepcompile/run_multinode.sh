@@ -34,10 +34,13 @@ else
         export MASTER_PORT="${MASTER_PORT:-$((15000 + RANDOM % 10000))}"
         LOG_DIR="${SCRIPT_DIR}/logs"
         mkdir -p "${LOG_DIR}"
+        SRUN_LOG_FILE="${SRUN_LOG_FILE:-${LOG_DIR}/${SLURM_JOB_NAME:-deepcompile_bench}.out.log}"
+        set -o pipefail
         srun --nodes="${NUM_NODES}" --ntasks-per-node=1 --gpus-per-node="${NGPUS_PER_NODE}" \
-            --output="${LOG_DIR}/srun-%t.out.log" \
+            --label \
             --export=ALL,NUM_NODES="${NUM_NODES}",NGPUS_PER_NODE="${NGPUS_PER_NODE}",MASTER_ADDR="${MASTER_ADDR}",MASTER_PORT="${MASTER_PORT}" \
-            bash "${SCRIPT_DIR}/run.sh" --host-ip "${MASTER_ADDR}" --host-port "${MASTER_PORT}" $*
+            bash "${SCRIPT_DIR}/run.sh" --host-ip "${MASTER_ADDR}" --host-port "${MASTER_PORT}" $* \
+            2>&1 | tee -a "${SRUN_LOG_FILE}" >/dev/null
     else
         echo "Error: multi-node run requires Slurm; SLURM_JOB_ID is not set."
         exit 1

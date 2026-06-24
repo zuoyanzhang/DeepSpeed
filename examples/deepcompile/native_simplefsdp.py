@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,20 +28,28 @@ _LATEST_CHORUS_GRAPH_STATS: dict[str, int | float | str] = {}
 _CHORUS_GRAPH_HISTORY: list[dict[str, int | float | str]] = []
 _CHORUS_RETAINED_TENSORS: dict[int, torch.Tensor] = {}
 _CHORUS_RETAINED_BYTES_BY_KEY: dict[int, int] = {}
+_CHORUS_RETAINED_BUFFER_POOL: dict[int, torch.Tensor] = {}
 _CHORUS_FORWARD_RETAIN_SIGNATURE_TO_KEY: dict[tuple, int] = {}
+_CHORUS_RETAIN_KEY_TO_SIGNATURE: dict[int, tuple] = {}
 _CHORUS_FORWARD_RETAIN_BYTES: dict[tuple, int] = {}
+_CHORUS_STATIC_PARAM_TAGS: list[tuple[str, int, tuple[int, ...]]] = []
+_CHORUS_PARAM_TRACE_TAGS: list[tuple[str, int, tuple[int, ...]]] = []
+_CHORUS_PARAM_TRACE_TAG_CONSUMED = 0
 _CHORUS_NEXT_RETAIN_KEY = 1
 _CHORUS_RUNTIME_MAX_LIVE_BYTES = 0
 _CHORUS_RUNTIME_USABLE_FRACTION = 0.90
-_CHORUS_RUNTIME_STATIC_MARGIN_BYTES = 1024 * 1024 * 1024
+_CHORUS_RUNTIME_STATIC_MARGIN_BYTES = 0
 _CHORUS_RUNTIME_RETAINED_BYTES = 0
 _CHORUS_RUNTIME_RETAIN_CLONE = True
 _CHORUS_RUNTIME_STATS: dict[str, int | float] = {}
+_CHORUS_VALIDATE_PRINTED_KEYS: set[int] = set()
 
 
 _chorus_lib = torch.library.Library("simplefsdp_chorus", "DEF")
 _chorus_lib.define("retain_put(Tensor x, int key) -> Tensor")
+_chorus_lib.define("retain_put_waited(Tensor x, int key) -> Tensor")
 _chorus_lib.define("retain_get(Tensor local_shard, int key, int group_size, str group_name) -> Tensor")
+_chorus_lib.define("tag_param(Tensor x, str name) -> Tensor")
 
 
 def _new_chorus_runtime_stats() -> dict[str, int | float]:
@@ -56,6 +65,8 @@ def _new_chorus_runtime_stats() -> dict[str, int | float]:
         "admitted_bytes": 0,
         "retain_aliases": 0,
         "retain_clones": 0,
+        "retain_pool_hits": 0,
+        "retain_pool_misses": 0,
         "clone_mode": 0,
         "skipped_disabled": 0,
         "skipped_live_budget": 0,
@@ -112,7 +123,7 @@ def clear_simplefsdp_chorus_cross_graph_cache() -> None:
 def configure_simplefsdp_chorus_runtime_memory_budget(
     max_live_bytes: int,
     usable_fraction: float = 0.90,
-    static_margin_mb: int = 1024,
+    static_margin_mb: int = 0,
 ) -> dict[str, int | float]:
     """Configure runtime admission for cross-graph retained all-gathers.
 
@@ -128,6 +139,8 @@ def configure_simplefsdp_chorus_runtime_memory_budget(
     global _CHORUS_RUNTIME_RETAIN_CLONE
     global _CHORUS_RUNTIME_STATS
     global _CHORUS_NEXT_RETAIN_KEY
+    global _CHORUS_PARAM_TRACE_TAG_CONSUMED
+    global _CHORUS_VALIDATE_PRINTED_KEYS
 
     _CHORUS_RUNTIME_MAX_LIVE_BYTES = max(0, int(max_live_bytes))
     _CHORUS_RUNTIME_USABLE_FRACTION = max(0.0, min(1.0, float(usable_fraction)))
@@ -144,8 +157,13 @@ def configure_simplefsdp_chorus_runtime_memory_budget(
     })
     _CHORUS_RETAINED_TENSORS.clear()
     _CHORUS_RETAINED_BYTES_BY_KEY.clear()
+    _CHORUS_RETAINED_BUFFER_POOL.clear()
     _CHORUS_FORWARD_RETAIN_SIGNATURE_TO_KEY.clear()
+    _CHORUS_RETAIN_KEY_TO_SIGNATURE.clear()
     _CHORUS_FORWARD_RETAIN_BYTES.clear()
+    _CHORUS_PARAM_TRACE_TAGS.clear()
+    _CHORUS_PARAM_TRACE_TAG_CONSUMED = 0
+    _CHORUS_VALIDATE_PRINTED_KEYS.clear()
     _CHORUS_NEXT_RETAIN_KEY = 1
     _CHORUS_GRAPH_HISTORY.clear()
 
@@ -226,10 +244,10 @@ def _chorus_can_admit_retain(required_bytes: int, tensor: torch.Tensor, *, will_
         _CHORUS_RUNTIME_STATS["last_reusable_cache_bytes"] = max(0, int(reserved) - int(allocated))
         _CHORUS_RUNTIME_STATS["last_driver_growth_bytes"] = int(extra_allocation)
         _CHORUS_RUNTIME_STATS["last_projected_used_bytes"] = int(driver_used) + int(extra_allocation)
-        # Clone-retention is the safe default for Inductor-compiled graphs.
-        # Alias-retention can be enabled for experiments with
-        # SIMPLEFSDP_CHORUS_RETAIN_CLONE=0; in that mode the already materialized
-        # all-gather output is kept alive instead of allocating another copy.
+        # Cross-graph retention must outlive Inductor's graph-local temporary
+        # buffers. Clone by default so retain_get never observes a reused
+        # all-gather output; SIMPLEFSDP_CHORUS_RETAIN_CLONE=0 is an unsafe
+        # alias-retention ablation.
         if driver_used + extra_allocation + margin > safe_total:
             _CHORUS_RUNTIME_STATS["skipped_memory_pressure"] = int(
                 _CHORUS_RUNTIME_STATS.get("skipped_memory_pressure", 0)
@@ -243,18 +261,45 @@ def _chorus_can_admit_retain(required_bytes: int, tensor: torch.Tensor, *, will_
     return True
 
 
-@torch.library.impl(_chorus_lib, "retain_put", "CUDA")
-def _chorus_retain_put_cuda(x: torch.Tensor, key: int) -> torch.Tensor:
-    waited = torch.ops._c10d_functional.wait_tensor.default(x)
+def _chorus_pool_buffer_matches(buffer: torch.Tensor | None, tensor: torch.Tensor) -> bool:
+    if buffer is None:
+        return False
+    return (
+        buffer.device == tensor.device
+        and buffer.dtype == tensor.dtype
+        and tuple(buffer.shape) == tuple(tensor.shape)
+        and tuple(buffer.stride()) == tuple(tensor.stride())
+    )
+
+
+def _chorus_retain_put_cuda_impl(x: torch.Tensor, key: int, *, already_waited: bool) -> torch.Tensor:
+    waited = x if already_waited else torch.ops._c10d_functional.wait_tensor.default(x)
     key = int(key)
     nbytes = _chorus_tensor_nbytes(waited)
     _CHORUS_RUNTIME_STATS["attempted_puts"] = int(_CHORUS_RUNTIME_STATS.get("attempted_puts", 0)) + 1
     _drop_chorus_retained_key(key)
     retain_clone = bool(_CHORUS_RUNTIME_RETAIN_CLONE)
-    if not _chorus_can_admit_retain(nbytes, waited, will_allocate=retain_clone):
+    pooled = _CHORUS_RETAINED_BUFFER_POOL.get(key) if retain_clone else None
+    pool_hit = retain_clone and _chorus_pool_buffer_matches(pooled, waited)
+    if not _chorus_can_admit_retain(nbytes, waited, will_allocate=(retain_clone and not pool_hit)):
         return waited
     try:
-        retained = waited.detach().clone() if retain_clone else waited.detach()
+        if retain_clone:
+            if pool_hit:
+                retained = pooled
+                with torch.no_grad():
+                    retained.copy_(waited.detach(), non_blocking=True)
+                _CHORUS_RUNTIME_STATS["retain_pool_hits"] = int(
+                    _CHORUS_RUNTIME_STATS.get("retain_pool_hits", 0)
+                ) + 1
+            else:
+                retained = waited.detach().clone()
+                _CHORUS_RETAINED_BUFFER_POOL[key] = retained
+                _CHORUS_RUNTIME_STATS["retain_pool_misses"] = int(
+                    _CHORUS_RUNTIME_STATS.get("retain_pool_misses", 0)
+                ) + 1
+        else:
+            retained = waited.detach()
     except torch.OutOfMemoryError:
         _CHORUS_RUNTIME_STATS["skipped_oom"] = int(_CHORUS_RUNTIME_STATS.get("skipped_oom", 0)) + 1
         _drop_chorus_retained_key(key)
@@ -275,7 +320,19 @@ def _chorus_retain_put_cuda(x: torch.Tensor, key: int) -> torch.Tensor:
         int(_CHORUS_RUNTIME_STATS.get("peak_retained_bytes", 0)),
         int(_CHORUS_RUNTIME_RETAINED_BYTES),
     )
+    # Keep the forward value path identical to the original graph. The cached
+    # waited tensor is only for later retain_get calls in the recompute graph.
     return waited
+
+
+@torch.library.impl(_chorus_lib, "retain_put", "CUDA")
+def _chorus_retain_put_cuda(x: torch.Tensor, key: int) -> torch.Tensor:
+    return _chorus_retain_put_cuda_impl(x, key, already_waited=False)
+
+
+@torch.library.impl(_chorus_lib, "retain_put_waited", "CUDA")
+def _chorus_retain_put_waited_cuda(x: torch.Tensor, key: int) -> torch.Tensor:
+    return _chorus_retain_put_cuda_impl(x, key, already_waited=True)
 
 
 @torch.library.impl(_chorus_lib, "retain_put", "CPU")
@@ -287,8 +344,18 @@ def _chorus_retain_put_cpu(x: torch.Tensor, key: int) -> torch.Tensor:
     return x
 
 
+@torch.library.impl(_chorus_lib, "retain_put_waited", "CPU")
+def _chorus_retain_put_waited_cpu(x: torch.Tensor, key: int) -> torch.Tensor:
+    return _chorus_retain_put_cpu(x, key)
+
+
 @torch.library.impl(_chorus_lib, "retain_put", "Meta")
 def _chorus_retain_put_meta(x: torch.Tensor, key: int) -> torch.Tensor:
+    return x.new_empty_strided(tuple(x.shape), tuple(x.stride()))
+
+
+@torch.library.impl(_chorus_lib, "retain_put_waited", "Meta")
+def _chorus_retain_put_waited_meta(x: torch.Tensor, key: int) -> torch.Tensor:
     return x.new_empty_strided(tuple(x.shape), tuple(x.stride()))
 
 
@@ -317,10 +384,15 @@ def _chorus_retain_get_cuda(
         expected = _chorus_all_gather_fallback(local_shard, int(group_size), str(group_name))
         try:
             diff = (expected - retained).abs().max().item()
-            if diff != 0.0:
-                print(f"[simplefsdp-chorus-validate] key={int(key)} max_diff={diff}")
+            if diff != 0.0 and int(key) not in _CHORUS_VALIDATE_PRINTED_KEYS:
+                _CHORUS_VALIDATE_PRINTED_KEYS.add(int(key))
+                signature = _CHORUS_RETAIN_KEY_TO_SIGNATURE.get(int(key), ())
+                print(f"[simplefsdp-chorus-validate] key={int(key)} signature={signature} max_diff={diff}")
         except Exception as exc:
-            print(f"[simplefsdp-chorus-validate] key={int(key)} compare_failed={exc}")
+            if int(key) not in _CHORUS_VALIDATE_PRINTED_KEYS:
+                _CHORUS_VALIDATE_PRINTED_KEYS.add(int(key))
+                signature = _CHORUS_RETAIN_KEY_TO_SIGNATURE.get(int(key), ())
+                print(f"[simplefsdp-chorus-validate] key={int(key)} signature={signature} compare_failed={exc}")
     return retained
 
 
@@ -350,6 +422,77 @@ def _chorus_retain_get_meta(
     if shape:
         shape[0] = int(shape[0]) * int(group_size)
     return local_shard.new_empty(tuple(shape))
+
+
+@torch.library.impl(_chorus_lib, "tag_param", "CUDA")
+def _chorus_tag_param_cuda(x: torch.Tensor, name: str) -> torch.Tensor:
+    return x
+
+
+@torch.library.impl(_chorus_lib, "tag_param", "CPU")
+def _chorus_tag_param_cpu(x: torch.Tensor, name: str) -> torch.Tensor:
+    return x
+
+
+@torch.library.impl(_chorus_lib, "tag_param", "Meta")
+def _chorus_tag_param_meta(x: torch.Tensor, name: str) -> torch.Tensor:
+    return x
+
+
+def _chorus_retain_put_setup_context(ctx, inputs, output) -> None:
+    return None
+
+
+def _chorus_retain_put_backward(ctx, grad_output: torch.Tensor):
+    return grad_output, None
+
+
+def _chorus_retain_get_setup_context(ctx, inputs, output) -> None:
+    ctx.group_size = int(inputs[2])
+    ctx.group_name = str(inputs[3])
+
+
+def _chorus_retain_get_backward(ctx, grad_output: torch.Tensor):
+    if grad_output is None:
+        return None, None, None, None
+    grad_local = torch.ops._c10d_functional.reduce_scatter_tensor.default(
+        grad_output.contiguous(),
+        "sum",
+        int(ctx.group_size),
+        str(ctx.group_name),
+    )
+    grad_local = torch.ops._c10d_functional.wait_tensor.default(grad_local)
+    return grad_local, None, None, None
+
+
+def _chorus_tag_param_setup_context(ctx, inputs, output) -> None:
+    return None
+
+
+def _chorus_tag_param_backward(ctx, grad_output: torch.Tensor):
+    return grad_output, None
+
+
+torch.library.register_autograd(
+    "simplefsdp_chorus::retain_put",
+    _chorus_retain_put_backward,
+    setup_context=_chorus_retain_put_setup_context,
+)
+torch.library.register_autograd(
+    "simplefsdp_chorus::retain_put_waited",
+    _chorus_retain_put_backward,
+    setup_context=_chorus_retain_put_setup_context,
+)
+torch.library.register_autograd(
+    "simplefsdp_chorus::retain_get",
+    _chorus_retain_get_backward,
+    setup_context=_chorus_retain_get_setup_context,
+)
+torch.library.register_autograd(
+    "simplefsdp_chorus::tag_param",
+    _chorus_tag_param_backward,
+    setup_context=_chorus_tag_param_setup_context,
+)
 
 
 @contextmanager
@@ -436,13 +579,20 @@ _wrap_class_cache: dict[tuple[type, frozenset[str]], type] = {}
 
 
 def _register_parametrization(
-    module: nn.Module, param_names: list[str], parametrization: nn.Module
+    module: nn.Module,
+    param_names: list[str],
+    parametrization: nn.Module,
+    param_fqns: dict[str, str] | None = None,
 ) -> None:
     if not param_names:
         return
     param_name_to_property = {
         param_name: property(
-            lambda self, pn=param_name: self._simplefsdp_parametrization(self._parameters[pn], pn)
+            lambda self, pn=param_name: self._simplefsdp_parametrization(
+                self._parameters[pn],
+                pn,
+                getattr(self, "_simplefsdp_param_fqns", {}).get(pn, pn),
+            )
         )
         for param_name in param_names
     }
@@ -458,6 +608,7 @@ def _register_parametrization(
         sys.modules[module_cls.__module__].__dict__[module_cls.__name__] = module_cls
         _wrap_class_cache[cache_key] = module_cls
     module._simplefsdp_parametrization = parametrization
+    module._simplefsdp_param_fqns = dict(param_fqns or {})
     module.__class__ = module_cls
 
 
@@ -470,6 +621,7 @@ class ReplicateComputation(nn.Module):
         mp_policy: SimpleFSDPMixedPrecisionPolicy | None,
         full_dtensor: bool = False,
         persistent_param_names: Sequence[str] | None = None,
+        enable_param_tags: bool = False,
     ) -> None:
         super().__init__()
         self.device_mesh = device_mesh
@@ -482,6 +634,7 @@ class ReplicateComputation(nn.Module):
         self.reduce_dtype = mp_policy.reduce_dtype
         self.full_dtensor = full_dtensor
         self.persistent_param_names = frozenset(str(name) for name in (persistent_param_names or ()))
+        self.enable_param_tags = bool(enable_param_tags)
         self._chorus_persistent_cache: dict[str, tuple[int | None, torch.Tensor]] = {}
         self._chorus_trace_cache_hits = 0
         self._chorus_trace_cache_misses = 0
@@ -564,7 +717,12 @@ class ReplicateComputation(nn.Module):
         self._chorus_persistent_cache[cache_key] = (version, output)
         return output
 
-    def forward(self, x: DTensor, param_name: str | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: DTensor,
+        param_name: str | None = None,
+        param_tag: str | None = None,
+    ) -> torch.Tensor:
         if not _active_parametrization:
             return x
         if param_name is not None and str(param_name) in self.persistent_param_names:
@@ -583,7 +741,10 @@ def data_parallel(
     replicate_module_attr: str = "_simplefsdp_chorus_global_retain",
     replicate_param_names_attr: str = "_simplefsdp_chorus_global_retain_params",
     persistent_param_names_attr: str = "_simplefsdp_chorus_persistent_params",
+    enable_param_tags: bool = False,
 ) -> nn.Module:
+    if enable_param_tags:
+        _CHORUS_STATIC_PARAM_TAGS.clear()
     if mode == "replicate":
         param_sharding: tuple[Placement, ...] = (Replicate(),)
     elif mode == "fully_shard":
@@ -594,12 +755,15 @@ def data_parallel(
     else:
         raise ValueError(f"Unsupported SimpleFSDP mode {mode}")
 
+    module_fqns = {id(module): name for name, module in model.named_modules()}
     for mod in list(model.modules()):
         params_dict = dict(mod.named_parameters(recurse=False))
         if "SimpleFSDP" in mod.__class__.__name__:
             continue
         wrapped_param_names = []
+        wrapped_param_fqns = {}
         persistent_param_names = set(str(name) for name in getattr(mod, persistent_param_names_attr, ()))
+        module_fqn = str(module_fqns.get(id(mod), ""))
         for p_name, p in params_dict.items():
             if p is None or p.numel() == 0:
                 continue
@@ -609,10 +773,20 @@ def data_parallel(
                 param_placements = (Replicate(),)
             elif replicate_numel_threshold > 0 and int(p.numel()) <= replicate_numel_threshold:
                 param_placements = (Replicate(),)
+            param_fqn = f"{module_fqn}.{p_name}" if module_fqn else str(p_name)
+            if enable_param_tags and param_placements and param_placements[0].is_shard():
+                tag_dtype = mp_policy.param_dtype if mp_policy is not None and mp_policy.param_dtype is not None else p.dtype
+                tag_element_size = torch.empty((), dtype=tag_dtype).element_size()
+                _CHORUS_STATIC_PARAM_TAGS.append((
+                    param_fqn,
+                    int(p.numel()) * int(tag_element_size),
+                    tuple(int(dim) for dim in p.shape),
+                ))
             distribute_tensor_func = _distribute_dtensor if isinstance(p, DTensor) else distribute_tensor
             dtensor_param = distribute_tensor_func(p, device_mesh, param_placements)
             mod.register_parameter(p_name, nn.Parameter(dtensor_param))
             wrapped_param_names.append(p_name)
+            wrapped_param_fqns[p_name] = param_fqn
         _register_parametrization(
             mod,
             wrapped_param_names,
@@ -623,7 +797,9 @@ def data_parallel(
                 mp_policy=mp_policy,
                 full_dtensor=full_dtensor,
                 persistent_param_names=persistent_param_names,
+                enable_param_tags=bool(enable_param_tags),
             ),
+            param_fqns=wrapped_param_fqns,
         )
     return model
 
@@ -725,10 +901,269 @@ def _node_nbytes(node) -> int:
     return 0
 
 
+def _node_shape(node) -> tuple[int, ...]:
+    meta = getattr(node, "meta", {}) or {}
+    val = meta.get("val") if "val" in meta else meta.get("tensor_meta")
+    if isinstance(val, (tuple, list)) and val:
+        val = val[0]
+    if hasattr(val, "shape"):
+        try:
+            return tuple(int(dim) for dim in val.shape)
+        except Exception:
+            return ()
+    return ()
+
+
 def _debug_node_name(arg) -> str:
     if hasattr(arg, "name"):
         return str(getattr(arg, "name"))
     return type(arg).__name__
+
+
+def _tag_entry_name(entry) -> str:
+    try:
+        return str(entry[0])
+    except Exception:
+        return ""
+
+
+def _tag_entry_nbytes(entry) -> int:
+    try:
+        return int(entry[1])
+    except Exception:
+        return 0
+
+
+def _tag_entry_shape(entry) -> tuple[int, ...]:
+    try:
+        if len(entry) >= 3:
+            return tuple(int(dim) for dim in entry[2])
+    except Exception:
+        return ()
+    return ()
+
+
+def _layer_id_from_param_tag(tag: str) -> int | None:
+    marker = ".layers."
+    idx = str(tag).find(marker)
+    if idx < 0:
+        return None
+    start = idx + len(marker)
+    end = start
+    while end < len(tag) and tag[end].isdigit():
+        end += 1
+    if end == start:
+        return None
+    try:
+        return int(tag[start:end])
+    except Exception:
+        return None
+
+
+def _reverse_layer_block_indices(indices: list[int], tag_source) -> list[int]:
+    if os.getenv("SIMPLEFSDP_CHORUS_REVERSE_FORWARD_LAYER_TAGS", "1") != "1":
+        return indices
+    if len(indices) < 2:
+        return indices
+
+    prefix: list[int] = []
+    suffix: list[int] = []
+    groups: list[tuple[int, list[int]]] = []
+    current_layer: int | None = None
+    current_group: list[int] = []
+    seen_layer = False
+
+    for tag_idx in indices:
+        layer_id = _layer_id_from_param_tag(_tag_entry_name(tag_source[tag_idx]))
+        if layer_id is None:
+            if not seen_layer:
+                prefix.append(tag_idx)
+            else:
+                if current_group:
+                    groups.append((int(current_layer), current_group))
+                    current_group = []
+                    current_layer = None
+                suffix.append(tag_idx)
+            continue
+
+        if suffix:
+            return indices
+        seen_layer = True
+        if current_layer is None or int(layer_id) == int(current_layer):
+            current_layer = int(layer_id)
+            current_group.append(tag_idx)
+            continue
+        groups.append((int(current_layer), current_group))
+        current_layer = int(layer_id)
+        current_group = [tag_idx]
+
+    if current_group:
+        groups.append((int(current_layer), current_group))
+
+    if len(groups) < 2:
+        return indices
+    layer_ids = [layer_id for layer_id, _ in groups]
+    if layer_ids != sorted(layer_ids):
+        return indices
+    reversed_groups = [group for _, group in reversed(groups)]
+    return prefix + [tag_idx for group in reversed_groups for tag_idx in group] + suffix
+
+
+def _is_chorus_tag_param_node(node) -> bool:
+    return (
+        getattr(node, "op", None) == "call_function"
+        and getattr(node, "target", None) == torch.ops.simplefsdp_chorus.tag_param.default
+    )
+
+
+def _all_gather_param_tags_from_users(node, max_depth: int = 8) -> tuple[str, ...]:
+    tags: set[str] = set()
+    seen: set[int] = set()
+    queue = deque([(node, 0)])
+    while queue:
+        current, depth = queue.popleft()
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        if depth >= max_depth:
+            continue
+        for user in list(getattr(current, "users", ())):
+            if _is_chorus_tag_param_node(user):
+                try:
+                    tags.add(str(user.args[1]))
+                except Exception:
+                    pass
+                continue
+            if hasattr(user, "users"):
+                queue.append((user, depth + 1))
+    return tuple(sorted(tags))
+
+
+def _all_gather_param_tag(node) -> str | None:
+    meta = getattr(node, "meta", {}) or {}
+    trace_tag = meta.get("simplefsdp_chorus_param_tag")
+    if trace_tag:
+        return str(trace_tag)
+    tags = _all_gather_param_tags_from_users(node)
+    if len(tags) == 1:
+        return tags[0]
+    return None
+
+
+def _tag_entry_matches_all_gather(entry, node) -> bool:
+    tag_nbytes = _tag_entry_nbytes(entry)
+    output_nbytes = int(_all_gather_output_nbytes(node))
+    if tag_nbytes > 0 and output_nbytes > 0 and tag_nbytes != output_nbytes:
+        return False
+    tag_shape = _tag_entry_shape(entry)
+    output_shape = _all_gather_output_shape(node)
+    if tag_shape and output_shape and tag_shape != output_shape:
+        return False
+    return True
+
+
+def _aligned_param_tag_indices(tag_source, ag_nodes) -> list[int] | None:
+    if not tag_source or not ag_nodes or len(ag_nodes) > len(tag_source):
+        return None
+
+    exact_starts: list[int] = []
+    max_start = len(tag_source) - len(ag_nodes)
+    for start in range(max_start + 1):
+        if all(_tag_entry_matches_all_gather(tag_source[start + idx], node) for idx, node in enumerate(ag_nodes)):
+            exact_starts.append(start)
+
+    if exact_starts:
+        # A full forward graph usually starts at 0. Activation-recompute graphs
+        # can omit parameters outside checkpointed blocks (for example token
+        # embedding and lm_head), so choose the earliest exact window for that
+        # graph instead of blindly restarting at static[0].
+        start = exact_starts[0]
+        return [start + idx for idx in range(len(ag_nodes))]
+
+    # Last-resort ordered subsequence match. This keeps unusual selective
+    # checkpointing graphs correct as long as nbytes/shape make the sequence
+    # identifiable.
+    indices: list[int] = []
+    cursor = 0
+    for node in ag_nodes:
+        matched_idx = None
+        for idx in range(cursor, len(tag_source)):
+            if _tag_entry_matches_all_gather(tag_source[idx], node):
+                matched_idx = idx
+                break
+        if matched_idx is None:
+            return None
+        indices.append(matched_idx)
+        cursor = matched_idx + 1
+    return indices
+
+
+def _dump_param_tag_assignment(graph_idx: int, tag_source, ag_nodes, indices: list[int]) -> None:
+    if os.getenv("SIMPLEFSDP_CHORUS_DUMP_ASSIGNMENTS", "0") != "1":
+        return
+    print(
+        f"[simplefsdp-chorus-assign] graph={graph_idx} "
+        f"ag_nodes={len(ag_nodes)} static_tags={len(tag_source)}"
+    )
+    limit = int(os.getenv("SIMPLEFSDP_CHORUS_DUMP_ASSIGNMENTS_LIMIT", "64"))
+    for ag_idx, tag_idx in enumerate(indices[:max(0, limit)]):
+        entry = tag_source[tag_idx]
+        print(
+            "[simplefsdp-chorus-assign] "
+            f"graph={graph_idx} ag_idx={ag_idx} tag_idx={tag_idx} "
+            f"tag={_tag_entry_name(entry)} tag_nbytes={_tag_entry_nbytes(entry)} "
+            f"tag_shape={_tag_entry_shape(entry)} "
+            f"ag_nbytes={_all_gather_output_nbytes(ag_nodes[ag_idx])} "
+            f"ag_shape={_all_gather_output_shape(ag_nodes[ag_idx])}"
+        )
+
+
+def _assign_trace_param_tags_to_all_gathers(ag_nodes, *, has_reduce_scatter: bool = False) -> None:
+    tag_source = _CHORUS_PARAM_TRACE_TAGS if _CHORUS_PARAM_TRACE_TAGS else _CHORUS_STATIC_PARAM_TAGS
+    if not tag_source:
+        return
+    graph_idx = len(_CHORUS_GRAPH_HISTORY)
+    aligned_indices = _aligned_param_tag_indices(tag_source, ag_nodes)
+    if aligned_indices is not None and len(aligned_indices) == len(ag_nodes):
+        if not bool(has_reduce_scatter):
+            aligned_indices = _reverse_layer_block_indices(aligned_indices, tag_source)
+        _dump_param_tag_assignment(graph_idx, tag_source, ag_nodes, aligned_indices)
+        for node, tag_idx in zip(ag_nodes, aligned_indices):
+            meta = getattr(node, "meta", None)
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("simplefsdp_chorus_param_tag"):
+                continue
+            entry = tag_source[tag_idx]
+            meta["simplefsdp_chorus_param_tag"] = _tag_entry_name(entry)
+            meta["simplefsdp_chorus_param_nbytes"] = _tag_entry_nbytes(entry)
+            meta["simplefsdp_chorus_param_shape"] = _tag_entry_shape(entry)
+        return
+
+    cursor = 0
+    fallback_indices: list[int] = []
+    for node in ag_nodes:
+        meta = getattr(node, "meta", None)
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("simplefsdp_chorus_param_tag"):
+            continue
+        matched_idx = None
+        scan_end = min(len(tag_source), int(cursor) + 32)
+        for idx in range(int(cursor), scan_end):
+            if _tag_entry_matches_all_gather(tag_source[idx], node):
+                matched_idx = idx
+                break
+        if matched_idx is None:
+            continue
+        entry = tag_source[matched_idx]
+        cursor = int(matched_idx) + 1
+        fallback_indices.append(matched_idx)
+        meta["simplefsdp_chorus_param_tag"] = _tag_entry_name(entry)
+        meta["simplefsdp_chorus_param_nbytes"] = _tag_entry_nbytes(entry)
+        meta["simplefsdp_chorus_param_shape"] = _tag_entry_shape(entry)
+    _dump_param_tag_assignment(graph_idx, tag_source, ag_nodes[:len(fallback_indices)], fallback_indices)
 
 
 def _maybe_dump_chorus_ag_signatures(graph, ag_nodes) -> None:
@@ -744,6 +1179,8 @@ def _maybe_dump_chorus_ag_signatures(graph, ag_nodes) -> None:
             "[simplefsdp-chorus-dump] "
             f"idx={idx} node={getattr(node, 'name', '')} input={_debug_node_name(inp)} "
             f"nbytes={_node_nbytes(inp)} args_tail={node.args[1:]} "
+            f"param_tags={_all_gather_param_tags_from_users(node)} "
+            f"signature={_all_gather_cross_graph_signature(node)} "
             f"meta_keys={list(meta.keys())[:8]} input_meta_keys={list(inp_meta.keys())[:8]}"
         )
         stack = str(meta.get("stack_trace", "") or inp_meta.get("stack_trace", ""))
@@ -904,9 +1341,33 @@ def _all_gather_output_nbytes(node) -> int:
     return max(0, input_nbytes * max(1, _all_gather_group_size(node)))
 
 
+def _all_gather_output_shape(node) -> tuple[int, ...]:
+    output_shape = _node_shape(node)
+    if output_shape:
+        return output_shape
+    if not node.args:
+        return ()
+    input_shape = _node_shape(node.args[0])
+    if not input_shape:
+        return ()
+    shape = list(input_shape)
+    shape[0] = int(shape[0]) * max(1, _all_gather_group_size(node))
+    return tuple(shape)
+
+
 def _all_gather_cross_graph_signature(node):
     inp = node.args[0] if node.args else None
+    param_tag = _all_gather_param_tag(node)
+    if param_tag:
+        return (
+            "param",
+            str(param_tag),
+            int(_all_gather_output_nbytes(node)),
+            int(_all_gather_group_size(node)),
+            str(_all_gather_group_name(node)),
+        )
     return (
+        "fallback",
         _debug_node_name(inp),
         _tensor_signature(inp),
         int(_node_nbytes(inp)),
@@ -914,6 +1375,10 @@ def _all_gather_cross_graph_signature(node):
         int(_all_gather_group_size(node)),
         str(_all_gather_group_name(node)),
     )
+
+
+def _is_stable_cross_graph_signature(signature: tuple) -> bool:
+    return bool(signature) and signature[0] == "param"
 
 
 def _is_activation_recompute_all_gather(node) -> bool:
@@ -931,10 +1396,13 @@ def _is_activation_recompute_all_gather(node) -> bool:
 def _unique_cross_graph_candidates(ag_nodes) -> list[tuple[tuple, object, int]]:
     candidates = []
     seen = set()
+    allow_unmarked = not any(_is_activation_recompute_all_gather(node) for node in ag_nodes)
     for node in ag_nodes:
-        if not _is_activation_recompute_all_gather(node):
+        if not allow_unmarked and not _is_activation_recompute_all_gather(node):
             continue
         signature = _all_gather_cross_graph_signature(node)
+        if not _is_stable_cross_graph_signature(signature):
+            continue
         if signature in seen:
             continue
         seen.add(signature)
@@ -1024,7 +1492,15 @@ def _chorus_retain_key_for_signature(signature: tuple) -> int:
     key = int(_CHORUS_NEXT_RETAIN_KEY)
     _CHORUS_NEXT_RETAIN_KEY += 1
     _CHORUS_FORWARD_RETAIN_SIGNATURE_TO_KEY[signature] = key
+    _CHORUS_RETAIN_KEY_TO_SIGNATURE[key] = signature
     return key
+
+
+def _is_wait_tensor_node(node) -> bool:
+    return (
+        getattr(node, "op", None) == "call_function"
+        and getattr(node, "target", None) == torch.ops._c10d_functional.wait_tensor.default
+    )
 
 
 def _insert_cross_graph_retain_puts(graph, ag_nodes, selected_signatures: set[tuple]) -> tuple[int, int]:
@@ -1037,6 +1513,25 @@ def _insert_cross_graph_retain_puts(graph, ag_nodes, selected_signatures: set[tu
         key = _chorus_retain_key_for_signature(signature)
         nbytes = int(_all_gather_output_nbytes(node))
         _CHORUS_FORWARD_RETAIN_BYTES[signature] = nbytes
+        wait_users = [user for user in list(node.users) if _is_wait_tensor_node(user)]
+        if wait_users:
+            for wait_node in wait_users:
+                with graph.inserting_after(wait_node):
+                    retained = graph.call_function(
+                        torch.ops.simplefsdp_chorus.retain_put_waited.default,
+                        args=(wait_node, int(key)),
+                    )
+                retained.meta = dict(getattr(wait_node, "meta", {}))
+                replaced = False
+                for user in list(wait_node.users):
+                    if user is retained:
+                        continue
+                    user.replace_input_with(wait_node, retained)
+                    replaced = True
+                if replaced:
+                    puts += 1
+                    retained_bytes += nbytes
+            continue
         with graph.inserting_after(node):
             retained = graph.call_function(
                 torch.ops.simplefsdp_chorus.retain_put.default,
@@ -1063,13 +1558,30 @@ def _replace_cross_graph_retain_gets(graph, ag_nodes) -> tuple[int, int]:
         local_shard = node.args[0]
         group_size = int(_all_gather_group_size(node))
         group_name = str(_all_gather_group_name(node))
+        nbytes = int(_all_gather_output_nbytes(node))
+        wait_users = [user for user in list(node.users) if _is_wait_tensor_node(user)]
+        if wait_users:
+            for wait_node in wait_users:
+                with graph.inserting_before(wait_node):
+                    retained = graph.call_function(
+                        torch.ops.simplefsdp_chorus.retain_get.default,
+                        args=(local_shard, int(key), group_size, group_name),
+                    )
+                retained.meta = dict(getattr(wait_node, "meta", {}))
+                wait_node.replace_all_uses_with(retained)
+                if len(wait_node.users) == 0:
+                    graph.erase_node(wait_node)
+                gets += 1
+                retained_bytes += nbytes
+            if len(node.users) == 0:
+                graph.erase_node(node)
+            continue
         with graph.inserting_before(node):
             retained = graph.call_function(
                 torch.ops.simplefsdp_chorus.retain_get.default,
                 args=(local_shard, int(key), group_size, group_name),
             )
         retained.meta = dict(getattr(node, "meta", {}))
-        nbytes = int(_all_gather_output_nbytes(node))
         node.replace_all_uses_with(retained)
         if len(node.users) == 0:
             graph.erase_node(node)
@@ -1503,6 +2015,7 @@ def simplefsdp_chorus_collectives_graph_pass(
     prefetch_groups: int = 2,
     max_live_bytes: int = 4 * 1024 * 1024 * 1024,
     milp_time_limit_s: float = 2.0,
+    enable_cross_graph_retention: bool = False,
 ):
     """Apply the SimpleFSDP+Chorus graph schedule to visible collectives.
 
@@ -1561,17 +2074,23 @@ def simplefsdp_chorus_collectives_graph_pass(
             rs_nodes.append(node)
     _LATEST_CHORUS_GRAPH_STATS["ag_before"] = int(len(ag_nodes))
     _LATEST_CHORUS_GRAPH_STATS["rs_before"] = int(len(rs_nodes))
+    _assign_trace_param_tags_to_all_gathers(ag_nodes, has_reduce_scatter=bool(rs_nodes))
     _maybe_dump_chorus_ag_signatures(graph, ag_nodes)
 
-    cross_changed, cross_stats = _apply_cross_graph_retention(
-        graph,
-        ag_nodes,
-        has_reduce_scatter=bool(rs_nodes),
-        max_live_bytes=max_live_bytes,
-        milp_time_limit_s=float(milp_time_limit_s),
-    )
-    _LATEST_CHORUS_GRAPH_STATS.update(cross_stats)
-    changed = cross_changed or changed
+    cross_changed = False
+    if enable_cross_graph_retention:
+        cross_changed, cross_stats = _apply_cross_graph_retention(
+            graph,
+            ag_nodes,
+            has_reduce_scatter=bool(rs_nodes),
+            max_live_bytes=max_live_bytes,
+            milp_time_limit_s=float(milp_time_limit_s),
+        )
+        _LATEST_CHORUS_GRAPH_STATS.update(cross_stats)
+        changed = cross_changed or changed
+    else:
+        _LATEST_CHORUS_GRAPH_STATS["cross_graph_method"] = "disabled"
+        _LATEST_CHORUS_GRAPH_STATS["cross_graph_status"] = 0
 
     if cross_changed:
         ag_nodes = []

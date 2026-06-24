@@ -4,7 +4,9 @@
 #SBATCH --qos=gpugpu
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
-#SBATCH --output=logs/%x-%j.out.log
+#SBATCH --output=logs/%x.out.log
+#SBATCH --error=logs/%x.out.log
+#SBATCH --open-mode=append
 
 module load miniforge3/24.1 compilers/gcc/11.3.0  compilers/cuda/12.4  cudnn/8.9.5.29_cuda12.x nccl/2.26.5-1_cuda12.4
 source /home/bingxing2/apps/miniforge3/24.1.2/etc/profile.d/conda.sh
@@ -38,4 +40,8 @@ fi
 export MASTER_PORT=${MASTER_PORT:-$((15000 + RANDOM % 10000))}
 
 # 运行基准脚本（多节点启动由 run_multinode.sh 内部的 srun 负责）
+echo "===== BEGIN job_id=${SLURM_JOB_ID:-unknown} start=$(date '+%F %T') ====="
 bash ./run_bench.sh
+status=$?
+echo "===== END job_id=${SLURM_JOB_ID:-unknown} status=${status} end=$(date '+%F %T') ====="
+exit ${status}

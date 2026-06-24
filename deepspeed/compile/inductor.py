@@ -17,7 +17,6 @@ try:
 except ImportError:
     pass
 
-from deepspeed.utils.torch import required_torch_version
 from .util import get_input_nodes
 from .graph_param import DSGraphParamManager
 from .partitioner import get_wrapped_partitioner
@@ -175,7 +174,21 @@ def register_custom_ops():
                     self.codegen_comment(wrapper)
                     args = [*self.codegen_args(), *self.codegen_kwargs()]
 
-                    if required_torch_version(min_version=2.7):
+                    try:
+                        import inspect
+                        fallback_sig = inspect.signature(V.graph.wrapper_code.generate_fallback_kernel)
+                        positional_params = [
+                            p for p in fallback_sig.parameters.values()
+                            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                        ]
+                        accepts_varargs = any(
+                            p.kind == p.VAR_POSITIONAL for p in fallback_sig.parameters.values()
+                        )
+                    except (TypeError, ValueError):
+                        positional_params = []
+                        accepts_varargs = True
+
+                    if accepts_varargs or len(positional_params) >= 2:
                         V.graph.wrapper_code.generate_fallback_kernel(self, args)
                     else:
                         V.graph.wrapper_code.generate_fallback_kernel(self)

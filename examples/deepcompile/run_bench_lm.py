@@ -1,7 +1,5 @@
 import os
 import argparse
-import subprocess
-import threading
 import time
 from datetime import datetime
 from contextlib import nullcontext
@@ -26,58 +24,6 @@ def distributed_max_int(value: int) -> int:
     tensor = torch.tensor([int(value)], device=device, dtype=torch.int64)
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
     return int(tensor.item())
-
-
-def query_nvidia_smi_memory_bytes(device_index: int | None = None) -> int:
-    if not torch.cuda.is_available():
-        return 0
-    if device_index is None:
-        device_index = int(torch.cuda.current_device())
-    try:
-        output = subprocess.check_output(
-            [
-                "nvidia-smi",
-                f"--id={int(device_index)}",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2.0,
-        )
-        first_line = output.strip().splitlines()[0].strip()
-        used_mib = int(first_line.split()[0])
-        return used_mib * 1024 * 1024
-    except Exception:
-        return 0
-
-
-class NvidiaSmiMemorySampler:
-    def __init__(self, device_index: int | None = None, interval_s: float = 0.2) -> None:
-        self.device_index = device_index
-        self.interval_s = float(interval_s)
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self.max_bytes = 0
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self.max_bytes = max(self.max_bytes, query_nvidia_smi_memory_bytes(self.device_index))
-        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
-        self._thread.start()
-
-    def _sample_loop(self) -> None:
-        while not self._stop_event.wait(self.interval_s):
-            self.max_bytes = max(self.max_bytes, query_nvidia_smi_memory_bytes(self.device_index))
-
-    def stop(self) -> int:
-        self.max_bytes = max(self.max_bytes, query_nvidia_smi_memory_bytes(self.device_index))
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        self.max_bytes = max(self.max_bytes, query_nvidia_smi_memory_bytes(self.device_index))
-        return int(self.max_bytes)
 
 
 def get_args():
@@ -143,12 +89,12 @@ def get_args():
                         help="Safety margin for automatic SimpleFSDP-Chorus persistent retention. The auto budget targets at most this fraction of total GPU memory.")
     parser.add_argument("--simplefsdp_chorus_persistent_baseline_param_multiplier", "--simplefsdp-chorus-persistent-baseline-param-multiplier",
                         type=float, default=1.45,
-                        help="Conservative multiplier from loaded fp32 model parameter bytes to estimated non-persistent nvidia-smi peak for automatic SimpleFSDP-Chorus budgeting.")
+                        help="Conservative multiplier from loaded fp32 model parameter bytes to estimated non-persistent memory peak for automatic SimpleFSDP-Chorus budgeting.")
     parser.add_argument("--simplefsdp_chorus_persistent_cost_multiplier", "--simplefsdp-chorus-persistent-cost-multiplier",
                         type=float, default=20.00,
                         help="Runtime footprint multiplier for each extra persistent parameter byte, covering grads, optimizer state, foreach temporaries, and allocator slack.")
     parser.add_argument("--simplefsdp_chorus_persistent_static_margin_mb", "--simplefsdp-chorus-persistent-static-margin-mb",
-                        type=int, default=1024,
+                        type=int, default=0,
                         help="Additional fixed safety margin in MiB for automatic SimpleFSDP-Chorus persistent retention budgeting.")
     parser.add_argument("--simplefsdp_chorus_global_retention_max_layers", "--simplefsdp-chorus-global-retention-max-layers",
                         type=int, default=0,
@@ -156,6 +102,12 @@ def get_args():
     parser.add_argument("--simplefsdp_chorus_milp_time_limit_s", "--simplefsdp-chorus-milp-time-limit-s",
                         type=float, default=2.0,
                         help="Time limit for the SimpleFSDP-Chorus global-retention MILP planner.")
+    parser.add_argument("--simplefsdp_chorus_enable_cross_graph_retention", "--simplefsdp-chorus-enable-cross-graph-retention",
+                        action="store_true",
+                        help="Compatibility no-op: SimpleFSDP-Chorus now enables cross-graph retention by default.")
+    parser.add_argument("--simplefsdp_chorus_disable_cross_graph_retention", "--simplefsdp-chorus-disable-cross-graph-retention",
+                        action="store_true",
+                        help="Disable SimpleFSDP-Chorus cross-graph retention for debugging ablations.")
     parser.add_argument("--simplefsdp_replicate_small_param_numel", "--simplefsdp-replicate-small-param-numel",
                         type=int, default=16384,
                         help="Replicate SimpleFSDP parameters with at most this many elements to remove tiny all-gathers. 0 disables this memory-for-latency policy.")
@@ -173,7 +125,10 @@ def get_args():
                         help="Optional SimpleFSDP selective activation checkpoint interval. 0 keeps the normal full activation-checkpointing policy.")
     parser.add_argument("--simplefsdp_enable_fused_optimizer", "--simplefsdp-enable-fused-optimizer",
                         action="store_true",
-                        help="Enable fused AdamW for SimpleFSDP ablations. Default uses the same AdamW path as the other backends.")
+                        help="Force fused AdamW for SimpleFSDP when available. Fused AdamW is the default CUDA fast path unless disabled.")
+    parser.add_argument("--simplefsdp_disable_fused_optimizer", "--simplefsdp-disable-fused-optimizer",
+                        action="store_true",
+                        help="Disable the SimpleFSDP fused AdamW fast path for ablations.")
     parser.add_argument("--offload_opt_states", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--deterministic", action="store_true")
@@ -417,6 +372,23 @@ def _module_tree_param_nbytes(module: torch.nn.Module) -> int:
     return int(nbytes)
 
 
+def _module_tree_param_numel(module: torch.nn.Module) -> int:
+    seen = set()
+    numel = 0
+    for param in module.parameters(recurse=True):
+        if param is None:
+            continue
+        ident = id(param)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            numel += int(param.numel())
+        except Exception:
+            continue
+    return int(numel)
+
+
 def _mark_module_tree(module: torch.nn.Module, attr: str, value: bool) -> None:
     for submodule in module.modules():
         setattr(submodule, attr, bool(value))
@@ -428,6 +400,7 @@ def estimate_simplefsdp_chorus_auto_persistent_budget(
     baseline_param_multiplier: float,
     runtime_cost_multiplier: float,
     static_margin_mb: int,
+    world_size: int = 1,
 ) -> dict:
     total_mem = 0
     current_alloc = 0
@@ -444,23 +417,65 @@ def estimate_simplefsdp_chorus_auto_persistent_budget(
     runtime_cost_multiplier = max(1.0, float(runtime_cost_multiplier))
     static_margin_bytes = max(0, int(static_margin_mb)) * 1024 * 1024
     model_param_bytes = _module_tree_param_nbytes(model)
+    model_param_numel = _module_tree_param_numel(model)
     safe_total = int(float(total_mem) * usable_fraction)
-    estimated_from_params = int(float(model_param_bytes) * baseline_param_multiplier) + static_margin_bytes
+    world_size = max(1, int(world_size))
+    if world_size <= 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            world_size = max(1, int(torch.distributed.get_world_size()))
+        except Exception:
+            world_size = 1
+    # SimpleFSDP converts loaded fp32 parameters into sharded bf16 DTensors.
+    # A full fp32-parameter multiplier is too pessimistic for the compiled
+    # SimpleFSDP steady state and can collapse the Chorus graph budget to zero.
+    target_param_bytes = int(model_param_numel) * 2
+    local_target_param_bytes = int((target_param_bytes + world_size - 1) // world_size)
+    optimizer_grad_floor = int(local_target_param_bytes * 4)
+    activation_margin_bytes = max(
+        2 * 1024 * 1024 * 1024,
+        min(6 * 1024 * 1024 * 1024, int(target_param_bytes // 3)),
+    )
+    estimated_simplefsdp_runtime_floor = (
+        int(optimizer_grad_floor)
+        + int(target_param_bytes)
+        + int(activation_margin_bytes)
+        + int(static_margin_bytes)
+    )
     observed_floor = max(int(current_alloc), int(current_reserved))
-    estimated_baseline = max(estimated_from_params, observed_floor)
-    runtime_budget = max(0, safe_total - estimated_baseline)
+    estimated_baseline = max(int(estimated_simplefsdp_runtime_floor), int(observed_floor) + int(static_margin_bytes))
+    runtime_headroom = max(0, int(safe_total) - int(estimated_baseline))
+    if total_mem > 0:
+        # Cross-graph retained AGs are transient per-step buffers guarded by the
+        # runtime 0.9 safety check. Use a GPU-size-proportional cap and round up
+        # to a coarse bucket so 40 GB cards get a 4 GiB window while 80 GB cards
+        # can naturally use a larger one.
+        live_quantum = 512 * 1024 * 1024
+        raw_live_cap = max(1024 * 1024 * 1024, int(float(total_mem) * 0.10))
+        rounded_live_cap = ((raw_live_cap + live_quantum - 1) // live_quantum) * live_quantum
+        runtime_live_cap = min(16 * 1024 * 1024 * 1024, int(rounded_live_cap))
+    else:
+        runtime_live_cap = runtime_headroom
+    runtime_budget = max(0, min(int(runtime_headroom), int(runtime_live_cap)))
     return {
         "enabled": True,
         "total_mem_bytes": int(total_mem),
         "usable_fraction": float(usable_fraction),
         "safe_total_bytes": int(safe_total),
         "model_param_bytes": int(model_param_bytes),
+        "model_param_numel": int(model_param_numel),
+        "target_param_bytes": int(target_param_bytes),
+        "local_target_param_bytes": int(local_target_param_bytes),
         "baseline_param_multiplier": float(baseline_param_multiplier),
         "runtime_cost_multiplier": float(runtime_cost_multiplier),
         "static_margin_bytes": int(static_margin_bytes),
+        "activation_margin_bytes": int(activation_margin_bytes),
         "current_alloc_bytes": int(current_alloc),
         "current_reserved_bytes": int(current_reserved),
+        "observed_floor_bytes": int(observed_floor),
+        "estimated_simplefsdp_runtime_floor_bytes": int(estimated_simplefsdp_runtime_floor),
         "estimated_baseline_bytes": int(estimated_baseline),
+        "runtime_headroom_bytes": int(runtime_headroom),
+        "runtime_live_cap_bytes": int(runtime_live_cap),
         "runtime_budget_bytes": int(runtime_budget),
         "runtime_budget_mb": int(runtime_budget // (1024 * 1024)),
     }
@@ -691,7 +706,7 @@ def configure_native_simplefsdp(
     chorus_persistent_usable_fraction: float = 0.90,
     chorus_persistent_baseline_param_multiplier: float = 1.45,
     chorus_persistent_cost_multiplier: float = 20.00,
-    chorus_persistent_static_margin_mb: int = 1024,
+    chorus_persistent_static_margin_mb: int = 0,
 ) -> dict:
     from torch.distributed.device_mesh import init_device_mesh
     from native_simplefsdp import (
@@ -720,12 +735,20 @@ def configure_native_simplefsdp(
         "usable_fraction": float(chorus_persistent_usable_fraction),
         "safe_total_bytes": 0,
         "model_param_bytes": 0,
+        "model_param_numel": 0,
+        "target_param_bytes": 0,
+        "local_target_param_bytes": 0,
         "baseline_param_multiplier": float(chorus_persistent_baseline_param_multiplier),
         "runtime_cost_multiplier": float(chorus_persistent_cost_multiplier),
         "static_margin_bytes": int(chorus_persistent_static_margin_mb) * 1024 * 1024,
+        "activation_margin_bytes": 0,
         "current_alloc_bytes": 0,
         "current_reserved_bytes": 0,
+        "observed_floor_bytes": 0,
+        "estimated_simplefsdp_runtime_floor_bytes": 0,
         "estimated_baseline_bytes": 0,
+        "runtime_headroom_bytes": 0,
+        "runtime_live_cap_bytes": 0,
         "runtime_budget_bytes": 0,
         "runtime_budget_mb": 0,
     }
@@ -738,8 +761,12 @@ def configure_native_simplefsdp(
             baseline_param_multiplier=float(chorus_persistent_baseline_param_multiplier),
             runtime_cost_multiplier=float(chorus_persistent_cost_multiplier),
             static_margin_mb=int(chorus_persistent_static_margin_mb),
+            world_size=accelerator.num_processes,
         )
-        effective_retention_mb = int(auto_budget_meta.get("runtime_budget_mb", 0))
+        # Automatic budgeting is used for graph-local Chorus prefetch/retention.
+        # Persistent full-parameter retention changes SimpleFSDP parameter
+        # placement, so keep it opt-in via an explicit positive value.
+        effective_retention_mb = 0
     chorus_plan = plan_simplefsdp_chorus_global_retention(
         layer_entries,
         world_size=accelerator.num_processes,
@@ -765,6 +792,7 @@ def configure_native_simplefsdp(
         replicate_module_attr="_simplefsdp_chorus_global_retain",
         replicate_param_names_attr="_simplefsdp_chorus_global_retain_params",
         persistent_param_names_attr="_simplefsdp_chorus_persistent_params",
+        enable_param_tags=bool(enable_chorus),
     )
     param_stats = summarize_simplefsdp_parameters(model)
     return {
@@ -808,7 +836,15 @@ def configure_native_simplefsdp(
         "chorus_auto_budget_usable_fraction": float(auto_budget_meta.get("usable_fraction", 0.0)),
         "chorus_auto_budget_safe_total_bytes": int(auto_budget_meta.get("safe_total_bytes", 0)),
         "chorus_auto_budget_model_param_bytes": int(auto_budget_meta.get("model_param_bytes", 0)),
+        "chorus_auto_budget_model_param_numel": int(auto_budget_meta.get("model_param_numel", 0)),
+        "chorus_auto_budget_target_param_bytes": int(auto_budget_meta.get("target_param_bytes", 0)),
+        "chorus_auto_budget_local_target_param_bytes": int(auto_budget_meta.get("local_target_param_bytes", 0)),
+        "chorus_auto_budget_activation_margin_bytes": int(auto_budget_meta.get("activation_margin_bytes", 0)),
+        "chorus_auto_budget_observed_floor_bytes": int(auto_budget_meta.get("observed_floor_bytes", 0)),
+        "chorus_auto_budget_runtime_floor_bytes": int(auto_budget_meta.get("estimated_simplefsdp_runtime_floor_bytes", 0)),
         "chorus_auto_budget_estimated_baseline_bytes": int(auto_budget_meta.get("estimated_baseline_bytes", 0)),
+        "chorus_auto_budget_runtime_headroom_bytes": int(auto_budget_meta.get("runtime_headroom_bytes", 0)),
+        "chorus_auto_budget_runtime_live_cap_bytes": int(auto_budget_meta.get("runtime_live_cap_bytes", 0)),
         "chorus_auto_budget_runtime_budget_bytes": int(auto_budget_meta.get("runtime_budget_bytes", 0)),
         "chorus_auto_budget_runtime_cost_multiplier": float(auto_budget_meta.get("runtime_cost_multiplier", chorus_persistent_cost_multiplier)),
         "chorus_milp_binary_vars": int(chorus_plan.get("binary_vars", 0)),
@@ -993,7 +1029,7 @@ def main():
         disable_progress_bar()
         
     # dataset = load_dataset('ag_news', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
-    dataset = load_dataset('/home/dev/DeepSpeed/examples/deepcompile/datasets', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
+    dataset = load_dataset('/home/bingxing2/home/scx7euw/DeepSpeed/examples/deepcompile/datasets', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
 
     # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # tokenizer.pad_token = tokenizer.convert_ids_to_tokens(2)
@@ -1059,7 +1095,15 @@ def main():
         "chorus_auto_budget_usable_fraction": 0.0,
         "chorus_auto_budget_safe_total_bytes": 0,
         "chorus_auto_budget_model_param_bytes": 0,
+        "chorus_auto_budget_model_param_numel": 0,
+        "chorus_auto_budget_target_param_bytes": 0,
+        "chorus_auto_budget_local_target_param_bytes": 0,
+        "chorus_auto_budget_activation_margin_bytes": 0,
+        "chorus_auto_budget_observed_floor_bytes": 0,
+        "chorus_auto_budget_runtime_floor_bytes": 0,
         "chorus_auto_budget_estimated_baseline_bytes": 0,
+        "chorus_auto_budget_runtime_headroom_bytes": 0,
+        "chorus_auto_budget_runtime_live_cap_bytes": 0,
         "chorus_auto_budget_runtime_budget_bytes": 0,
         "chorus_auto_budget_runtime_cost_multiplier": 0.0,
         "chorus_milp_binary_vars": 0,
@@ -1101,10 +1145,14 @@ def main():
         simplefsdp_stats.setdefault("chorus_runtime_max_live_bytes", 0)
         simplefsdp_stats.setdefault("chorus_runtime_safe_total_bytes", 0)
         simplefsdp_stats.setdefault("chorus_runtime_static_margin_bytes", 0)
+        simplefsdp_use_fused_optimizer = (
+            bool(args.simplefsdp_enable_fused_optimizer)
+            or (torch.cuda.is_available() and not bool(args.simplefsdp_disable_fused_optimizer))
+        )
         optimizer, optimizer_name = make_adamw_optimizer(
             model.parameters(),
             lr=args.learning_rate,
-            fused=args.simplefsdp_enable_fused_optimizer,
+            fused=simplefsdp_use_fused_optimizer,
         )
         simplefsdp_stats["optimizer"] = optimizer_name
         simplefsdp_stats["inductor_comm_overlap"] = bool(simplefsdp_inductor_comm_overlap)
@@ -1118,22 +1166,22 @@ def main():
         effective_chorus_live_mb = int(args.simplefsdp_chorus_live_mb)
         if simplefsdp_inductor_comm_overlap and args.simplefsdp_enable_chorus:
             if effective_chorus_live_mb < 0:
-                auto_live_mb = int(simplefsdp_stats.get("chorus_global_retention_budget_mb", 0))
-                # Use the measured/estimated runtime budget as the Chorus live
-                # retention envelope. A fixed 4 GiB cap left most recompute
-                # all-gathers in the graph on 80 GB NVLink GPUs; use half of the
-                # safe budget, capped at 16 GiB, while keeping a 1 GiB floor
-                # only when the auto budget is positive. Users can still
-                # override this for ablations.
+                auto_live_mb = int(simplefsdp_stats.get("chorus_auto_budget_runtime_budget_bytes", 0)) // (1024 * 1024)
+                if auto_live_mb <= 0:
+                    auto_live_mb = int(simplefsdp_stats.get("chorus_global_retention_budget_mb", 0))
+                # Graph-local scheduling and persistent full-param retention have
+                # different runtime costs. Use the SimpleFSDP-aware headroom for
+                # graph-local live AGs instead of tying it to the persistent MILP
+                # budget, which may intentionally be zero.
                 if auto_live_mb > 0:
                     if int(args.seq_length) >= 2048:
                         # Long-sequence runs already have high activation and optimizer
                         # pressure. Use a small, high-confidence cross-graph budget so
                         # selected retain_get nodes hit without carrying too many
                         # long-lived full parameters through high-activation regions.
-                        effective_chorus_live_mb = max(512, min(auto_live_mb // 8, 2048))
+                        effective_chorus_live_mb = max(512, min(auto_live_mb // 2, 2048))
                     else:
-                        effective_chorus_live_mb = max(1024, min(auto_live_mb // 2, 16384))
+                        effective_chorus_live_mb = max(1024, min(auto_live_mb, 16384))
                 else:
                     # No measured/estimated safe budget means no graph-retained
                     # full-parameter buffers. Retain_get falls back to all-gather.
@@ -1168,6 +1216,7 @@ def main():
                     prefetch_groups=prefetch_groups,
                     max_live_bytes=live_bytes,
                     milp_time_limit_s=float(args.simplefsdp_chorus_milp_time_limit_s),
+                    enable_cross_graph_retention=not bool(args.simplefsdp_chorus_disable_cross_graph_retention),
                 )
             )
         simplefsdp_stats["coalesce_bucket_mb"] = (
@@ -1234,6 +1283,11 @@ def main():
                 f"chorus_auto_budget_usable_fraction={simplefsdp_stats['chorus_auto_budget_usable_fraction']:.4f} "
                 f"chorus_auto_budget_safe_total_bytes={simplefsdp_stats['chorus_auto_budget_safe_total_bytes']} "
                 f"chorus_auto_budget_model_param_bytes={simplefsdp_stats['chorus_auto_budget_model_param_bytes']} "
+                f"chorus_auto_budget_target_param_bytes={simplefsdp_stats['chorus_auto_budget_target_param_bytes']} "
+                f"chorus_auto_budget_local_target_param_bytes={simplefsdp_stats['chorus_auto_budget_local_target_param_bytes']} "
+                f"chorus_auto_budget_runtime_floor_bytes={simplefsdp_stats['chorus_auto_budget_runtime_floor_bytes']} "
+                f"chorus_auto_budget_runtime_headroom_bytes={simplefsdp_stats['chorus_auto_budget_runtime_headroom_bytes']} "
+                f"chorus_auto_budget_runtime_live_cap_bytes={simplefsdp_stats['chorus_auto_budget_runtime_live_cap_bytes']} "
                 f"chorus_auto_budget_estimated_baseline_bytes={simplefsdp_stats['chorus_auto_budget_estimated_baseline_bytes']} "
                 f"chorus_auto_budget_runtime_budget_bytes={simplefsdp_stats['chorus_auto_budget_runtime_budget_bytes']} "
                 f"chorus_auto_budget_runtime_cost_multiplier={simplefsdp_stats['chorus_auto_budget_runtime_cost_multiplier']:.4f} "
@@ -1356,7 +1410,6 @@ def main():
     iter_times_by_step = {}
     memory_report_start_step = 7
     memory_peak_reset_done = False
-    nvidia_smi_sampler = NvidiaSmiMemorySampler(device_index=accelerator.local_process_index)
 
     # See https://github.com/microsoft/DeepSpeed/issues/6793
     acc_context = nullcontext if (is_deepspeed or is_simplefsdp) else accelerator.accumulate
@@ -1414,7 +1467,6 @@ def main():
                         step_compute_time = 0.0
                         if (not memory_peak_reset_done) and global_step >= memory_report_start_step - 1:
                             torch.cuda.reset_peak_memory_stats()
-                            nvidia_smi_sampler.start()
                             memory_peak_reset_done = True
                     else:
                         step_compute_time += time.time() - micro_start
@@ -1435,11 +1487,9 @@ def main():
     if not report_times:
         report_times = iter_times
 
-    local_nvidia_smi_peak_bytes = nvidia_smi_sampler.stop()
-    nvidia_smi_peak_global_bytes = distributed_max_int(local_nvidia_smi_peak_bytes)
-
     alloc_bytes = int(torch.cuda.memory_allocated())
     peak_bytes = int(torch.cuda.max_memory_allocated())
+    alloc_global_bytes = distributed_max_int(alloc_bytes)
     peak_global_bytes = distributed_max_int(peak_bytes)
 
     steady_iteration_time = float(sum(report_times) / len(report_times)) if report_times else 0.0
@@ -1464,12 +1514,10 @@ def main():
 
         is_deepcompile = is_deepspeed and model._config.compile_config.deepcompile
         alloc_gb = float(alloc_bytes) / (1024**3)
+        alloc_global_gb = float(alloc_global_bytes) / (1024**3)
         peak_gb = float(peak_bytes) / (1024**3)
         peak_global_gb = float(peak_global_bytes) / (1024**3)
 
-        predicted_peak = ""
-        predicted_total_peak_bytes = 0
-        predicted_total_peak_gb = 0.0
         milp_stats = ""
         try:
             from deepspeed.compile.passes import global_layer_scheduler
@@ -1497,34 +1545,8 @@ def main():
                         f" milp_status: {milp_status}"
                         f" milp_status_msg: {milp_status_msg}"
                     )
-                predicted_total_peak_bytes = int(
-                    meta.get("predicted_total_peak_mem_bytes", meta.get("predicted_peak_mem_bytes", 0)))
-                predicted_total_peak_gb = float(
-                    meta.get("predicted_total_peak_mem_gb", meta.get("predicted_peak_mem_gb", 0.0)))
-                predicted_graph_peak_bytes = int(meta.get("predicted_graph_peak_mem_bytes", 0))
-                predicted_graph_peak_gb = float(meta.get("predicted_graph_peak_mem_gb", 0.0))
-                predicted_baseline_offset_bytes = int(meta.get("predicted_peak_baseline_offset_bytes", 0))
-                predicted_baseline_offset_gb = float(meta.get("predicted_peak_baseline_offset_gb", 0.0))
-                if predicted_total_peak_gb > 0.0 or predicted_total_peak_bytes > 0:
-                    prediction_error_bytes = int(peak_global_bytes) - int(predicted_total_peak_bytes)
-                    prediction_error_gb = float(prediction_error_bytes) / (1024**3)
-                    prediction_error_pct = (
-                        abs(float(prediction_error_bytes)) / float(peak_global_bytes) * 100.0
-                        if int(peak_global_bytes) > 0 else 0.0
-                    )
-                    predicted_peak = (
-                        f" predicted_total_peak_mem: {predicted_total_peak_gb:.2f} GB"
-                        f" predicted_total_peak_mem_bytes: {predicted_total_peak_bytes}"
-                        f" predicted_graph_peak_mem: {predicted_graph_peak_gb:.2f} GB"
-                        f" predicted_graph_peak_mem_bytes: {predicted_graph_peak_bytes}"
-                        f" predicted_peak_baseline_offset: {predicted_baseline_offset_gb:.2f} GB"
-                        f" predicted_peak_baseline_offset_bytes: {predicted_baseline_offset_bytes}"
-                        f" prediction_error: {prediction_error_gb:.2f} GB"
-                        f" prediction_error_bytes: {prediction_error_bytes}"
-                        f" prediction_abs_error_pct: {prediction_error_pct:.2f}"
-                    )
         except Exception:
-            predicted_peak = ""
+            milp_stats = ""
 
         simplefsdp_chorus_diag = {
             "cache_trace_hits": 0,
@@ -1685,6 +1707,11 @@ def main():
             f" simplefsdp_chorus_auto_budget_usable_fraction: {simplefsdp_stats['chorus_auto_budget_usable_fraction']:.4f}"
             f" simplefsdp_chorus_auto_budget_safe_total_bytes: {simplefsdp_stats['chorus_auto_budget_safe_total_bytes']}"
             f" simplefsdp_chorus_auto_budget_model_param_bytes: {simplefsdp_stats['chorus_auto_budget_model_param_bytes']}"
+            f" simplefsdp_chorus_auto_budget_target_param_bytes: {simplefsdp_stats['chorus_auto_budget_target_param_bytes']}"
+            f" simplefsdp_chorus_auto_budget_local_target_param_bytes: {simplefsdp_stats['chorus_auto_budget_local_target_param_bytes']}"
+            f" simplefsdp_chorus_auto_budget_runtime_floor_bytes: {simplefsdp_stats['chorus_auto_budget_runtime_floor_bytes']}"
+            f" simplefsdp_chorus_auto_budget_runtime_headroom_bytes: {simplefsdp_stats['chorus_auto_budget_runtime_headroom_bytes']}"
+            f" simplefsdp_chorus_auto_budget_runtime_live_cap_bytes: {simplefsdp_stats['chorus_auto_budget_runtime_live_cap_bytes']}"
             f" simplefsdp_chorus_auto_budget_estimated_baseline_bytes: {simplefsdp_stats['chorus_auto_budget_estimated_baseline_bytes']}"
             f" simplefsdp_chorus_auto_budget_runtime_budget_bytes: {simplefsdp_stats['chorus_auto_budget_runtime_budget_bytes']}"
             f" simplefsdp_chorus_auto_budget_runtime_cost_multiplier: {simplefsdp_stats['chorus_auto_budget_runtime_cost_multiplier']:.4f}"
@@ -1757,7 +1784,6 @@ def main():
         activation_checkpointing_report = bool(
             activation_checkpointing_enabled or simplefsdp_stats.get("selective_checkpoint_layers", 0) > 0
         )
-        nvidia_smi_peak_gb = float(nvidia_smi_peak_global_bytes) / (1024**3)
         msg = (
             f"{args.model_name} ds={is_deepspeed} np={accelerator.num_processes}"
             f" batch_size={args.batch_size} seq={args.seq_length} zero_stage={args.zero_stage}"
@@ -1771,26 +1797,30 @@ def main():
             f" alloc_mem_gb: {alloc_gb:.2f}"
             f" peak_mem_gb: {peak_gb:.2f}"
             f" peak_mem_global_gb: {peak_global_gb:.2f}"
-            f" nvidia_smi_peak_gb: {nvidia_smi_peak_gb:.2f}"
             f"{fsdp2_stats}{simplefsdp_msg}{milp_stats}"
         )
-        pred_meas_msg = f"Pred. {predicted_total_peak_gb:.2f} GB Meas. {nvidia_smi_peak_gb:.2f} GB"
+        final_metrics_msg = (
+            f"Final metrics: iteration_time={steady_iteration_time:.4f}s"
+            f" compile_time={compile_time_sum:.4f}s"
+            f" alloc_mem={alloc_global_gb:.2f}GB"
+            f" peak_mem={peak_global_gb:.2f}GB"
+        )
         print(msg)
-        print(pred_meas_msg)
+        print(final_metrics_msg)
 
 
-    if args.profile_dir:
-            from pathlib import Path
-            filepath = Path(args.profile_dir) / f"result.txt"
+    if accelerator.is_main_process and args.profile_dir:
+        from pathlib import Path
+        filepath = Path(args.profile_dir) / f"result.txt"
+        with open(filepath, "a") as f:
+            f.write(f"{timestamp} {msg}" + "\n")
+            f.write(f"{timestamp} {final_metrics_msg}" + "\n")
+
+        if args.compile:
+            filepath = Path(args.profile_dir) / f"compile_time.txt"
             with open(filepath, "a") as f:
-                f.write(f"{timestamp} {msg}" + "\n")
-                f.write(f"{timestamp} {pred_meas_msg}" + "\n")
-
-            if args.compile:
-                filepath = Path(args.profile_dir) / f"compile_time.txt"
-                with open(filepath, "a") as f:
-                    compile_msg =  f"{msg} compile_time_detail={compile_time}"
-                    f.write(f"{timestamp} {compile_msg}" + "\n")
+                compile_msg =  f"{msg} compile_time_detail={compile_time}"
+                f.write(f"{timestamp} {compile_msg}" + "\n")
 
     # # Save the model
     # if accelerator.is_main_process:

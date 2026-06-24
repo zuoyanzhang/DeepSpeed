@@ -28,7 +28,7 @@
         "global_layer_scheduler_milp_time_limit_s": 8.0,
         "global_layer_scheduler_milp_rel_gap": 0.001,
         "global_layer_scheduler_dump_schedule": false,
-        "global_layer_scheduler_topology_policy": "nvlink",
+        "global_layer_scheduler_topology_policy": "generic",
         "global_layer_scheduler_low_comm_keep_opportunity_factor": 0.5,
         "global_layer_scheduler_low_comm_keep_cap_fraction": 0.10,
         "global_layer_scheduler_low_comm_persistent_budget_mode": "selective",
