@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+# Modified by Chorus contributors for per-run configuration generation.
 
 import argparse
 from jinja2 import Template
@@ -19,6 +20,10 @@ def get_args():
                         help='FSDP2 reshard_after_forward value for templates')
     parser.add_argument('--fp16', action='store_true', help='Use fp16')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--ds_offload', action='store_true',
+                        help='Enable DeepSpeed ZeRO CPU parameter and optimizer offload')
+    parser.add_argument('--deepspeed_config_file', type=str, default='configs/ds_config.json',
+                        help='Absolute or relative DeepSpeed JSON path embedded in the Accelerate config')
     parser.add_argument('--deepcompile', action='store_true', help='Use deepcompile')
     parser.add_argument('--debug_log', action='store_true', help='Debug log')
     parser.add_argument('--sync_before_reduce', action='store_true', help='Sync before reduce')
@@ -45,6 +50,8 @@ def main(args):
                                 fsdp2_reshard_after_forward=args.fsdp2_reshard_after_forward,
                                 fp16=args.fp16,
                                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                                ds_offload=args.ds_offload,
+                                deepspeed_config_file=args.deepspeed_config_file,
                                 deepcompile=str(args.deepcompile).lower(),
                                 debug_log=str(args.debug_log).lower(),
                                 sync_before_reduce=str(args.sync_before_reduce).lower(),

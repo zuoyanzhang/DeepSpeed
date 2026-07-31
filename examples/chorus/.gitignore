@@ -1,0 +1,8 @@
+logs/
+profiles/
+results/
+*.log
+*.out.log
+*.pyc
+*.png
+__pycache__/

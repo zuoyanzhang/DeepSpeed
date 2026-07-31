@@ -1,7 +1,7 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: "[REQUEST]"
+name: Chorus feature request
+about: Suggest an improvement to Chorus
+title: "[FEATURE] "
 labels: enhancement
 assignees: ''
 

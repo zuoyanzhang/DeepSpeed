@@ -1,9 +1,7 @@
-# Microsoft Open Source Code of Conduct
+# Code of Conduct
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
+The Chorus community is committed to a respectful, harassment-free environment for everyone. Be constructive, assume good intent, welcome questions, and focus technical criticism on the work rather than the person.
 
-Resources:
+Harassment, discriminatory language, personal attacks, threats, deliberate intimidation, and publishing another person's private information are not acceptable in project spaces.
 
-- [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/)
-- [Microsoft Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/)
-- Contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with questions or concerns
+Repository maintainers may edit or remove contributions that violate these expectations and may temporarily or permanently restrict participation. Report conduct concerns to the repository owner through their GitHub profile; do not put personal or sensitive information in a public issue.

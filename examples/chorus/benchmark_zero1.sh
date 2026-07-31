@@ -1,3 +1,8 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
 PROFILE_DIR=${PROFILE_DIR:-profiles}
 mkdir -p ${PROFILE_DIR}
 PROFILE_OPTS="--profile --profile-dir ${PROFILE_DIR}"
@@ -14,9 +19,9 @@ SEQ_LENGTH_OPTS=(512 1024 2048)
 for BATCH_SIZE in ${BATCH_SIZE_OPTS[@]}; do
     for SEQ_LENGTH in ${SEQ_LENGTH_OPTS[@]}; do
         ARGS="--model ${MODEL} --batch-size ${BATCH_SIZE} --seq-length ${SEQ_LENGTH} --zero-stage 1 ${ACC_OPTS} ${AC_OPTS}"
-        bash ./run_multinode.sh --backend deepspeed ${ARGS}
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${COMPILE_OPTS}
-        bash ./run_multinode.sh --backend deepspeed ${ARGS} ${DC_OPTS}
+        bash ./launch.sh --backend deepspeed ${ARGS}
+        bash ./launch.sh --backend deepspeed ${ARGS} ${COMPILE_OPTS}
+        bash ./launch.sh --backend deepspeed ${ARGS} ${DC_OPTS}
 
         cp -r logs ${PROFILE_DIR}/
     done

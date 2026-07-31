@@ -1,15 +1,30 @@
 {
-    
+    {% if fp16 %}
+    "fp16": {
+        "enabled": true,
+        "initial_scale_power": 8
+    },
+    {% else %}
     "bf16": {
         "enabled": true
     },
-    
+    {% endif %}
     "zero_optimization": {
-        "stage": 3,
+        "stage": {{ zero_stage }},
+        {% if ds_offload %}
+        "offload_optimizer": {
+            "device": "cpu",
+            "pin_memory": true
+        },
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": true
+        },
+        {% endif %}
         "sub_group_size": 100000000
     },
     "compile": {
-        "deepcompile": true,
+        "deepcompile": {{ deepcompile }},
         "global_layer_scheduler": false,
         "selective_activation_recompute": false,
         "selective_activation_recompute_dump_plan": false,
@@ -23,7 +38,7 @@
         "global_layer_scheduler_milp_time_limit_s": 8.0,
         "global_layer_scheduler_milp_rel_gap": 0.001,
         "global_layer_scheduler_dump_schedule": false,
-        "global_layer_scheduler_topology_policy": "nvlink",
+        "global_layer_scheduler_topology_policy": "generic",
         "global_layer_scheduler_low_comm_keep_opportunity_factor": 0.5,
         "global_layer_scheduler_low_comm_keep_cap_fraction": 0.10,
         "global_layer_scheduler_low_comm_persistent_budget_mode": "selective",
@@ -49,11 +64,13 @@
         "double_buffer": true,
         "symmetric_memory": false,
         "free_activation": false,
-        "debug_log": false,
-        "sync_before_reduce": false,
-        "sync_after_reduce": false
+        "debug_log": {{ debug_log }},
+        "sync_before_reduce": {{ sync_before_reduce }},
+        "sync_after_reduce": {{ sync_after_reduce }},
+        "sync_before_allgather": {{ sync_before_allgather }},
+        "sync_after_allgather": {{ sync_after_allgather }}
     },
-    "gradient_accumulation_steps": 1,
+    "gradient_accumulation_steps": {{ gradient_accumulation_steps }},
     "gradient_clipping": "auto",
     "steps_per_print": 2000,
     "train_batch_size": "auto",

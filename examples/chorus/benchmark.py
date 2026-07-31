@@ -1,8 +1,11 @@
+# Modified by Chorus contributors for Chorus backends and portable data/model loading.
+
 import os
 import argparse
 import time
 from datetime import datetime
 from contextlib import nullcontext
+from pathlib import Path
 from typing import List
 
 import torch
@@ -37,7 +40,11 @@ def get_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--activation_checkpointing", action="store_true")
     parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--dataset_name", type=str, default="timdettmers/openassistant-guanaco")
+    parser.add_argument("--dataset_name", "--dataset-name", type=str,
+                        default="timdettmers/openassistant-guanaco",
+                        help="Hugging Face dataset used when --dataset-path is not supplied and the bundled dataset is unavailable.")
+    parser.add_argument("--dataset_path", "--dataset-path", type=str, default=None,
+                        help="Local JSON/JSONL dataset file or directory. Defaults to the dataset bundled beside this script.")
     parser.add_argument("--num_layers", type=int, default=0)
     parser.add_argument("--attn_impl", type=str, default="sdpa")
     parser.add_argument("--compile", action="store_true")
@@ -138,7 +145,10 @@ def get_args():
     parser.add_argument("--print_interval", type=int, default=1)
     parser.add_argument("--save_weights", action="store_true")
     parser.add_argument("--load_weights", action="store_true")
-    parser.add_argument("--model_path", type=str, default="/home/dev/")
+    parser.add_argument("--model_path", type=str, default=None,
+                        help="Compatibility option: local root directory containing --model_name.")
+    parser.add_argument("--model_dir", "--model-dir", type=str, default=None,
+                        help="Exact local model directory. When omitted, --model_name is also used as a Hugging Face identifier.")
     parser.add_argument("--disable_fsdp2_prefetch", "--disable-fsdp2-prefetch", action="store_true",
                         help="Disable explicit FSDP2 module prefetching.")
     parser.add_argument("--fsdp2_forward_prefetch_distance", "--fsdp2-forward-prefetch-distance",
@@ -975,17 +985,23 @@ def main():
 
     model_name = args.model_name
 
-    # model_weight_path = f"{model_name.split('/')[1]}_cp_layer{args.num_layers}"
-    model_weight_path = os.path.join(args.model_path, args.model_name)
+    if args.model_dir:
+        model_weight_path = os.path.abspath(os.path.expanduser(args.model_dir))
+        model_source = model_weight_path
+    elif args.model_path:
+        model_weight_path = os.path.join(os.path.expanduser(args.model_path), args.model_name)
+        model_source = model_weight_path if os.path.exists(model_weight_path) else model_name
+    else:
+        model_weight_path = model_name
+        model_source = model_name
     
     if accelerator.is_main_process:
-        print(f"model_weight_path: {model_weight_path}")
+        print(f"model_source: {model_source}")
     if args.load_weights:
-        model = AutoModelForCausalLM.from_pretrained(model_weight_path, 
+        model = AutoModelForCausalLM.from_pretrained(model_source,
                                                      trust_remote_code=True)
     else:
-        config_source = model_weight_path if os.path.exists(model_weight_path) else model_name
-        model_config = AutoConfig.from_pretrained(config_source,
+        model_config = AutoConfig.from_pretrained(model_source,
                                                   attn_implementation=args.attn_impl,
                                                   trust_remote_code=True)
         if args.num_layers > 0:
@@ -1003,8 +1019,7 @@ def main():
     if accelerator.is_main_process:
         print(f"model is {model}")
 
-    # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_weight_path, 
+    tokenizer = AutoTokenizer.from_pretrained(model_source,
                                               trust_remote_code=True)
 
     if args.save_weights and accelerator.is_main_process:
@@ -1028,8 +1043,29 @@ def main():
     else:
         disable_progress_bar()
         
-    # dataset = load_dataset('ag_news', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
-    dataset = load_dataset('/home/bingxing2/home/scx7euw/DeepSpeed/examples/deepcompile/datasets', split='train[:100%]', download_config=DownloadConfig(disable_tqdm=True))
+    bundled_dataset = Path(__file__).resolve().parent / "datasets" / "openassistant_best_replies_de_train.jsonl"
+    dataset_path = Path(args.dataset_path).expanduser().resolve() if args.dataset_path else bundled_dataset
+    if dataset_path.exists():
+        if dataset_path.is_dir():
+            data_files = sorted(str(path) for pattern in ("*.json", "*.jsonl") for path in dataset_path.glob(pattern))
+            if not data_files:
+                raise FileNotFoundError(f"No JSON or JSONL files found in dataset directory: {dataset_path}")
+        else:
+            data_files = [str(dataset_path)]
+        dataset = load_dataset(
+            "json",
+            data_files={"train": data_files},
+            split="train[:100%]",
+            download_config=DownloadConfig(disable_tqdm=True),
+        )
+    elif args.dataset_path:
+        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
+    else:
+        dataset = load_dataset(
+            args.dataset_name,
+            split="train[:100%]",
+            download_config=DownloadConfig(disable_tqdm=True),
+        )
 
     # tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # tokenizer.pad_token = tokenizer.convert_ids_to_tokens(2)

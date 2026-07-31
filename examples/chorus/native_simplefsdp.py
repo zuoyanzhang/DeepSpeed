@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# Adapted from TorchTitan graph_trainer/simple_fsdp.py for the DeepCompile
-# benchmark harness. This is the compiler-friendly SimpleFSDP core: parameters
+# Adapted from TorchTitan graph_trainer/simple_fsdp.py for the Chorus benchmark
+# harness. This is the compiler-friendly SimpleFSDP core: parameters
 # are stored as DTensor shards, and parameter access performs a traceable
 # redistribute to replicated local tensors.
 

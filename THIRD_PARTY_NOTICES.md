@@ -1,0 +1,9 @@
+# Third-party notices
+
+Chorus is a modified research fork of [DeepSpeed](https://github.com/deepspeedai/DeepSpeed). DeepSpeed is copyright Microsoft Corporation and contributors and is distributed under the Apache License 2.0. The original copyright and SPDX notices are retained in the source files. The DeepSpeed package version in this tree is `0.18.4`; the most recent upstream synchronization point recorded in this history is commit `b4e74a918bef25ffd13c9756d80aaef5ee17f94a`.
+
+`examples/chorus/native_simplefsdp.py` contains code adapted from [TorchTitan's SimpleFSDP implementation](https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/graph_trainer/simple_fsdp.py), copyright Meta Platforms, Inc. and affiliates. TorchTitan is distributed under the BSD 3-Clause License. The copyright notice in the adapted file is retained, and the applicable license text is reproduced in [`LICENSES/TorchTitan-BSD-3-Clause.txt`](LICENSES/TorchTitan-BSD-3-Clause.txt). The historical `memory` branch did not record the exact upstream TorchTitan revision; the adaptation first appears in this repository at Chorus commit `2cfc177caaaaa28dd16cfbb03b3319d2c1d92b27`.
+
+`examples/chorus/datasets/openassistant_best_replies_de_train.jsonl` is the 335-row German subset published as [RainerGa/openassistant-guanaco-de](https://huggingface.co/datasets/RainerGa/openassistant-guanaco-de). That dataset identifies itself as a language-filtered copy of the OpenAssistant/Guanaco data and is distributed under the Apache License 2.0. Its upstream dataset card contains provenance and preparation details. The repository's Apache-2.0 [`LICENSE`](LICENSE) applies to its redistribution here.
+
+Chorus-specific modifications include global scheduling, memory-aware retention and prefetching, DeepSpeed integration, SimpleFSDP integration, launch tooling, and the benchmark harness. See the Git history for file-level changes.

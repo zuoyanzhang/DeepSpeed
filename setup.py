@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+# Modified by Chorus contributors to identify this research fork and its dependencies.
 """
 DeepSpeed library
 
@@ -92,6 +93,8 @@ extras_require = {
     'sd': fetch_requirements('requirements/requirements-sd.txt'),
     'triton': fetch_requirements('requirements/requirements-triton.txt'),
     'deepcompile': fetch_requirements('requirements/requirements-deepcompile.txt'),
+    # Chorus modification: install the benchmark and global-scheduler dependencies.
+    'chorus': fetch_requirements('requirements/requirements-chorus.txt'),
 }
 
 # Only install pynvml on nvidia gpus.
@@ -310,15 +313,15 @@ start_time = time.time()
 
 setup(name='deepspeed',
       version=version_str,
-      description='DeepSpeed library',
+      description='Chorus research fork of DeepSpeed',
       long_description=readme_text,
       long_description_content_type='text/markdown',
-      author='DeepSpeed Team',
-      author_email='info@deepspeedai.com',
-      url='http://deepspeed.ai',
+      author='Chorus authors and DeepSpeed contributors',
+      url='https://github.com/zuoyanzhang/Chorus',
       project_urls={
-          'Documentation': 'https://deepspeed.readthedocs.io',
-          'Source': 'https://github.com/deepspeedai/DeepSpeed',
+          'Chorus documentation': 'https://github.com/zuoyanzhang/Chorus/tree/main/examples/chorus',
+          'Source': 'https://github.com/zuoyanzhang/Chorus',
+          'Upstream DeepSpeed': 'https://github.com/deepspeedai/DeepSpeed',
       },
       install_requires=install_requires,
       extras_require=extras_require,
