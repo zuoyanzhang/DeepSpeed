@@ -1450,6 +1450,9 @@ def main():
     # See https://github.com/microsoft/DeepSpeed/issues/6793
     acc_context = nullcontext if (is_deepspeed or is_simplefsdp) else accelerator.accumulate
 
+    normal_stop = 11 * args.gradient_accumulation_steps
+    profiler_stop = 10 * args.gradient_accumulation_steps + 3
+    stop_after_microsteps = max(normal_stop, profiler_stop if args.profile else normal_stop)
     stop = False
     with prof_context as prof:
         step_compute_time = 0.0
@@ -1510,8 +1513,10 @@ def main():
                 if do_profile:
                     prof.step()
 
-                # Only run through step 11 for faster experiments.
-                stop = global_step >= 11 * args.gradient_accumulation_steps
+                # Keep the normal benchmark at 11 optimizer-update windows.
+                # Profiling needs enough microsteps to finish its 10*GAS
+                # warmup plus three active steps and flush the trace.
+                stop = global_step >= stop_after_microsteps
                 if stop:
                     break
             if stop:
@@ -1857,6 +1862,10 @@ def main():
             with open(filepath, "a") as f:
                 compile_msg =  f"{msg} compile_time_detail={compile_time}"
                 f.write(f"{timestamp} {compile_msg}" + "\n")
+
+    # Keep sequential sweep cases aligned across nodes and let rank 0 finish
+    # writing metrics before every worker tears down its process group.
+    accelerator.wait_for_everyone()
 
     # # Save the model
     # if accelerator.is_main_process:

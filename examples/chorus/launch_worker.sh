@@ -5,8 +5,23 @@ set -Eeuo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
+die() {
+    echo "Error: $*" >&2
+    exit 2
+}
+
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_integer() {
+    [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]
+}
+
 NUM_NODES=${NUM_NODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-1}
+is_positive_integer "$NUM_NODES" || die "NUM_NODES must be a positive integer"
+is_positive_integer "$NGPUS_PER_NODE" || die "NGPUS_PER_NODE must be a positive integer"
 NUM_PROCESSES=$((NUM_NODES * NGPUS_PER_NODE))
 if [[ -n "${PYTHON:-}" ]]; then
     PYTHON_BIN=$PYTHON
@@ -34,7 +49,8 @@ SYNC_BEFORE_ALLGATHER=0
 SYNC_AFTER_ALLGATHER=0
 DS_OFFLOAD=0
 FSDP2_RESHARD_AFTER_FORWARD=${FSDP2_RESHARD_AFTER_FORWARD:-true}
-EXPLICIT_MACHINE_RANK=${MACHINE_RANK:-}
+ENV_MACHINE_RANK=${MACHINE_RANK:-}
+EXPLICIT_MACHINE_RANK=""
 BENCHMARK_ARGS=()
 
 while (($#)); do
@@ -162,6 +178,15 @@ done
 
 HOST_IP=${HOST_IP:-${MASTER_ADDR:-127.0.0.1}}
 HOST_PORT=${HOST_PORT:-${MASTER_PORT:-29500}}
+is_positive_integer "$HOST_PORT" || die "rendezvous port must be an integer from 1 to 65535"
+((HOST_PORT <= 65535)) || die "rendezvous port must be an integer from 1 to 65535"
+if ((NUM_NODES > 1)); then
+    case "$HOST_IP" in
+        127.*|localhost|localhost.*|::1|0.0.0.0)
+            die "multi-node runs require the reachable hostname or IP of machine rank 0"
+            ;;
+    esac
+fi
 
 if [[ -n "$EXPLICIT_MACHINE_RANK" ]]; then
     MACHINE_RANK=$EXPLICIT_MACHINE_RANK
@@ -169,9 +194,13 @@ elif [[ -n "${SLURM_NODEID:-}" ]]; then
     MACHINE_RANK=$SLURM_NODEID
 elif [[ -n "${SLURM_PROCID:-}" ]]; then
     MACHINE_RANK=$SLURM_PROCID
+elif [[ -n "$ENV_MACHINE_RANK" ]]; then
+    MACHINE_RANK=$ENV_MACHINE_RANK
 else
     MACHINE_RANK=0
 fi
+is_nonnegative_integer "$MACHINE_RANK" || die "machine rank must be a non-negative integer"
+((MACHINE_RANK < NUM_NODES)) || die "machine rank must be smaller than NUM_NODES"
 
 case "$BACKEND" in
     deepspeed|fsdp|fsdp2|simplefsdp|ddp|singlegpu) ;;
@@ -202,16 +231,19 @@ fi
 
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
-if [[ -n "${SLURM_JOB_ID:-}" && -z "${DS_DEEPCOMPILE_USE_GLOBAL_CACHE:-}" ]]; then
-    CACHE_BASE=${SLURM_TMPDIR:-${TMPDIR:-/tmp}}
-    CACHE_DIR=${CACHE_BASE%/}/ds_deepcompile_cache_${USER:-user}_${SLURM_JOB_ID}
+RUN_ID=${CHORUS_RUN_ID:-${SLURM_JOB_ID:-local-$$}}
+SAFE_RUN_ID=${RUN_ID//[^a-zA-Z0-9_.-]/_}
+SAFE_RUN_ID=${SAFE_RUN_ID:0:64}
+[[ -n "$SAFE_RUN_ID" ]] || SAFE_RUN_ID=run
+if [[ -z "${DS_DEEPCOMPILE_USE_GLOBAL_CACHE:-}" ]]; then
+    CACHE_BASE=${CHORUS_RUNTIME_DIR:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}}
+    CACHE_DIR=${CACHE_BASE%/}/chorus-cache-${UID:-user}-${SAFE_RUN_ID}-rank-${MACHINE_RANK}
     export TRITON_CACHE_DIR=$CACHE_DIR/triton
     export TORCHINDUCTOR_CACHE_DIR=$CACHE_DIR/torchinductor
     mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 fi
 
-RUN_ID=${CHORUS_RUN_ID:-${SLURM_JOB_ID:-local-$$}}
-RUNTIME_BASE=${CHORUS_RUNTIME_DIR:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/chorus-runtime-${UID:-user}-$RUN_ID-$HOST_PORT}
+RUNTIME_BASE=${CHORUS_RUNTIME_DIR:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/chorus-runtime-${UID:-user}-$SAFE_RUN_ID-$HOST_PORT}
 RUNTIME_CONFIG_DIR=$RUNTIME_BASE/rank-$MACHINE_RANK
 mkdir -p "$RUNTIME_CONFIG_DIR"
 ACCELERATE_CONFIG=$RUNTIME_CONFIG_DIR/accelerate.yaml
@@ -266,7 +298,7 @@ SAFE_PASSES=${PASSES//,/_}
 SAFE_MODEL=${MODEL##*/}
 LOG_DIR=${LOG_DIR:-$SCRIPT_DIR/logs}
 mkdir -p "$LOG_DIR"
-LOG_FILE=$LOG_DIR/chorus_n${MACHINE_RANK}_${SAFE_MODEL}_${BACKEND}_np${NUM_PROCESSES}z${ZERO_STAGE}c${COMPILE}dc${DEEPCOMPILE}e${EAGER}o${DS_OFFLOAD}b${BATCH_SIZE}seq${SEQ_LENGTH}g${GRADIENT_ACCUMULATION_STEPS}a${ACTIVATION_CHECKPOINTING}p${SAFE_PASSES}.log
+LOG_FILE=$LOG_DIR/chorus_${SAFE_RUN_ID}_n${MACHINE_RANK}_${SAFE_MODEL}_${BACKEND}_np${NUM_PROCESSES}z${ZERO_STAGE}c${COMPILE}dc${DEEPCOMPILE}e${EAGER}o${DS_OFFLOAD}b${BATCH_SIZE}seq${SEQ_LENGTH}g${GRADIENT_ACCUMULATION_STEPS}a${ACTIVATION_CHECKPOINTING}p${SAFE_PASSES}.log
 
 echo "Chorus backend: $BACKEND"
 echo "Machine rank: $MACHINE_RANK/$NUM_NODES"
